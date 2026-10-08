@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ==========================================
-# 1. إعدادات السيرفر (البروكسي السحري لكسر الحظر)
+# 1. إعدادات السيرفر (البروكسي السحري المعدل)
 # ==========================================
 app = Flask(__name__)
 CORS(app) # دي اللي بتسمح لموقعك إنه يكلم السيرفر بدون حظر
@@ -32,7 +32,11 @@ def proxy(endpoint):
         if request.method == 'POST':
             res = requests.post(url, headers=headers, data=request.form, timeout=15)
         else:
-            res = requests.get(url, headers=headers, params=request.args, timeout=15)
+            params = request.args.to_dict()
+            # 🔴 التعديل السحري: إضافة التوكن إجبارياً في الرابط لحل مشكلة سحب الملفات
+            params['token'] = TORBOX_KEY
+            
+            res = requests.get(url, headers=headers, params=params, timeout=15)
         
         return jsonify(res.json())
     except Exception as e:
@@ -172,7 +176,7 @@ def handle_links(message):
         bot.reply_to(message, "⚠ يرجى إرسال رابط صالح.")
 
 print("=====================================================")
-print("🚀 السيرفر يعمل الآن وجاهز لاستقبال طلبات الموقع!")
+print("🚀 السيرفر يعمل الآن وجاهز لاستقبال طلبات الموقع وتخطي الحظر!")
 print("=====================================================")
 
 while True:
