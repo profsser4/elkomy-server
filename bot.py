@@ -4,7 +4,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-# السطر ده هو اللي هيحل مشكلة Failed to fetch للأبد
 CORS(app) 
 
 TORBOX_KEY = os.environ.get("TORBOX_KEY")
@@ -21,31 +20,40 @@ def generate():
     if not query:
         return jsonify({"error": "لم يتم إرسال رابط"}), 400
 
-    # تجهيز الطلب لـ TorBox مع الـ Token
+    # نرسل التوكن في الهيدر وفي الرابط لضمان قبول TorBox للطلب
     headers = {
         "Authorization": f"Bearer {TORBOX_KEY}"
     }
     
     try:
-        # تحديد إذا كان الرابط تورنت (Magnet) أو رابط مباشر
+        # تحديد إذا كان الرابط تورنت أم رابط مباشر
         if query.startswith("magnet:"):
-            url = "https://api.torbox.app/v1/api/torrents/createtorrent"
+            url = f"https://api.torbox.app/v1/api/torrents/createtorrent?token={TORBOX_KEY}"
             payload = {"magnet": query}
         else:
-            url = "https://api.torbox.app/v1/api/webdownloads/create"
+            url = f"https://api.torbox.app/v1/api/webdownloads/createwebdownload?token={TORBOX_KEY}"
             payload = {"link": query}
             
-        # إرسال الطلب
         res = requests.post(url, headers=headers, data=payload)
+        
+        # لو المسار خطأ أو الملف محذوف
+        if res.status_code == 404:
+            return jsonify({"error": "الملف محذوف من المصدر، أو الرابط غير مدعوم."})
+            
         res_data = res.json()
         
-        # لو الرد ناجح، نرجع الرابط للموقع
         if res.ok and res_data.get("success"):
-            # استخراج الرابط المباشر من رد TorBox
-            direct_link = res_data.get("data", {}).get("link", "")
+            # استخراج الرابط المباشر
+            direct_link = res_data.get("data", {}).get("download_link", "")
             if not direct_link:
-                 direct_link = res_data.get("data", {}).get("download_link", "")
-            return jsonify({"direct_link": direct_link})
+                 direct_link = res_data.get("data", {}).get("link", "")
+                 
+            # إذا كان الفيلم (كاش) سيظهر الرابط فوراً
+            if direct_link:
+                return jsonify({"direct_link": direct_link})
+            else:
+                # إذا كان الفيلم جديد وغير متوفر كاش
+                return jsonify({"error": "⏳ تم إضافة الفيلم لحسابك في TorBox بنجاح! ولكنه يحتاج بعض الوقت للتحميل لأنه (غير متوفر كاش). يرجى المحاولة لاحقاً."})
         else:
             return jsonify({"error": str(res_data.get("detail", res_data))})
             
