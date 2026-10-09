@@ -34,7 +34,6 @@ def generate():
     headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
 
     try:
-        # اتأكد التوكن سليم بسرعة
         chk = requests.get(f"{TORBOX_URL}/torrents/mylist", headers=headers, params={"limit": 1}, timeout=10)
         if chk.status_code == 401:
             return jsonify({"error": "An error occurred while verifying your token. جدد التوكن من TorBox"}), 401
@@ -54,7 +53,6 @@ def generate():
             if add.get("success"):
                 target_id = add.get("data", {}).get("torrent_id")
             
-            # دور في الليستة
             mylist = requests.get(f"{TORBOX_URL}/torrents/mylist", headers=headers, params={"bypass_cache": True, "limit": 100}, timeout=15).json()
             
             for item in mylist.get("data", []):
@@ -66,12 +64,24 @@ def generate():
                     if not files:
                         return jsonify({"error": "التورنت فاضي مفيهوش ملفات"}), 400
                     
-                    biggest = max(files, key=lambda f: f.get("size", 0))
-                    dl = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item["id"], "file_id": biggest["id"]}, timeout=15).json()
+                    # اختيار أول ملف فيديو أو الملف الأكبر المتاح بأمان
+                    valid_files = [f for f in files if f.get("size", 0) > 0]
+                    if not valid_files:
+                        valid_files = files
+                    
+                    target_file = max(valid_files, key=lambda f: f.get("size", 0))
+                    
+                    dl = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item["id"], "file_id": target_file["id"]}, timeout=15).json()
                     if dl.get("success"):
-                        return jsonify({"direct_link": dl["data"], "name": biggest.get("name")})
+                        return jsonify({"direct_link": dl["data"], "name": target_file.get("name")})
                     else:
-                        return jsonify({"error": dl.get("error", "فشل جلب الرابط المباشر")}), 400
+                        # محاولة ثانية بأي ملف تاني لو الملف الأول رفضه توربوكس
+                        for alt_file in valid_files:
+                            dl_alt = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item["id"], "file_id": alt_file["id"]}, timeout=15).json()
+                            if dl_alt.get("success"):
+                                return jsonify({"direct_link": dl_alt["data"], "name": alt_file.get("name")})
+                        
+                        return jsonify({"error": "فشل جلب الرابط المباشر من TorBox لهذا الملف"}), 400
 
             return jsonify({"error": "⏳ اتضاف بس لسه بيجهز، استنى 30 ثانية واضغط سحب تاني", "retry": True}), 202
 
