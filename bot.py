@@ -7,7 +7,7 @@ app = Flask(__name__)
 CORS(app)
 
 # مؤقت للتجربة: بعد ما يشتغل ولّد مفتاح جديد وحطه في Variables على Railway (TORBOX_KEY)
-KEY = os.environ.get("TORBOX_KEY", "39056ee9-f78d-4670-b61b-e5677e897919")
+KEY = os.environ.get("TORBOX_KEY", "6244452f-12cf-453d-a1d2-fb855e9b9c51")
 BASE = "https://api.torbox.app/v1/api"
 H = {"Authorization": f"Bearer {KEY}"}
 VIDEO = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v")
