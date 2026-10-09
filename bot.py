@@ -40,7 +40,9 @@ TRACKERS = (
 
 
 def tb(method, path, **kw):
-    r = requests.request(method, TORBOX_BASE + path, headers=TORBOX_H, timeout=20, **kw)
+    r = requests.request(
+        method, TORBOX_BASE + path, headers=TORBOX_H, timeout=20, **kw
+    )
     try:
         return r.json()
     except ValueError:
@@ -59,7 +61,10 @@ def resolve_1fichier(url):
         res = requests.post(
             "https://1fichier.com/v1/download/get_token.cgi",
             json={"url": url},
-            headers={"Authorization": f"Bearer {KEYS['ONEFICHIER']}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {KEYS['ONEFICHIER']}",
+                "Content-Type": "application/json",
+            },
             timeout=15,
         ).json()
         if res.get("status") == "OK" and res.get("url"):
@@ -93,7 +98,8 @@ def resolve_alldebrid(url):
         ).json()
         if res.get("status") == "success" and res.get("data", {}).get("link"):
             return {"success": True, "url": res["data"]["link"]}
-        return {"success": False, "error": "AllDebrid: " + str(res.get("error", {}).get("message", "فشل"))}
+        msg = res.get("error", {}).get("message", "فشل")
+        return {"success": False, "error": "AllDebrid: " + str(msg)}
     except Exception as e:
         return {"success": False, "error": f"AllDebrid: {e}"}
 
@@ -108,10 +114,12 @@ def resolve_premiumize(url):
         if res.get("status") == "success":
             links = [c for c in (res.get("content") or []) if c.get("link")]
             if links:
-                return {"success": True, "url": max(links, key=lambda c: c.get("size", 0))["link"]}
+                best = max(links, key=lambda c: c.get("size", 0))
+                return {"success": True, "url": best["link"]}
             if res.get("location"):
                 return {"success": True, "url": res["location"]}
-        return {"success": False, "error": "Premiumize: " + str(res.get("message", "الرابط غير مدعوم أو غير جاهز"))}
+        msg = res.get("message", "الرابط غير مدعوم أو غير جاهز")
+        return {"success": False, "error": "Premiumize: " + str(msg)}
     except Exception as e:
         return {"success": False, "error": f"Premiumize: {e}"}
 
@@ -140,7 +148,11 @@ def torbox_web(q, web_id=None):
                 "progress": info.get("progress"),
             }, 202
 
-    dl = tb("GET", "/webdl/requestdl", params={"token": KEYS["TORBOX"], "web_id": web_id, "file_id": 0})
+    dl = tb(
+        "GET",
+        "/webdl/requestdl",
+        params={"token": KEYS["TORBOX"], "web_id": web_id, "file_id": 0},
+    )
     if dl.get("success"):
         return {"direct_link": dl["data"], "name": "TorBox Web VIP 🚀"}, 200
     return {"error": "جاري التجهيز...", "torrent_id": f"web:{web_id}"}, 202
@@ -165,7 +177,12 @@ def tmdb():
     def call(lang):
         r = requests.get(
             "https://api.themoviedb.org/3/search/multi",
-            params={"api_key": TMDB_KEY, "query": q, "language": lang, "include_adult": "false"},
+            params={
+                "api_key": TMDB_KEY,
+                "query": q,
+                "language": lang,
+                "include_adult": "false",
+            },
             timeout=15,
         )
         if r.status_code != 200:
@@ -174,4 +191,179 @@ def tmdb():
 
     try:
         ar = call("ar")
-        en = {x["id"]: x
+        en = {}
+        for item in call("en-US"):
+            en[item["id"]] = item
+
+        out = []
+        for x in ar:
+            if x.get("media_type") not in ("movie", "tv"):
+                continue
+            e = en.get(x["id"], x)
+            date = x.get("release_date") or x.get("first_air_date") or ""
+            poster = None
+            if x.get("poster_path"):
+                poster = "https://image.tmdb.org/t/p/w342" + x["poster_path"]
+            search_title = (
+                e.get("title")
+                or e.get("name")
+                or x.get("original_title")
+                or x.get("original_name")
+                or ""
+            )
+            out.append({
+                "title": x.get("title") or x.get("name") or "",
+                "search_title": search_title,
+                "year": date[:4],
+                "type": x["media_type"],
+                "poster": poster,
+            })
+        return jsonify(results=out[:18])
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+# ---------- بحث التورنت (Prowlarr) ----------
+@app.get("/search")
+def search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify(results=[])
+    if not (PROWLARR_URL and PROWLARR_KEY):
+        return jsonify(error="PROWLARR_URL و PROWLARR_KEY مش متضافين في Variables"), 500
+
+    try:
+        r = requests.get(
+            f"{PROWLARR_URL}/api/v1/search",
+            headers={"X-Api-Key": PROWLARR_KEY},
+            params={"query": q, "type": "search", "limit": 100},
+            timeout=45,
+        )
+        if r.status_code != 200:
+            return jsonify(error=f"Prowlarr رجّع {r.status_code}: تأكد من الرابط والمفتاح"), 502
+        items = r.json()
+        out = []
+        for x in items:
+            mag = x.get("magnetUrl") or ""
+            if not mag.startswith("magnet:"):
+                g = x.get("guid") or ""
+                if g.startswith("magnet:"):
+                    mag = g
+                elif x.get("infoHash"):
+                    name = quote(x.get("title", ""))
+                    mag = f"magnet:?xt=urn:btih:{x['infoHash']}&dn={name}"
+                else:
+                    continue
+            out.append({
+                "title": x.get("title", ""),
+                "size": x.get("size") or 0,
+                "seeders": x.get("seeders") or 0,
+                "indexer": x.get("indexer", ""),
+                "magnet": mag,
+            })
+        out.sort(key=lambda i: i["seeders"], reverse=True)
+        return jsonify(results=out[:60])
+    except requests.Timeout:
+        return jsonify(error="البحث أخد وقت طويل، جرب تاني"), 504
+    except Exception as e:
+        return jsonify(error=f"مشكلة في البحث: {e}"), 500
+
+
+@app.post("/generate")
+def generate():
+    data = request.get_json() or {}
+    q = (data.get("query") or data.get("magnet") or data.get("link") or "").strip()
+    tid = data.get("torrent_id")
+    if not q and not tid:
+        return jsonify(error="مفيش رابط مبعوت"), 400
+
+    try:
+        # ---------- متابعة رابط ويب كان بيجهز ----------
+        if tid and str(tid).startswith("web:"):
+            body, code = torbox_web(q, web_id=str(tid)[4:])
+            return jsonify(body), code
+
+        # ---------- تورنت (TorBox) ----------
+        if tid or q.startswith("magnet:"):
+            if not tid:
+                if "&tr=" not in q:
+                    q += TRACKERS
+                add = tb("POST", "/torrents/createtorrent", data={"magnet": q, "seed": 1})
+                if not add.get("success"):
+                    msg = add.get("detail") or add.get("error") or "فشل إضافة التورنت"
+                    return jsonify(error=msg), 400
+                tid = add["data"]["torrent_id"]
+
+            info = tb(
+                "GET",
+                "/torrents/mylist",
+                params={"id": tid, "bypass_cache": "true"},
+            ).get("data")
+            if not info:
+                return jsonify(error="جاري التجهيز...", torrent_id=tid), 202
+
+            if not (info.get("download_finished") or info.get("download_present")):
+                return jsonify(
+                    error="جاري التجهيز...",
+                    torrent_id=tid,
+                    status=info.get("download_state"),
+                    progress=info.get("progress"),
+                ), 202
+
+            files = info.get("files", [])
+            if not files:
+                return jsonify(error="التورنت فاضي مفيهوش ملفات"), 400
+
+            f = pick_file(files)
+            dl = tb(
+                "GET",
+                "/torrents/requestdl",
+                params={"token": KEYS["TORBOX"], "torrent_id": tid, "file_id": f["id"]},
+            )
+            if dl.get("success"):
+                return jsonify(direct_link=dl["data"], name=f["name"])
+            return jsonify(error="TorBox رفض إنشاء الرابط", detail=dl), 400
+
+        # ---------- روابط الويب (توجيه ذكي) ----------
+        errors = []
+
+        if "1fichier.com" in q and has("ONEFICHIER"):
+            res = resolve_1fichier(q)
+            if res["success"]:
+                return jsonify(direct_link=res["url"], name="1Fichier VIP 🚀")
+            errors.append(res["error"])
+
+        if has("REAL_DEBRID"):
+            res = resolve_real_debrid(q)
+            if res["success"]:
+                return jsonify(direct_link=res["url"], name="Real-Debrid VIP 🚀")
+            errors.append(res["error"])
+
+        if has("ALLDEBRID"):
+            res = resolve_alldebrid(q)
+            if res["success"]:
+                return jsonify(direct_link=res["url"], name="AllDebrid VIP 🚀")
+            errors.append(res["error"])
+
+        if has("PREMIUMIZE"):
+            res = resolve_premiumize(q)
+            if res["success"]:
+                return jsonify(direct_link=res["url"], name="Premiumize VIP 🚀")
+            errors.append(res["error"])
+
+        if has("TORBOX"):
+            body, code = torbox_web(q)
+            if code in (200, 202):
+                return jsonify(body), code
+            errors.append(body.get("error", "TorBox فشل"))
+
+        return jsonify(error="فشل السحب من جميع السيرفرات ❌ " + " | ".join(errors)), 400
+
+    except requests.Timeout:
+        return jsonify(error="السيرفرات بطيئة حالياً، جرب تاني"), 504
+    except Exception as e:
+        return jsonify(error=f"مشكلة في السيرفر: {e}"), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
