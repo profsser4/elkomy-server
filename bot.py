@@ -1,109 +1,98 @@
-
 import os
-import re
-import urllib.parse
-import time
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
-TORBOX_KEY = "39056ee9-f78d-4670-b61b-e5677e897919"
-TORBOX_URL = "https://api.torbox.app/v1/api"
-TRACKERS = "&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.bittor.pw:1337/announce"
+# مؤقت للتجربة: بعد ما يشتغل ولّد مفتاح جديد وحطه في Variables على Railway (TORBOX_KEY)
+KEY = os.environ.get("TORBOX_KEY", "39056ee9-f78d-4670-b61b-e5677e897919")
+BASE = "https://api.torbox.app/v1/api"
+H = {"Authorization": f"Bearer {KEY}"}
+VIDEO = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v")
+TRACKERS = (
+    "&tr=udp://tracker.opentrackr.org:1337/announce"
+    "&tr=udp://open.stealth.si:80/announce"
+    "&tr=udp://tracker.bittor.pw:1337/announce"
+)
 
-@app.route('/')
+
+def tb(method, path, **kw):
+    r = requests.request(method, BASE + path, headers=H, timeout=20, **kw)
+    return r.json()
+
+
+def pick_file(files):
+    vids = [f for f in files if f["name"].lower().endswith(VIDEO)] or files
+    return max(vids, key=lambda f: f.get("size", 0))
+
+
+@app.get("/")
 def home():
     return "Elkomy Server is Active! 🚀"
 
-@app.route("/generate", methods=["POST", "OPTIONS"])
+
+@app.post("/generate")
 def generate():
-    if request.method == "OPTIONS":
-        return "", 200
-
     data = request.get_json() or {}
-    raw = data.get("magnet") or data.get("link") or data.get("query") or ""
-    query = urllib.parse.unquote(raw).strip()
-
-    if not query:
-        return jsonify({"error": "مفيش رابط مبعوت"}), 400
-
-    is_torrent = query.startswith("magnet:")
-    headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
+    q = (data.get("query") or data.get("magnet") or data.get("link") or "").strip()
+    tid = data.get("torrent_id")
+    if not q and not tid:
+        return jsonify(error="مفيش رابط مبعوت"), 400
 
     try:
-        chk = requests.get(f"{TORBOX_URL}/torrents/mylist", headers=headers, params={"limit": 1}, timeout=10)
-        if chk.status_code == 401:
-            return jsonify({"error": "An error occurred while verifying your token. جدد التوكن من TorBox"}), 401
+        # ---------- تورنت ----------
+        if tid or q.startswith("magnet:"):
+            if not tid:
+                if "&tr=" not in q:
+                    q += TRACKERS
+                add = tb("POST", "/torrents/createtorrent", data={"magnet": q, "seed": 1})
+                if not add.get("success"):
+                    return jsonify(error=add.get("detail") or add.get("error") or "فشل إضافة التورنت"), 400
+                tid = add["data"]["torrent_id"]
 
-        target_id = None
-        magnet_hash = None
+            info = tb("GET", "/torrents/mylist", params={"id": tid, "bypass_cache": "true"}).get("data")
+            if not info:
+                return jsonify(error="جاري التجهيز...", torrent_id=tid), 202
 
-        if is_torrent:
-            m = re.search(r'btih:([a-zA-Z0-9]+)', query, re.I)
-            if m: magnet_hash = m.group(1).lower()
+            if not (info.get("download_finished") or info.get("download_present")):
+                return jsonify(
+                    error="جاري التجهيز...",
+                    torrent_id=tid,
+                    status=info.get("download_state"),
+                    progress=info.get("progress"),
+                ), 202
 
-            if "&tr=" not in query:
-                query += TRACKERS
+            files = info.get("files", [])
+            if not files:
+                return jsonify(error="التورنت فاضي مفيهوش ملفات"), 400
 
-            add = requests.post(f"{TORBOX_URL}/torrents/createtorrent", headers=headers, data={"magnet": query, "seed": 1}, timeout=20).json()
-            
-            if add.get("success"):
-                target_id = add.get("data", {}).get("torrent_id")
-            
-            mylist = requests.get(f"{TORBOX_URL}/torrents/mylist", headers=headers, params={"bypass_cache": True, "limit": 100}, timeout=15).json()
-            
-            for item in mylist.get("data", []):
-                if (target_id and str(item.get("id")) == str(target_id)) or (magnet_hash and magnet_hash in str(item.get("hash","")).lower()):
-                    if item.get("download_state") not in ["completed", "cached", "seeding", "finished"]:
-                        return jsonify({"error": f"⏳ الملف لسه بيجهز في TorBox... استنى دقيقة ودوس تاني", "status": item.get("download_state")}), 202
+            f = pick_file(files)
+            dl = tb("GET", "/torrents/requestdl",
+                    params={"token": KEY, "torrent_id": tid, "file_id": f["id"]})
+            if dl.get("success"):
+                return jsonify(direct_link=dl["data"], name=f["name"])
+            return jsonify(error="TorBox رفض إنشاء الرابط", detail=dl), 400
 
-                    files = item.get("files", [])
-                    if not files:
-                        return jsonify({"error": "التورنت فاضي مفيهوش ملفات"}), 400
-                    
-                    # اختيار أول ملف فيديو أو الملف الأكبر المتاح بأمان
-                    valid_files = [f for f in files if f.get("size", 0) > 0]
-                    if not valid_files:
-                        valid_files = files
-                    
-                    target_file = max(valid_files, key=lambda f: f.get("size", 0))
-                    
-                    dl = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item["id"], "file_id": target_file["id"]}, timeout=15).json()
-                    if dl.get("success"):
-                        return jsonify({"direct_link": dl["data"], "name": target_file.get("name")})
-                    else:
-                        # محاولة ثانية بأي ملف تاني لو الملف الأول رفضه توربوكس
-                        for alt_file in valid_files:
-                            dl_alt = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item["id"], "file_id": alt_file["id"]}, timeout=15).json()
-                            if dl_alt.get("success"):
-                                return jsonify({"direct_link": dl_alt["data"], "name": alt_file.get("name")})
-                        
-                        return jsonify({"error": "فشل جلب الرابط المباشر من TorBox لهذا الملف"}), 400
+        # ---------- رابط عادي ----------
+        add = tb("POST", "/webdownloads/createwebdownload", data={"link": q})
+        if not add.get("success"):
+            return jsonify(error=add.get("detail") or add.get("error") or "الرابط غير مدعوم"), 400
 
-            return jsonify({"error": "⏳ اتضاف بس لسه بيجهز، استنى 30 ثانية واضغط سحب تاني", "retry": True}), 202
+        d = add["data"]
+        wid = d.get("webdownload_id") or d.get("id")
+        dl = tb("GET", "/webdownloads/requestdl",
+                params={"token": KEY, "web_id": wid, "file_id": 0})
+        if dl.get("success"):
+            return jsonify(direct_link=dl["data"])
+        return jsonify(error="رابط الويب لسه بيجهز", web_id=wid), 202
 
-        else:
-            add = requests.post(f"{TORBOX_URL}/webdownloads/createwebdownload", headers=headers, data={"link": query}, timeout=20).json()
-            if not add.get("success"):
-                return jsonify({"error": add.get("error", "الرابط المباشر غير مدعوم")}), 400
-            
-            wid = add.get("data", {}).get("id")
-            time.sleep(3)
-            mylist = requests.get(f"{TORBOX_URL}/webdownloads/mylist", headers=headers, params={"bypass_cache": True}, timeout=15).json()
-            for item in mylist.get("data", []):
-                if str(item.get("id")) == str(wid):
-                    dl = requests.get(f"{TORBOX_URL}/webdownloads/requestdl", headers=headers, params={"webdownload_id": wid}, timeout=15).json()
-                    if dl.get("success"):
-                        return jsonify({"direct_link": dl["data"]})
-            return jsonify({"error": "رابط الويب لسه بيجهز، جرب تاني بعد شوية"}), 202
-
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "TorBox بطيء حاليا، جرب تاني"}), 504
+    except requests.Timeout:
+        return jsonify(error="TorBox بطيء حالياً، جرب تاني"), 504
     except Exception as e:
-        return jsonify({"error": f"مشكلة في السيرفر: {str(e)}"}), 500
+        return jsonify(error=f"مشكلة في السيرفر: {e}"), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
