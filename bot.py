@@ -15,7 +15,7 @@ KEYS = {
     "TORBOX": os.environ.get("TORBOX_KEY", "6244452f-12cf-453d-a1d2-fb855e9b9c51"),
     
     # 1Fichier Premium API Key
-    "ONEFICHIER": "حط_توكن_1fichier_هنا",
+    "ONEFICHIER": "vvtl3GNHckzvhtCwHER3AhulMQOAP0oZ",
     
     # Real-Debrid API Key (بيدعم ميجا وأكتر من 50 موقع)
     "REAL_DEBRID": "حط_توكن_Real-Debrid_هنا",
