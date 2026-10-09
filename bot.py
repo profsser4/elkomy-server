@@ -1,4 +1,6 @@
 import os
+from urllib.parse import quote
+
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -16,6 +18,9 @@ KEYS = {
     "ALLDEBRID": os.environ.get("ALLDEBRID_KEY", ""),
     "PREMIUMIZE": os.environ.get("PREMIUMIZE_KEY", ""),
 }
+TMDB_KEY = os.environ.get("TMDB_KEY", "")
+PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
+PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 # ==============================================================
 
 
@@ -101,11 +106,9 @@ def resolve_premiumize(url):
             timeout=20,
         ).json()
         if res.get("status") == "success":
-            content = res.get("content") or []
-            links = [c for c in content if c.get("link")]
+            links = [c for c in (res.get("content") or []) if c.get("link")]
             if links:
-                best = max(links, key=lambda c: c.get("size", 0))
-                return {"success": True, "url": best["link"]}
+                return {"success": True, "url": max(links, key=lambda c: c.get("size", 0))["link"]}
             if res.get("location"):
                 return {"success": True, "url": res["location"]}
         return {"success": False, "error": "Premiumize: " + str(res.get("message", "الرابط غير مدعوم أو غير جاهز"))}
@@ -116,7 +119,6 @@ def resolve_premiumize(url):
 # ----------------- TorBox روابط الويب -----------------
 
 def torbox_web(q, web_id=None):
-    """يرجع (response, status_code)"""
     if not web_id:
         add = tb("POST", "/webdl/createwebdownload", data={"link": q})
         if not add.get("success"):
@@ -151,93 +153,25 @@ def home():
     return "Elkomy Server (Multi-API) is Active! 🚀"
 
 
-@app.post("/generate")
-def generate():
-    data = request.get_json() or {}
-    q = (data.get("query") or data.get("magnet") or data.get("link") or "").strip()
-    tid = data.get("torrent_id")
-    if not q and not tid:
-        return jsonify(error="مفيش رابط مبعوت"), 400
+# ---------- بحث الأفلام والمسلسلات (بوسترات من TMDB) ----------
+@app.get("/tmdb")
+def tmdb():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify(results=[])
+    if not TMDB_KEY:
+        return jsonify(error="TMDB_KEY مش متضاف في Variables على Railway"), 500
+
+    def call(lang):
+        r = requests.get(
+            "https://api.themoviedb.org/3/search/multi",
+            params={"api_key": TMDB_KEY, "query": q, "language": lang, "include_adult": "false"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"TMDB رجّع {r.status_code}: تأكد من المفتاح (v3)")
+        return r.json().get("results", [])
 
     try:
-        # ---------- متابعة رابط ويب كان بيجهز ----------
-        if tid and str(tid).startswith("web:"):
-            body, code = torbox_web(q, web_id=str(tid)[4:])
-            return jsonify(body), code
-
-        # ---------- تورنت (TorBox) ----------
-        if tid or q.startswith("magnet:"):
-            if not tid:
-                if "&tr=" not in q:
-                    q += TRACKERS
-                add = tb("POST", "/torrents/createtorrent", data={"magnet": q, "seed": 1})
-                if not add.get("success"):
-                    return jsonify(error=add.get("detail") or add.get("error") or "فشل إضافة التورنت"), 400
-                tid = add["data"]["torrent_id"]
-
-            info = tb("GET", "/torrents/mylist", params={"id": tid, "bypass_cache": "true"}).get("data")
-            if not info:
-                return jsonify(error="جاري التجهيز...", torrent_id=tid), 202
-
-            if not (info.get("download_finished") or info.get("download_present")):
-                return jsonify(
-                    error="جاري التجهيز...",
-                    torrent_id=tid,
-                    status=info.get("download_state"),
-                    progress=info.get("progress"),
-                ), 202
-
-            files = info.get("files", [])
-            if not files:
-                return jsonify(error="التورنت فاضي مفيهوش ملفات"), 400
-
-            f = pick_file(files)
-            dl = tb("GET", "/torrents/requestdl",
-                    params={"token": KEYS["TORBOX"], "torrent_id": tid, "file_id": f["id"]})
-            if dl.get("success"):
-                return jsonify(direct_link=dl["data"], name=f["name"])
-            return jsonify(error="TorBox رفض إنشاء الرابط", detail=dl), 400
-
-        # ---------- روابط الويب (توجيه ذكي) ----------
-        errors = []
-
-        if "1fichier.com" in q and has("ONEFICHIER"):
-            res = resolve_1fichier(q)
-            if res["success"]:
-                return jsonify(direct_link=res["url"], name="1Fichier VIP 🚀")
-            errors.append(res["error"])
-
-        if has("REAL_DEBRID"):
-            res = resolve_real_debrid(q)
-            if res["success"]:
-                return jsonify(direct_link=res["url"], name="Real-Debrid VIP 🚀")
-            errors.append(res["error"])
-
-        if has("ALLDEBRID"):
-            res = resolve_alldebrid(q)
-            if res["success"]:
-                return jsonify(direct_link=res["url"], name="AllDebrid VIP 🚀")
-            errors.append(res["error"])
-
-        if has("PREMIUMIZE"):
-            res = resolve_premiumize(q)
-            if res["success"]:
-                return jsonify(direct_link=res["url"], name="Premiumize VIP 🚀")
-            errors.append(res["error"])
-
-        if has("TORBOX"):
-            body, code = torbox_web(q)
-            if code in (200, 202):
-                return jsonify(body), code
-            errors.append(body.get("error", "TorBox فشل"))
-
-        return jsonify(error="فشل السحب من جميع السيرفرات ❌ " + " | ".join(errors)), 400
-
-    except requests.Timeout:
-        return jsonify(error="السيرفرات بطيئة حالياً، جرب تاني"), 504
-    except Exception as e:
-        return jsonify(error=f"مشكلة في السيرفر: {e}"), 500
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+        ar = call("ar")
+        en = {x["id"]: x
