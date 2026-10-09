@@ -9,7 +9,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# التوكن المباشر بتاعك (عشان نلغي مشاكل Railway)
+# التوكن المباشر بتاعك
 TORBOX_KEY = "39056ee9-f78d-4670-b61b-e5677e897919"
 TORBOX_URL = "https://api.torbox.app/v1/api"
 
@@ -44,12 +44,12 @@ def generate():
         add_data = add_req.json()
 
         if not add_data.get("success"):
-            return jsonify({"error": f"الرابط غير مدعوم أو محذوف من المصدر: {add_data.get('detail', '')}"}), 400
+            return jsonify({"error": f"الرابط غير مدعوم أو محذوف: {add_data.get('detail', '')}"}), 400
 
         item_id = add_data.get("data", {}).get("torrent_id") if is_torrent else add_data.get("data", {}).get("id")
 
-        # انتظار بسيط 5 ثواني عشان السيرفر يلحق يجهز الرابط
-        time.sleep(5)
+        # انتظار مرة واحدة بس زي الأول
+        time.sleep(6)
         
         check_url = f"{TORBOX_URL}/torrents/mylist" if is_torrent else f"{TORBOX_URL}/webdownloads/mylist"
         mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True}).json()
@@ -68,7 +68,7 @@ def generate():
                     if dl_link:
                         return jsonify({"direct_link": dl_link})
         
-        return jsonify({"error": "الملف بيتحمل حالياً في حسابك TorBox... اضغط سحب كمان دقيقة."})
+        return jsonify({"error": "⏳ الملف بيتحمل حالياً في حسابك TorBox... اضغط سحب كمان دقيقة."})
 
     except Exception as e:
         return jsonify({"error": f"مشكلة في السيرفر: {str(e)}"}), 500
