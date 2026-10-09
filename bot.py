@@ -32,45 +32,45 @@ def generate():
     headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
 
     try:
+        item_id = None
         # 1. إضافة الملف
         if is_torrent:
             if "&tr=" not in query:
-                query += "&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce"
-            add_req = requests.post(f"{TORBOX_URL}/torrents/createtorrent", headers=headers, data={"magnet": query, "seed": 1})
+                query += "&tr=udp://tracker.opentrackr.org:1337/announce"
+            add_req = requests.post(f"{TORBOX_URL}/torrents/createtorrent", headers=headers, data={"magnet": query, "seed": 1}).json()
+            item_id = add_req.get("data", {}).get("torrent_id")
         else:
-            add_req = requests.post(f"{TORBOX_URL}/webdownloads/createwebdownload", headers=headers, data={"link": query})
-            
-        add_data = add_req.json()
+            add_req = requests.post(f"{TORBOX_URL}/webdownloads/createwebdownload", headers=headers, data={"link": query}).json()
+            item_id = add_req.get("data", {}).get("id")
 
-        if not add_data.get("success"):
-            return jsonify({"error": f"الرابط غير مدعوم أو محذوف: {add_data.get('detail', '')}"}), 400
-
-        item_id = add_data.get("data", {}).get("torrent_id") if is_torrent else add_data.get("data", {}).get("id")
-
-        # 2. نظام الانتظار (زي بوت التلجرام) - بيستنى لحد 60 ثانية
+        # 2. الانتظار المبدئي زي ما كنت بتحب
+        time.sleep(5)
+        
         check_url = f"{TORBOX_URL}/torrents/mylist" if is_torrent else f"{TORBOX_URL}/webdownloads/mylist"
         
-        for _ in range(12): # هيلف 12 مرة
-            time.sleep(5)   # كل مرة يستنى 5 ثواني
+        # 3. محاولة البحث الذكية (عشان لو حسابك مليان ملفات أو ضفت الملف كذا مرة)
+        for _ in range(5):
+            time.sleep(3) # ثواني إضافية مخفية لضمان استقرار السيرفر
             
-            mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True}).json()
+            # ضفنا limit=1000 عشان يجيب كل الـ 286 ملف اللي عندك
+            mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True, "limit": 1000}).json()
             
             for item in mylist.get("data", []):
-                if str(item.get("id")) == str(item_id):
+                # المطابقة بالـ ID أو بحروف الماجنيت كحل بديل
+                if (item_id and str(item.get("id")) == str(item_id)) or (is_torrent and item.get("hash") and item.get("hash").lower() in query.lower()):
                     if is_torrent:
                         files = item.get("files", [])
-                        if files: # لو الملفات ظهرت، يعني التحميل خلص
+                        if files:
                             target_file = max(files, key=lambda f: f.get("size", 0))
-                            dl_req = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item_id, "file_id": target_file["id"]}).json()
+                            dl_req = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item.get("id"), "file_id": target_file["id"]}).json()
                             if dl_req.get("success"):
                                 return jsonify({"direct_link": dl_req["data"]})
                     else:
                         dl_link = item.get("download_link") or item.get("link")
-                        if dl_link: # لو الرابط المباشر ظهر
+                        if dl_link:
                             return jsonify({"direct_link": dl_link})
         
-        # لو الدقيقة خلصت والملف لسه بيحمل (عشان حجمه كبير)
-        return jsonify({"error": "⏳ الملف ضخم وبياخد وقت في السيرفر... ارجع اضغط سحب كمان دقيقتين."})
+        return jsonify({"error": "⏳ الملف بيتحمل حالياً في حسابك TorBox... اضغط سحب كمان دقيقة."})
 
     except Exception as e:
         return jsonify({"error": f"مشكلة في السيرفر: {str(e)}"}), 500
