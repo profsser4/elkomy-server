@@ -32,7 +32,6 @@ def generate():
     is_torrent = query.startswith("magnet:")
     headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
 
-    # 🔥 الحل السحري: استخراج بصمة الفيلم (Hash) عشان نصطاده من الحساب
     magnet_hash = None
     if is_torrent:
         match = re.search(r'urn:btih:([a-zA-Z0-9]+)', query, re.IGNORECASE)
@@ -44,7 +43,6 @@ def generate():
 
     try:
         target_id = None
-        # 1. محاولة إضافة الملف (حتى لو موجود قبل كده)
         if is_torrent:
             add_req = requests.post(f"{TORBOX_URL}/torrents/createtorrent", headers=headers, data={"magnet": query, "seed": 1}).json()
             target_id = add_req.get("data", {}).get("torrent_id")
@@ -52,20 +50,17 @@ def generate():
             add_req = requests.post(f"{TORBOX_URL}/webdownloads/createwebdownload", headers=headers, data={"link": query}).json()
             target_id = add_req.get("data", {}).get("id")
 
-        # 2. الانتظار الذكي (بيلف 10 مرات = 30 ثانية)
         check_url = f"{TORBOX_URL}/torrents/mylist" if is_torrent else f"{TORBOX_URL}/webdownloads/mylist"
         
         for _ in range(10):
-            time.sleep(3) # استنى 3 ثواني في كل لفة
+            time.sleep(3)
             
-            # جيب كل الملفات اللي في الحساب
             mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True, "limit": 1000}).json()
             
             for item in mylist.get("data", []):
                 item_id_str = str(item.get("id"))
                 item_hash = str(item.get("hash", "")).lower()
                 
-                # 🔥 التطابق بالبصمة أو بالآي دي (مستحيل يهرب)
                 if (target_id and item_id_str == str(target_id)) or (magnet_hash and magnet_hash == item_hash):
                     if is_torrent:
                         files = item.get("files", [])
