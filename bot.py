@@ -9,7 +9,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# التوكن المباشر بتاعك
 TORBOX_KEY = "39056ee9-f78d-4670-b61b-e5677e897919"
 TORBOX_URL = "https://api.torbox.app/v1/api"
 
@@ -28,12 +27,12 @@ def generate():
     if not raw:
         return jsonify({"error": "مفيش رابط مبعوت"}), 400
 
-    # فك تشفير الرابط عشان ميجبش Not Found
     query = urllib.parse.unquote(raw).strip()
     is_torrent = query.startswith("magnet:")
     headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
 
     try:
+        # 1. إضافة الملف
         if is_torrent:
             if "&tr=" not in query:
                 query += "&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce"
@@ -48,27 +47,30 @@ def generate():
 
         item_id = add_data.get("data", {}).get("torrent_id") if is_torrent else add_data.get("data", {}).get("id")
 
-        # انتظار مرة واحدة بس زي الأول
-        time.sleep(6)
-        
+        # 2. نظام الانتظار (زي بوت التلجرام) - بيستنى لحد 60 ثانية
         check_url = f"{TORBOX_URL}/torrents/mylist" if is_torrent else f"{TORBOX_URL}/webdownloads/mylist"
-        mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True}).json()
         
-        for item in mylist.get("data", []):
-            if str(item.get("id")) == str(item_id):
-                if is_torrent:
-                    files = item.get("files", [])
-                    if files:
-                        target_file = max(files, key=lambda f: f.get("size", 0))
-                        dl_req = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item_id, "file_id": target_file["id"]}).json()
-                        if dl_req.get("success"):
-                            return jsonify({"direct_link": dl_req["data"]})
-                else:
-                    dl_link = item.get("download_link") or item.get("link")
-                    if dl_link:
-                        return jsonify({"direct_link": dl_link})
+        for _ in range(12): # هيلف 12 مرة
+            time.sleep(5)   # كل مرة يستنى 5 ثواني
+            
+            mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True}).json()
+            
+            for item in mylist.get("data", []):
+                if str(item.get("id")) == str(item_id):
+                    if is_torrent:
+                        files = item.get("files", [])
+                        if files: # لو الملفات ظهرت، يعني التحميل خلص
+                            target_file = max(files, key=lambda f: f.get("size", 0))
+                            dl_req = requests.get(f"{TORBOX_URL}/torrents/requestdl", headers=headers, params={"torrent_id": item_id, "file_id": target_file["id"]}).json()
+                            if dl_req.get("success"):
+                                return jsonify({"direct_link": dl_req["data"]})
+                    else:
+                        dl_link = item.get("download_link") or item.get("link")
+                        if dl_link: # لو الرابط المباشر ظهر
+                            return jsonify({"direct_link": dl_link})
         
-        return jsonify({"error": "⏳ الملف بيتحمل حالياً في حسابك TorBox... اضغط سحب كمان دقيقة."})
+        # لو الدقيقة خلصت والملف لسه بيحمل (عشان حجمه كبير)
+        return jsonify({"error": "⏳ الملف ضخم وبياخد وقت في السيرفر... ارجع اضغط سحب كمان دقيقتين."})
 
     except Exception as e:
         return jsonify({"error": f"مشكلة في السيرفر: {str(e)}"}), 500
