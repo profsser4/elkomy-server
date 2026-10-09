@@ -3,6 +3,7 @@ import os
 import time
 import urllib.parse
 import requests
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -31,33 +32,41 @@ def generate():
     is_torrent = query.startswith("magnet:")
     headers = {"Authorization": f"Bearer {TORBOX_KEY}"}
 
+    # 🔥 الحل السحري: استخراج بصمة الفيلم (Hash) عشان نصطاده من الحساب
+    magnet_hash = None
+    if is_torrent:
+        match = re.search(r'urn:btih:([a-zA-Z0-9]+)', query, re.IGNORECASE)
+        if match:
+            magnet_hash = match.group(1).lower()
+        
+        if "&tr=" not in query:
+            query += "&tr=udp://tracker.opentrackr.org:1337/announce"
+
     try:
-        item_id = None
-        # 1. إضافة الملف
+        target_id = None
+        # 1. محاولة إضافة الملف (حتى لو موجود قبل كده)
         if is_torrent:
-            if "&tr=" not in query:
-                query += "&tr=udp://tracker.opentrackr.org:1337/announce"
             add_req = requests.post(f"{TORBOX_URL}/torrents/createtorrent", headers=headers, data={"magnet": query, "seed": 1}).json()
-            item_id = add_req.get("data", {}).get("torrent_id")
+            target_id = add_req.get("data", {}).get("torrent_id")
         else:
             add_req = requests.post(f"{TORBOX_URL}/webdownloads/createwebdownload", headers=headers, data={"link": query}).json()
-            item_id = add_req.get("data", {}).get("id")
+            target_id = add_req.get("data", {}).get("id")
 
-        # 2. الانتظار المبدئي زي ما كنت بتحب
-        time.sleep(5)
-        
+        # 2. الانتظار الذكي (بيلف 10 مرات = 30 ثانية)
         check_url = f"{TORBOX_URL}/torrents/mylist" if is_torrent else f"{TORBOX_URL}/webdownloads/mylist"
         
-        # 3. محاولة البحث الذكية (عشان لو حسابك مليان ملفات أو ضفت الملف كذا مرة)
-        for _ in range(5):
-            time.sleep(3) # ثواني إضافية مخفية لضمان استقرار السيرفر
+        for _ in range(10):
+            time.sleep(3) # استنى 3 ثواني في كل لفة
             
-            # ضفنا limit=1000 عشان يجيب كل الـ 286 ملف اللي عندك
+            # جيب كل الملفات اللي في الحساب
             mylist = requests.get(check_url, headers=headers, params={"bypass_cache": True, "limit": 1000}).json()
             
             for item in mylist.get("data", []):
-                # المطابقة بالـ ID أو بحروف الماجنيت كحل بديل
-                if (item_id and str(item.get("id")) == str(item_id)) or (is_torrent and item.get("hash") and item.get("hash").lower() in query.lower()):
+                item_id_str = str(item.get("id"))
+                item_hash = str(item.get("hash", "")).lower()
+                
+                # 🔥 التطابق بالبصمة أو بالآي دي (مستحيل يهرب)
+                if (target_id and item_id_str == str(target_id)) or (magnet_hash and magnet_hash == item_hash):
                     if is_torrent:
                         files = item.get("files", [])
                         if files:
@@ -70,7 +79,7 @@ def generate():
                         if dl_link:
                             return jsonify({"direct_link": dl_link})
         
-        return jsonify({"error": "⏳ الملف بيتحمل حالياً في حسابك TorBox... اضغط سحب كمان دقيقة."})
+        return jsonify({"error": "⏳ الملف ضخم أو لسه بيحمل في سيرفرات TorBox... ارجع اضغط سحب كمان دقيقتين."})
 
     except Exception as e:
         return jsonify({"error": f"مشكلة في السيرفر: {str(e)}"}), 500
