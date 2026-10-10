@@ -30,9 +30,11 @@ TYPES = {
     "alldebrid": "AllDebrid",
     "premiumize": "Premiumize",
     "1fichier": "1Fichier",
+    "debridlink": "Debrid-Link",
 }
 DEFAULT_DOMAINS = {"1fichier": ["1fichier.com"]}  # أنواع بتشتغل على موقعها بس
 ENV_SEED = {
+    "debridlink": "DEBRIDLINK_KEY",
     "torbox": "TORBOX_KEY", "1fichier": "ONEFICHIER_KEY",
     "realdebrid": "REALDEBRID_KEY", "alldebrid": "ALLDEBRID_KEY",
     "premiumize": "PREMIUMIZE_KEY",
@@ -137,6 +139,51 @@ def providers_del(pid):
     return jsonify(ok=True)
 
 
+@app.get("/providers/export")
+def providers_export():
+    return jsonify(items=load())
+
+
+@app.post("/providers/import")
+def providers_import():
+    if load():
+        return jsonify(ok=False)
+    items = [x for x in ((request.get_json() or {}).get("items") or [])
+             if isinstance(x, dict) and x.get("type") in TYPES and x.get("key")]
+    for x in items:
+        x.setdefault("id", uuid.uuid4().hex[:8])
+        x.setdefault("name", TYPES[x["type"]])
+        x.setdefault("domains", DEFAULT_DOMAINS.get(x["type"], []))
+    save(items)
+    return jsonify(ok=True)
+
+
+@app.post("/providers/<pid>/test")
+def providers_test(pid):
+    p = next((x for x in load() if x["id"] == pid), None)
+    if not p:
+        return jsonify(ok=False, error="مش موجود"), 404
+    k, t = p["key"], p["type"]
+    h = {"Authorization": f"Bearer {k}"}
+    try:
+        if t == "torbox":
+            ok = tb(k, "GET", "/user/me").get("success")
+        elif t == "realdebrid":
+            ok = requests.get("https://api.real-debrid.com/rest/1.0/user", headers=h, timeout=15).status_code == 200
+        elif t == "alldebrid":
+            ok = requests.get("https://api.alldebrid.com/v4/user", params={"agent": "Elkomy", "apikey": k}, timeout=15).json().get("status") == "success"
+        elif t == "premiumize":
+            ok = requests.get("https://www.premiumize.me/api/account/info", params={"apikey": k}, timeout=15).json().get("status") == "success"
+        elif t == "debridlink":
+            ok = requests.get("https://debrid-link.com/api/v2/account/infos", headers=h, timeout=15).json().get("success") is True
+        else:
+            r = requests.post("https://api.1fichier.com/v1/user/info.cgi", headers=h, json={}, timeout=15)
+            ok = r.status_code == 200 and r.json().get("status") != "KO"
+        return jsonify(ok=bool(ok))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
 # ----------------- TorBox -----------------
 
 def tb(key, method, path, **kw):
@@ -172,10 +219,20 @@ def pick_file(files):
     return max(vids, key=lambda f: f.get("size", 0))
 
 
+def clean_torbox(k):
+    items = tb(k, "GET", "/webdl/mylist").get("data") or []
+    for x in (items if isinstance(items, list) else []):
+        if not (x.get("download_finished") or x.get("download_present")):
+            tb(k, "POST", "/webdl/controlwebdownload", json={"webdl_id": x["id"], "operation": "delete"})
+
+
 def torbox_web(p, q, web_id=None):
     k = p["key"]
     if not web_id:
         add = tb(k, "POST", "/webdl/createwebdownload", data={"link": q})
+        if not add.get("success") and "limit" in str(add.get("detail") or add.get("error") or "").lower():
+            clean_torbox(k)
+            add = tb(k, "POST", "/webdl/createwebdownload", data={"link": q})
         if not add.get("success"):
             raise Exception(add.get("detail") or add.get("error") or "الرابط غير مدعوم")
         d = add.get("data") or {}
@@ -272,7 +329,15 @@ def r_premiumize(k, u):
     raise Exception(str(res.get("message", "الرابط غير مدعوم")))
 
 
-INSTANT = {"1fichier": r_1fichier, "realdebrid": r_realdebrid,
+def r_debridlink(k, u):
+    res = requests.post("https://debrid-link.com/api/v2/downloader/add",
+                        headers={"Authorization": f"Bearer {k}"}, data={"url": u}, timeout=20).json()
+    if res.get("success") and (res.get("value") or {}).get("downloadUrl"):
+        return res["value"]["downloadUrl"]
+    raise Exception(str(res.get("error", "فشل")))
+
+
+INSTANT = {"debridlink": r_debridlink, "1fichier": r_1fichier, "realdebrid": r_realdebrid,
            "alldebrid": r_alldebrid, "premiumize": r_premiumize}
 
 
