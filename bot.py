@@ -1,13 +1,17 @@
 import os
+import io
 import re
 import json
 import uuid
 import hmac
+import time
+import zipfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -15,16 +19,22 @@ CORS(app)
 
 # ==============================================================
 # Variables على Railway: TMDB_KEY, PROWLARR_URL, PROWLARR_KEY,
-# APP_USER, APP_PASS (الافتراضي admin/admin), DATA_DIR (اختياري)
+# SUBDL_KEY, APP_USER, APP_PASS (الافتراضي admin/admin),
+# DATA_DIR (اختياري)
 # مفاتيح المزوّدين بتتضاف من جوه الموقع مش من الكود
 # ==============================================================
 APP_USER = os.environ.get("APP_USER", "admin")
 APP_PASS = os.environ.get("APP_PASS", "admin")
 TMDB_KEY = os.environ.get("TMDB_KEY", "")
+SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 PFILE = os.path.join(DATA_DIR, "providers.json")
+UDFILE = os.path.join(DATA_DIR, "userdata.json")
+UD_LOCK = threading.Lock()
+MAX_PROFILES = 10
+MAX_ITEMS = 150
 
 TYPES = {
     "torbox": "TorBox",
@@ -55,6 +65,8 @@ ENV_SEED = {
 }
 
 TORBOX_BASE = "https://api.torbox.app/v1/api"
+SUBDL_API = "https://api.subdl.com/api/v1/subtitles"
+SUBDL_DL = "https://dl.subdl.com"
 VIDEO = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v")
 TRACKERS = (
     "&tr=udp://tracker.opentrackr.org:1337/announce"
@@ -129,7 +141,8 @@ def jj(r):
 
 @app.before_request
 def guard():
-    if request.method == "OPTIONS" or request.path in ("/", "/auth"):
+    open_paths = ("/", "/auth", "/ud/beacon")
+    if request.method == "OPTIONS" or request.path in open_paths:
         return None
     sent = request.headers.get("X-Pass", "")
     if not hmac.compare_digest(sent.encode(), APP_PASS.encode()):
@@ -244,6 +257,106 @@ def providers_test(pid):
         return jsonify(ok=False, error=str(e))
 
 
+# ----------------- بيانات المستخدمين (بروفايلات + تقدّم المشاهدة) -----------------
+
+def tnum(x):
+    t = x.get("t") if isinstance(x, dict) else 0
+    return t if isinstance(t, (int, float)) else 0
+
+
+def ud_load():
+    try:
+        with open(UDFILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("profiles", {})
+    d.setdefault("items", {})
+    return d
+
+
+def ud_save(d):
+    tmp = UDFILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, UDFILE)
+
+
+def ud_merge(base, inc):
+    if not isinstance(inc, dict):
+        return base
+    profs = inc.get("profiles")
+    for pid, p in (profs.items() if isinstance(profs, dict) else []):
+        if not isinstance(p, dict) or not isinstance(pid, str) or len(pid) > 24:
+            continue
+        o = base["profiles"].get(pid)
+        if o is None and not p.get("del"):
+            live = [x for x in base["profiles"].values() if not x.get("del")]
+            if len(live) >= MAX_PROFILES:
+                continue
+        if o is None or tnum(p) > tnum(o):
+            base["profiles"][pid] = p
+    allit = inc.get("items")
+    for pid, items in (allit.items() if isinstance(allit, dict) else []):
+        if pid not in base["profiles"] or not isinstance(items, dict):
+            continue
+        dst = base["items"].setdefault(pid, {})
+        for k, it in items.items():
+            if not isinstance(it, dict) or len(str(k)) > 90:
+                continue
+            if len(json.dumps(it)) > 8000:
+                continue
+            o = dst.get(k)
+            if o is None or tnum(it) > tnum(o):
+                dst[k] = it
+        live = sorted(
+            [(tnum(v), k) for k, v in dst.items() if not v.get("del")],
+            reverse=True,
+        )
+        for _, k in live[MAX_ITEMS:]:
+            dst.pop(k, None)
+    cutoff = (time.time() - 60 * 86400) * 1000
+    for dst in base["items"].values():
+        old = [k for k, v in dst.items() if v.get("del") and tnum(v) < cutoff]
+        for k in old:
+            dst.pop(k, None)
+    return base
+
+
+@app.get("/ud")
+def ud_get():
+    with UD_LOCK:
+        return jsonify(ud_load())
+
+
+@app.post("/ud/merge")
+def ud_merge_ep():
+    inc = request.get_json(silent=True) or {}
+    with UD_LOCK:
+        base = ud_merge(ud_load(), inc)
+        ud_save(base)
+    if request.args.get("lite"):
+        return jsonify(ok=True)
+    return jsonify(base)
+
+
+@app.post("/ud/beacon")
+def ud_beacon():
+    try:
+        d = json.loads(request.get_data(as_text=True) or "{}")
+    except ValueError:
+        return "", 400
+    sent = str(d.get("p", ""))
+    if not hmac.compare_digest(sent.encode(), APP_PASS.encode()):
+        return "", 401
+    with UD_LOCK:
+        base = ud_merge(ud_load(), d.get("data") or {})
+        ud_save(base)
+    return "", 204
+
+
 # ----------------- TorBox -----------------
 
 def tb(key, method, path, **kw):
@@ -336,6 +449,19 @@ def tb_link(k, tid, file_id=None, zip_=False):
     raise Exception(dl.get("detail") or dl.get("error") or "TorBox رفض إنشاء الرابط")
 
 
+def find_existing(k, q):
+    m = re.search(r"btih:([a-zA-Z0-9]+)", q, re.I)
+    if not m:
+        return None
+    h = m.group(1).lower()
+    items = tb(k, "GET", "/torrents/mylist",
+               params={"bypass_cache": "true"}).get("data") or []
+    for x in (items if isinstance(items, list) else []):
+        if str(x.get("hash", "")).lower() == h:
+            return x.get("id")
+    return None
+
+
 def clean_torbox(k):
     items = tb(k, "GET", "/webdl/mylist").get("data") or []
     for x in (items if isinstance(items, list) else []):
@@ -380,6 +506,8 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
     if not p:
         return jsonify(error="ضيف TorBox من إعدادات المزوّدين الأول"), 400
     k = p["key"]
+    if not tid and q:
+        tid = find_existing(k, q)
     if not tid:
         if "&tr=" not in q:
             q += TRACKERS
@@ -433,16 +561,21 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
                 return jsonify(error="الملف مش موجود في التورنت"), 400
             url = tb_link(k, tid, f["id"])
             name = f.get("short_name") or (f.get("name") or "").rsplit("/", 1)[-1]
-            return jsonify(direct_link=url, name=name, size=f.get("size"),
-                           provider=p["name"], torrent_id=tid)
+            resp = {"direct_link": url, "name": name, "size": f.get("size"),
+                    "provider": p["name"], "torrent_id": tid, "file_id": f["id"]}
+            if len(vids) > 1:
+                resp["pack"] = True
+                resp["files"] = vids
+                resp["total_size"] = info.get("size")
+            return jsonify(resp)
 
-        # الوضع العادي (زي الأول) + قايمة الحلقات لو باك
+        # الوضع العادي + قايمة الحلقات لو باك
         main = main_file(vids, info)
         if not main:
             return jsonify(error="التورنت فاضي مفيهوش ملفات"), 400
         url = tb_link(k, tid, main["id"])
         resp = {"direct_link": url, "name": main["name"], "size": main["size"],
-                "provider": p["name"], "torrent_id": tid}
+                "provider": p["name"], "torrent_id": tid, "file_id": main["id"]}
         if len(vids) > 1:
             resp["pack"] = True
             resp["files"] = vids
@@ -634,6 +767,25 @@ def tmdb():
         return jsonify(error=str(e)), 500
 
 
+@app.get("/trending")
+def trending():
+    try:
+        res = tmdb_get("/trending/all/week", language="ar").get("results", [])
+        out = []
+        for x in res:
+            if x.get("media_type") not in ("movie", "tv"):
+                continue
+            date = x.get("release_date") or x.get("first_air_date") or ""
+            out.append({
+                "id": x["id"], "type": x["media_type"], "year": date[:4],
+                "title": x.get("title") or x.get("name") or "",
+                "poster": img(x.get("poster_path"), "w342"),
+            })
+        return jsonify(results=out[:20])
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
 @app.get("/details")
 def details():
     t, i = request.args.get("type"), request.args.get("id")
@@ -720,6 +872,252 @@ def search():
         return jsonify(error="البحث أخد وقت طويل، جرب تاني"), 504
     except Exception as e:
         return jsonify(error=f"مشكلة في البحث: {e}"), 500
+
+
+# ----------------- الترجمة (SubDL) -----------------
+
+ZIP_CACHE = {}
+TS_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+
+def ts_secs(m):
+    h, mi, s, ms = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")) / 1000
+
+
+def fmt_secs(t):
+    ms = int(round(max(0.0, t) * 1000))
+    return "%02d:%02d:%02d.%03d" % (
+        ms // 3600000, ms // 60000 % 60, ms // 1000 % 60, ms % 1000
+    )
+
+
+def to_vtt(text, shift=0.0):
+    text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\{\\[^}]*\}", "", text).strip()
+    if text.startswith("WEBVTT"):
+        text = text[6:]
+    lines = []
+    for line in text.split("\n"):
+        if "-->" in line:
+            line = TS_RE.sub(lambda m: fmt_secs(ts_secs(m) + shift), line)
+        lines.append(line)
+    return "WEBVTT\n\n" + "\n".join(lines).strip() + "\n"
+
+
+def ass_secs(t):
+    h, m, s = t.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def ass_to_vtt(text, shift=0.0):
+    cols, in_ev, cues = [], False, []
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if line.startswith("["):
+            in_ev = line.lower() == "[events]"
+            continue
+        if not in_ev:
+            continue
+        low = line.lower()
+        if low.startswith("format:"):
+            cols = [c.strip().lower() for c in line.split(":", 1)[1].split(",")]
+        elif low.startswith("dialogue:") and cols:
+            rest = line.split(":", 1)[1].lstrip()
+            parts = rest.split(",", len(cols) - 1)
+            if len(parts) < len(cols):
+                continue
+            row = dict(zip(cols, parts))
+            try:
+                st, en = ass_secs(row["start"]), ass_secs(row["end"])
+            except (KeyError, ValueError):
+                continue
+            txt = re.sub(r"\{[^}]*\}", "", row.get("text", ""))
+            txt = txt.replace("\\N", "\n").replace("\\n", "\n")
+            txt = txt.replace("\\h", " ").strip()
+            if txt:
+                cues.append((st, en, txt))
+    cues.sort(key=lambda c: c[0])
+    out = ["WEBVTT", ""]
+    for st, en, txt in cues:
+        out.append(fmt_secs(st + shift) + " --> " + fmt_secs(en + shift))
+        out.append(txt)
+        out.append("")
+    return "\n".join(out)
+
+
+def vtt_to_srt(vtt):
+    blocks = re.split(r"\n\s*\n", vtt.strip())
+    out, n = [], 0
+    for b in blocks:
+        lines = b.split("\n")
+        k = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if k is None:
+            continue
+        n += 1
+        lines[k] = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", lines[k])
+        out.append(str(n) + "\n" + "\n".join(lines[k:]))
+    return "\n\n".join(out) + "\n"
+
+
+def decode_sub(raw, ar):
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    for enc in ("utf-8-sig", "cp1256" if ar else "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def get_zip(u):
+    if u in ZIP_CACHE:
+        return ZIP_CACHE[u]
+    r = requests.get(SUBDL_DL + u, timeout=30)
+    if r.status_code != 200:
+        raise Exception(f"تحميل الترجمة فشل ({r.status_code})")
+    if len(r.content) > 6000000:
+        raise Exception("ملف الترجمة كبير زيادة")
+    if len(ZIP_CACHE) >= 20:
+        ZIP_CACHE.pop(next(iter(ZIP_CACHE)))
+    ZIP_CACHE[u] = r.content
+    return r.content
+
+
+def pick_sub(z, season, episode):
+    exts = (".srt", ".vtt", ".ass", ".ssa")
+    names = [
+        i for i in z.infolist()
+        if not i.is_dir() and i.filename.lower().endswith(exts)
+        and i.file_size < 3000000
+    ]
+    if not names:
+        return None
+    if episode is not None:
+        hits = []
+        for i in names:
+            s, e = parse_ep(i.filename)
+            if e == episode and (season is None or s is None or s == season):
+                hits.append(i)
+        if not hits:
+            pat = re.compile(r"(?<!\d)0*%d(?!\d)" % episode)
+            hits = [i for i in names if pat.search(os.path.basename(i.filename))]
+        if hits:
+            names = hits
+    pref = {".srt": 0, ".vtt": 1, ".ass": 2, ".ssa": 3}
+    names.sort(key=lambda i: (
+        pref.get(os.path.splitext(i.filename.lower())[1], 9), -i.file_size
+    ))
+    return names[0]
+
+
+def subdl_call(params):
+    r = requests.get(SUBDL_API, params=params, timeout=25)
+    res = jj(r)
+    if res.get("status") is False and not res.get("subtitles"):
+        msg = str(res.get("error") or "")
+        if "key" in msg.lower() or "api" in msg.lower():
+            raise Exception(msg)
+        return {}
+    return res
+
+
+def sub_items(res):
+    out = []
+    for x in res.get("subtitles") or []:
+        u = x.get("url") or ""
+        if not u.startswith("/subtitle/"):
+            continue
+        out.append({
+            "u": u,
+            "name": x.get("release_name") or x.get("name") or "ترجمة",
+            "lang": x.get("language") or x.get("lang") or "",
+            "author": x.get("author") or "",
+            "season": x.get("season"), "episode": x.get("episode"),
+            "full": bool(x.get("full_season")),
+        })
+    return out
+
+
+@app.get("/subs")
+def subs():
+    if not SUBDL_KEY:
+        return jsonify(error="SUBDL_KEY مش متضاف في Variables على Railway"), 500
+    lang = re.sub(r"[^A-Za-z,]", "", request.args.get("lang", "AR")).upper()
+    lang = lang or "AR"
+    typ = request.args.get("type", "")
+    tid = request.args.get("id", "")
+    q = request.args.get("q", "").strip()
+    s = request.args.get("s", "")
+    e = request.args.get("e", "")
+    base = {"api_key": SUBDL_KEY, "languages": lang}
+    if tid.isdigit() and typ in ("movie", "tv"):
+        base["tmdb_id"] = tid
+        base["type"] = typ
+    elif q:
+        base["film_name"] = q
+        if typ in ("movie", "tv"):
+            base["type"] = typ
+    else:
+        return jsonify(error="بيانات ناقصة"), 400
+
+    attempts = []
+    if base.get("type") == "tv" and s.isdigit():
+        se = dict(base, season_number=s)
+        if e.isdigit():
+            attempts.append(("exact", dict(se, episode_number=e)))
+        attempts.append(("season", dict(se, full_season=1)))
+    last = "loose" if base.get("type") == "tv" else "exact"
+    attempts.append((last, base))
+    try:
+        for mode, params in attempts:
+            items = sub_items(subdl_call(params))
+            if items:
+                return jsonify(items=items[:40], mode=mode)
+        return jsonify(items=[], mode="none")
+    except requests.Timeout:
+        return jsonify(error="SubDL بطيء، جرّب تاني"), 504
+    except Exception as ex:
+        return jsonify(error=f"الترجمة: {ex}"), 500
+
+
+@app.get("/sub")
+def sub_get():
+    u = request.args.get("u", "")
+    if not re.fullmatch(r"/subtitle/[\w.%-]+\.zip", u):
+        return jsonify(error="رابط ترجمة غير صالح"), 400
+    fmt = request.args.get("fmt", "vtt")
+    try:
+        shift = float(request.args.get("shift", 0))
+    except ValueError:
+        shift = 0.0
+    shift = max(-600.0, min(600.0, shift))
+    se, ep = request.args.get("s", ""), request.args.get("e", "")
+    season = int(se) if se.isdigit() else None
+    episode = int(ep) if ep.isdigit() else None
+    ar = "ar" in request.args.get("lang", "").lower()
+    try:
+        z = zipfile.ZipFile(io.BytesIO(get_zip(u)))
+        info = pick_sub(z, season, episode)
+        if not info:
+            return jsonify(error="مفيش ملف ترجمة مدعوم جوه الأرشيف"), 404
+        text = decode_sub(z.read(info), ar)
+        ext = os.path.splitext(info.filename.lower())[1]
+        if ext in (".ass", ".ssa"):
+            vtt = ass_to_vtt(text, shift)
+        else:
+            vtt = to_vtt(text, shift)
+        if fmt == "srt":
+            return Response(vtt_to_srt(vtt), mimetype="application/x-subrip")
+        return Response(vtt, mimetype="text/vtt")
+    except zipfile.BadZipFile:
+        return jsonify(error="ملف الترجمة تالف"), 502
+    except requests.Timeout:
+        return jsonify(error="تحميل الترجمة أخد وقت طويل"), 504
+    except Exception as ex:
+        return jsonify(error=f"الترجمة: {ex}"), 500
 
 
 if __name__ == "__main__":
