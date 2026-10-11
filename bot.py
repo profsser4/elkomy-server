@@ -78,6 +78,11 @@ EP_PATTERNS = (
     re.compile(r"(?<!\d)(\d{1,2})[xX](\d{2,3})(?!\d)"),
 )
 CATS = {"movie": "2000", "tv": "5000", "anime": "5070"}
+LATIN_RE = re.compile(r"[A-Za-z\u00C0-\u024F]")
+NONLAT_RE = re.compile(
+    r"[\u0400-\u04FF\u0590-\u06FF\u0750-\u077F\u3040-\u30FF"
+    r"\u4E00-\u9FFF\uAC00-\uD7AF]"
+)
 
 
 # ----------------- المزوّدين (محفوظين في ملف) -----------------
@@ -738,6 +743,27 @@ def img(p, size):
     return f"https://image.tmdb.org/t/p/{size}{p}" if p else None
 
 
+def is_latin(s):
+    return bool(s) and bool(LATIN_RE.search(s)) and not NONLAT_RE.search(s)
+
+
+def latin_titles(a, e):
+    cands = [
+        e.get("title") or e.get("name"),
+        a.get("original_title") or a.get("original_name"),
+    ]
+    alt = a.get("alternative_titles") or {}
+    for x in (alt.get("titles") or alt.get("results") or []):
+        cands.append(x.get("title"))
+    out, seen = [], set()
+    for c in cands:
+        c = (c or "").strip()
+        if is_latin(c) and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out[:8]
+
+
 @app.get("/tmdb")
 def tmdb():
     q = request.args.get("q", "").strip()
@@ -792,15 +818,18 @@ def details():
     if t not in ("movie", "tv") or not i:
         return jsonify(error="بيانات ناقصة"), 400
     try:
-        a = tmdb_get(f"/{t}/{i}", language="ar", append_to_response="credits")
+        a = tmdb_get(f"/{t}/{i}", language="ar",
+                     append_to_response="credits,alternative_titles")
         e = tmdb_get(f"/{t}/{i}", language="en-US")
         date = a.get("release_date") or a.get("first_air_date") or ""
         rt = a.get("runtime") or (a.get("episode_run_time") or [None])[0]
         cast = (a.get("credits") or {}).get("cast", [])[:10]
+        lat = latin_titles(a, e)
         return jsonify(
             id=int(i), type=t, year=date[:4], runtime=rt,
             title=a.get("title") or a.get("name") or "",
-            search_title=e.get("title") or e.get("name") or "",
+            search_title=lat[0] if lat else "",
+            alt=lat,
             rating=round(a.get("vote_average") or 0, 1),
             overview=a.get("overview") or e.get("overview") or "",
             genres=[g["name"] for g in a.get("genres", [])],
@@ -972,6 +1001,13 @@ def decode_sub(raw, ar):
     return raw.decode("latin-1", errors="replace")
 
 
+def ok_sub_path(u):
+    return (
+        u.startswith("/subtitle/") and len(u) < 300
+        and ".." not in u and not re.search(r"[\s\\]", u)
+    )
+
+
 def get_zip(u):
     if u in ZIP_CACHE:
         return ZIP_CACHE[u]
@@ -1086,7 +1122,7 @@ def subs():
 @app.get("/sub")
 def sub_get():
     u = request.args.get("u", "")
-    if not re.fullmatch(r"/subtitle/[\w.%-]+\.zip", u):
+    if not ok_sub_path(u):
         return jsonify(error="رابط ترجمة غير صالح"), 400
     fmt = request.args.get("fmt", "vtt")
     try:
@@ -1099,12 +1135,18 @@ def sub_get():
     episode = int(ep) if ep.isdigit() else None
     ar = "ar" in request.args.get("lang", "").lower()
     try:
-        z = zipfile.ZipFile(io.BytesIO(get_zip(u)))
-        info = pick_sub(z, season, episode)
-        if not info:
-            return jsonify(error="مفيش ملف ترجمة مدعوم جوه الأرشيف"), 404
-        text = decode_sub(z.read(info), ar)
-        ext = os.path.splitext(info.filename.lower())[1]
+        data = get_zip(u)
+        if data[:2] == b"PK":
+            z = zipfile.ZipFile(io.BytesIO(data))
+            info = pick_sub(z, season, episode)
+            if not info:
+                return jsonify(error="مفيش ملف ترجمة مدعوم جوه الأرشيف"), 404
+            raw = z.read(info)
+            ext = os.path.splitext(info.filename.lower())[1]
+        else:
+            raw = data
+            ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
+        text = decode_sub(raw, ar)
         if ext in (".ass", ".ssa"):
             vtt = ass_to_vtt(text, shift)
         else:
