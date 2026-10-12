@@ -1014,13 +1014,15 @@ def st_streams():
         if a.get("types") and typ not in a["types"]:
             return False
         pre = a.get("prefixes")
-        if pre and not any(imdb.startswith(p) for p in pre):
-            return False
-        return True
+        return not pre or any(imdb.startswith(p) for p in pre)
 
     def one(a):
+        url = f"{a['base']}/stream/{typ}/{sid}.json"
         try:
-            r = requests.get(f"{a['base']}/stream/{typ}/{sid}.json", timeout=25)
+            r = requests.get(url, timeout=25,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return [], f"{a['name']}: رد {r.status_code}"
             out = []
             for x in (r.json().get("streams") or []):
                 h = str(x.get("infoHash") or "").lower()
@@ -1032,8 +1034,8 @@ def st_streams():
                 zm = SIZE_RX.search(txt)
                 size = bh.get("videoSize") or (
                     int(float(zm.group(1)) * UNITS[zm.group(2).upper()]) if zm else 0)
-                url = x.get("url") or ""
-                direct = url if url.startswith(("http://", "https://")) else ""
+                u = x.get("url") or ""
+                direct = u if u.startswith(("http://", "https://")) else ""
                 if not direct and not h:
                     continue
                 out.append({
@@ -1042,19 +1044,20 @@ def st_streams():
                     "indexer": (a["name"] + " " + nm).strip(),
                     "hash": h,
                     "magnet": f"magnet:?xt=urn:btih:{h}&dn={quote(title)}" if h else "",
-                    "direct": direct,
-                    "cached": bool(direct),
+                    "direct": direct, "cached": bool(direct),
                 })
-            return out
-        except Exception:
-            return []
+            return out, (None if out else f"{a['name']}: رد فاضي (0 نتيجة)")
+        except Exception as ex:
+            return [], f"{a['name']}: {ex}"
 
     addons = [a for a in st_load()["addons"] if usable(a)]
     if not addons:
         return jsonify(error="مفيش إضافات بتدي نتايج للنوع ده. ضيف إضافة زي Torrentio.")
     with ThreadPoolExecutor(max_workers=6) as ex:
-        res = [i for part in ex.map(one, addons) for i in part]
-    return jsonify(results=res[:150])
+        parts = list(ex.map(one, addons))
+    res = [i for p, _ in parts for i in p]
+    notes = [n for _, n in parts if n]
+    return jsonify(results=res[:150], notes=notes)
 
 
 # ----------------- TMDB -----------------
