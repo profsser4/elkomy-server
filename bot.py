@@ -22,7 +22,7 @@ CORS(app)
 # Variables على Railway: TMDB_KEY, PROWLARR_URL, PROWLARR_KEY,
 # SUBDL_KEY, APP_USER, APP_PASS (الافتراضي admin/admin),
 # DATA_DIR (اختياري)
-# مفاتيح المزوّدين بتتضاف من جوه الموقع مش من الكود
+# مفاتيح المزوّدين وحساب Stremio بيتضافوا من جوه الموقع مش من الكود
 # ==============================================================
 APP_USER = os.environ.get("APP_USER", "admin")
 APP_PASS = os.environ.get("APP_PASS", "admin")
@@ -33,7 +33,9 @@ PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
+SFILE = os.path.join(DATA_DIR, "stremio.json")
 UD_LOCK = threading.Lock()
+ST_LOCK = threading.Lock()
 MAX_PROFILES = 10
 MAX_ITEMS = 150
 
@@ -68,6 +70,7 @@ ENV_SEED = {
 TORBOX_BASE = "https://api.torbox.app/v1/api"
 SUBDL_API = "https://api.subdl.com/api/v1/subtitles"
 SUBDL_DL = "https://dl.subdl.com"
+ST_API = "https://api.strem.io/api"
 VIDEO = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v")
 TRACKERS = (
     "&tr=udp://tracker.opentrackr.org:1337/announce"
@@ -740,6 +743,320 @@ def generate():
         return jsonify(error=f"مشكلة في السيرفر: {e}"), 500
 
 
+# ----------------- Stremio (حساب + إضافات + مكتبة) -----------------
+
+DEBRID_RX = re.compile(
+    r"(?:^|[/|,;])(realdebrid|alldebrid|premiumize|debridlink|torbox)="
+    r"([^/|,;&\s]+)", re.I)
+SEEDS_RX = re.compile(r"👤\s*(\d+)")
+SIZE_RX = re.compile(r"💾\s*([\d.]+)\s*(TB|GB|MB|KB)", re.I)
+UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def st_load():
+    try:
+        with open(SFILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("addons", [])
+    d.setdefault("ignored", [])
+    return d
+
+
+def st_save(d):
+    tmp = SFILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, SFILE)
+
+
+def st_post(method, body):
+    r = requests.post(f"{ST_API}/{method}", json=body, timeout=20)
+    j = jj(r)
+    err = j.get("error")
+    if err:
+        raise Exception(err.get("message") if isinstance(err, dict) else str(err))
+    return j.get("result")
+
+
+def st_base(u):
+    u = (u or "").strip().replace("stremio://", "https://")
+    return re.sub(r"/manifest\.json.*$", "", u).rstrip("/")
+
+
+def st_info(m):
+    """بترجّع (الأنواع, البادئات) لو الإضافة بتدي streams، وإلا None"""
+    for r in m.get("resources") or []:
+        name = r if isinstance(r, str) else (r or {}).get("name")
+        if name != "stream":
+            continue
+        rd = r if isinstance(r, dict) else {}
+        return {
+            "types": rd.get("types") or m.get("types") or [],
+            "prefixes": rd.get("idPrefixes") or m.get("idPrefixes") or [],
+        }
+    return None
+
+
+def st_manifest(base):
+    r = requests.get(base + "/manifest.json", timeout=15)
+    return jj(r)
+
+
+def st_add(d, base, man):
+    if any(a["base"] == base for a in d["addons"]):
+        return False
+    info = st_info(man)
+    d["addons"].append({
+        "id": uuid.uuid4().hex[:8], "base": base,
+        "name": man.get("name") or "Addon",
+        "stream": info is not None,
+        "types": (info or {}).get("types", []),
+        "prefixes": (info or {}).get("prefixes", []),
+    })
+    return True
+
+
+def st_import_keys(base):
+    """لو رابط الإضافة فيه مفتاح دابريد (زي Torrentio) بنضيفه كمزوّد"""
+    path = unquote(urlparse(base).path)
+    ps = load()
+    added = 0
+    for m in DEBRID_RX.finditer(path):
+        t, k = m.group(1).lower(), m.group(2).strip()
+        if not k or any(p["type"] == t for p in ps):
+            continue
+        ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
+                   "key": k, "domains": []})
+        added += 1
+    if added:
+        save(ps)
+    return added
+
+
+def st_import(d):
+    col = st_post("addonCollectionGet", {
+        "type": "AddonCollectionGet", "authKey": d["authKey"], "update": True})
+    ign = set(d.get("ignored", []))
+    added = keys = 0
+    for a in (col or {}).get("addons", []):
+        u = a.get("transportUrl") or ""
+        if not u.startswith(("http://", "https://")):
+            continue
+        base = st_base(u)
+        if base in ign:
+            continue
+        man = a.get("manifest") or {}
+        if not man:
+            try:
+                man = st_manifest(base)
+            except Exception:
+                man = {}
+        if st_add(d, base, man):
+            added += 1
+        keys += st_import_keys(base)
+    return added, keys
+
+
+@app.post("/stremio/login")
+def st_login():
+    b = request.get_json() or {}
+    email = str(b.get("email", "")).strip()
+    pw = str(b.get("password", ""))
+    if not email or not pw:
+        return jsonify(error="اكتب الإيميل والباسورد"), 400
+    try:
+        res = st_post("login", {"type": "Login", "email": email,
+                                "password": pw, "facebook": False})
+        key = (res or {}).get("authKey")
+        if not key:
+            return jsonify(error="Stremio: تسجيل الدخول فشل"), 400
+        with ST_LOCK:
+            d = st_load()
+            d["authKey"] = key
+            d["email"] = email
+            added, keys = st_import(d)
+            st_save(d)
+        return jsonify(ok=True, added=added, keys=keys)
+    except Exception as e:
+        return jsonify(error=f"Stremio: {e}"), 400
+
+
+@app.post("/stremio/sync")
+def st_sync():
+    with ST_LOCK:
+        d = st_load()
+        if not d.get("authKey"):
+            return jsonify(error="سجّل دخول Stremio الأول"), 400
+        try:
+            added, keys = st_import(d)
+        except Exception as e:
+            return jsonify(error=f"Stremio: {e} (جرّب تسجّل دخول تاني)"), 400
+        st_save(d)
+    return jsonify(ok=True, added=added, keys=keys)
+
+
+@app.post("/stremio/logout")
+def st_logout():
+    with ST_LOCK:
+        d = st_load()
+        d.pop("authKey", None)
+        d.pop("email", None)
+        st_save(d)
+    return jsonify(ok=True)
+
+
+@app.post("/stremio/addon")
+def st_add_ep():
+    base = st_base((request.get_json() or {}).get("url", ""))
+    if not base.startswith(("http://", "https://")):
+        return jsonify(error="الرابط لازم يبدأ بـ https:// أو stremio://"), 400
+    try:
+        man = st_manifest(base)
+    except Exception as e:
+        return jsonify(error=f"الإضافة مش شغالة: {e}"), 400
+    if not isinstance(man, dict) or not man.get("name"):
+        return jsonify(error="ده مش manifest إضافة صحيح"), 400
+    with ST_LOCK:
+        d = st_load()
+        d["ignored"] = [x for x in d["ignored"] if x != base]
+        added = st_add(d, base, man)
+        st_save(d)
+    keys = st_import_keys(base)
+    return jsonify(ok=True, added=added, keys=keys)
+
+
+@app.get("/stremio/addons")
+def st_list():
+    d = st_load()
+    return jsonify(
+        logged=bool(d.get("authKey")), email=d.get("email", ""),
+        items=[{"id": a["id"], "name": a["name"], "stream": a["stream"]}
+               for a in d["addons"]])
+
+
+@app.delete("/stremio/addons/<aid>")
+def st_del(aid):
+    with ST_LOCK:
+        d = st_load()
+        gone = next((a for a in d["addons"] if a["id"] == aid), None)
+        d["addons"] = [a for a in d["addons"] if a["id"] != aid]
+        if gone and gone["base"] not in d["ignored"]:
+            d["ignored"].append(gone["base"])
+        st_save(d)
+    return jsonify(ok=True)
+
+
+@app.get("/stremio/library")
+def st_library():
+    d = st_load()
+    key = d.get("authKey")
+    if not key:
+        return jsonify(items=[])
+    try:
+        res = st_post("datastoreGet", {
+            "type": "DatastoreGet", "authKey": key,
+            "collection": "libraryItem", "ids": [], "all": True})
+    except Exception as e:
+        return jsonify(items=[], error=f"Stremio: {e}")
+    items = []
+    for x in res or []:
+        if not isinstance(x, dict) or x.get("removed") or x.get("temp"):
+            continue
+        iid = str(x.get("_id", ""))
+        typ = x.get("type")
+        if not re.fullmatch(r"tt\d+", iid) or typ not in ("movie", "series"):
+            continue
+        items.append({
+            "imdb": iid, "type": "tv" if typ == "series" else "movie",
+            "title": x.get("name") or "", "poster": x.get("poster"),
+            "year": str(x.get("year") or "")[:4],
+            "t": str(x.get("_mtime") or ""),
+        })
+    items.sort(key=lambda i: i["t"], reverse=True)
+    return jsonify(items=items[:60])
+
+
+@app.get("/stremio/find")
+def st_find():
+    imdb = request.args.get("imdb", "")
+    typ = request.args.get("type", "")
+    if not re.fullmatch(r"tt\d+", imdb):
+        return jsonify(error="IMDb id غير صالح"), 400
+    try:
+        r = tmdb_get(f"/find/{imdb}", external_source="imdb_id")
+        mv = r.get("movie_results") or []
+        tv = r.get("tv_results") or []
+        order = [("tv", tv), ("movie", mv)] if typ == "tv" else [("movie", mv), ("tv", tv)]
+        for t, lst in order:
+            if lst:
+                return jsonify(type=t, id=lst[0]["id"])
+        return jsonify(error="مش لاقي العمل ده على TMDB")
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+@app.get("/stremio/streams")
+def st_streams():
+    typ = "series" if request.args.get("type") == "tv" else "movie"
+    imdb = request.args.get("imdb", "")
+    s, e = request.args.get("s", ""), request.args.get("e", "")
+    if not re.fullmatch(r"tt\d+", imdb):
+        return jsonify(error="العمل ده ملوش IMDb id"), 400
+    sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
+
+    def usable(a):
+        if not a.get("stream"):
+            return False
+        if a.get("types") and typ not in a["types"]:
+            return False
+        pre = a.get("prefixes")
+        if pre and not any(imdb.startswith(p) for p in pre):
+            return False
+        return True
+
+    def one(a):
+        try:
+            r = requests.get(f"{a['base']}/stream/{typ}/{sid}.json", timeout=25)
+            out = []
+            for x in (r.json().get("streams") or []):
+                h = str(x.get("infoHash") or "").lower()
+                bh = x.get("behaviorHints") or {}
+                txt = x.get("title") or x.get("description") or ""
+                nm = (x.get("name") or "").replace("\n", " ").strip()
+                title = (txt.split("\n")[0] or nm or "stream").strip()
+                sm = SEEDS_RX.search(txt)
+                zm = SIZE_RX.search(txt)
+                size = bh.get("videoSize") or (
+                    int(float(zm.group(1)) * UNITS[zm.group(2).upper()]) if zm else 0)
+                url = x.get("url") or ""
+                direct = url if url.startswith(("http://", "https://")) else ""
+                if not direct and not h:
+                    continue
+                out.append({
+                    "title": title, "size": size,
+                    "seeders": int(sm.group(1)) if sm else 0,
+                    "indexer": (a["name"] + " " + nm).strip(),
+                    "hash": h,
+                    "magnet": f"magnet:?xt=urn:btih:{h}&dn={quote(title)}" if h else "",
+                    "direct": direct,
+                    "cached": bool(direct),
+                })
+            return out
+        except Exception:
+            return []
+
+    addons = [a for a in st_load()["addons"] if usable(a)]
+    if not addons:
+        return jsonify(error="مفيش إضافات بتدي نتايج للنوع ده. ضيف إضافة زي Torrentio.")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = [i for part in ex.map(one, addons) for i in part]
+    return jsonify(results=res[:150])
+
+
 # ----------------- TMDB -----------------
 
 def tmdb_get(path, **params):
@@ -924,17 +1241,18 @@ def details():
         return jsonify(error="بيانات ناقصة"), 400
     try:
         a = tmdb_get(f"/{t}/{i}", language="ar",
-                     append_to_response="credits,alternative_titles")
+                     append_to_response="credits,alternative_titles,external_ids")
         e = tmdb_get(f"/{t}/{i}", language="en-US")
         date_s = a.get("release_date") or a.get("first_air_date") or ""
         rt = a.get("runtime") or (a.get("episode_run_time") or [None])[0]
         cast = (a.get("credits") or {}).get("cast", [])[:10]
         lat = latin_titles(a, e)
+        imdb = (a.get("external_ids") or {}).get("imdb_id") or a.get("imdb_id") or ""
         return jsonify(
             id=int(i), type=t, year=date_s[:4], runtime=rt,
             title=a.get("title") or a.get("name") or "",
             search_title=lat[0] if lat else "",
-            alt=lat,
+            alt=lat, imdb=imdb,
             rating=round(a.get("vote_average") or 0, 1),
             overview=a.get("overview") or e.get("overview") or "",
             genres=[g["name"] for g in a.get("genres", [])],
