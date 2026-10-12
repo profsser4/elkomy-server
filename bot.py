@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote, urlparse
 
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -19,7 +19,7 @@ CORS(app)
 
 # ==============================================================
 # Variables على Railway: TMDB_KEY, PROWLARR_URL, PROWLARR_KEY,
-# SUBDL_KEY, APP_USER, APP_PASS (الافتراضي admin/admin),
+# SUBDL_KEY, STREMIO_TOKEN, APP_USER, APP_PASS (الافتراضي admin/admin),
 # DATA_DIR (اختياري)
 # مفاتيح المزوّدين بتتضاف من جوه الموقع مش من الكود
 # ==============================================================
@@ -27,6 +27,7 @@ APP_USER = os.environ.get("APP_USER", "admin")
 APP_PASS = os.environ.get("APP_PASS", "admin")
 TMDB_KEY = os.environ.get("TMDB_KEY", "")
 SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
+STREMIO_TOKEN = os.environ.get("STREMIO_TOKEN", "").strip()
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
@@ -76,6 +77,10 @@ TRACKERS = (
 EP_PATTERNS = (
     re.compile(r"[sS](\d{1,2})[ ._-]*[eE](\d{1,3})"),
     re.compile(r"(?<!\d)(\d{1,2})[xX](\d{2,3})(?!\d)"),
+)
+EP_LOOSE = (
+    re.compile(r"(?<![A-Za-z0-9])(?:Episode|EP|E)[ ._-]?(\d{1,3})(?!\d)", re.I),
+    re.compile(r"الحلقة[ ._-]*(\d{1,3})"),
 )
 CATS = {"movie": "2000", "tv": "5000", "anime": "5070"}
 LATIN_RE = re.compile(r"[A-Za-z\u00C0-\u024F]")
@@ -148,6 +153,8 @@ def jj(r):
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
     if request.method == "OPTIONS" or request.path in open_paths:
+        return None
+    if request.path.startswith("/stremio/"):
         return None
     sent = request.headers.get("X-Pass", "")
     if not hmac.compare_digest(sent.encode(), APP_PASS.encode()):
@@ -405,6 +412,11 @@ def parse_ep(name):
         m = rx.search(name)
         if m:
             return int(m.group(1)), int(m.group(2))
+    base = name.rsplit("/", 1)[-1]
+    for rx in EP_LOOSE:
+        m = rx.search(base)
+        if m:
+            return None, int(m.group(1))
     return None, None
 
 
@@ -590,21 +602,25 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
         return jsonify(error=f"TorBox: {e}"), 400
 
 
+def cached_hashes(hs):
+    p = tb_provider()
+    if not p or not hs:
+        return set()
+    r = tb(p["key"], "GET", "/torrents/checkcached",
+           params={"hash": ",".join(hs), "format": "list"})
+    d = r.get("data") or []
+    if isinstance(d, dict):
+        found = list(d.keys())
+    else:
+        found = [x.get("hash") if isinstance(x, dict) else x for x in d]
+    return {str(x).lower() for x in found if x}
+
+
 @app.get("/cached")
 def cached():
     hs = [h for h in request.args.get("h", "").lower().split(",") if h][:60]
-    p = tb_provider()
-    if not hs or not p:
-        return jsonify(cached=[])
     try:
-        r = tb(p["key"], "GET", "/torrents/checkcached",
-               params={"hash": ",".join(hs), "format": "list"})
-        d = r.get("data") or []
-        if isinstance(d, dict):
-            found = list(d.keys())
-        else:
-            found = [x.get("hash") if isinstance(x, dict) else x for x in d]
-        return jsonify(cached=[str(x).lower() for x in found if x])
+        return jsonify(cached=sorted(cached_hashes(hs)))
     except Exception:
         return jsonify(cached=[])
 
@@ -859,43 +875,47 @@ def season():
 
 # ----------------- بحث التورنت (Prowlarr) -----------------
 
+def prowlarr_search(q, cat=None, timeout=45):
+    if not (PROWLARR_URL and PROWLARR_KEY):
+        raise Exception("PROWLARR_URL و PROWLARR_KEY مش متضافين في Variables")
+    params = {"query": q, "type": "search", "limit": 100}
+    if cat:
+        params["categories"] = cat
+    r = requests.get(f"{PROWLARR_URL}/api/v1/search",
+                     headers={"X-Api-Key": PROWLARR_KEY},
+                     params=params, timeout=timeout)
+    if r.status_code != 200:
+        raise Exception(f"Prowlarr رجّع {r.status_code}: تأكد من الرابط والمفتاح")
+    out = []
+    for x in r.json():
+        mag = x.get("magnetUrl") or ""
+        if not mag.startswith("magnet:"):
+            g = x.get("guid") or ""
+            if g.startswith("magnet:"):
+                mag = g
+            elif x.get("infoHash"):
+                name = quote(x.get("title", ""))
+                mag = f"magnet:?xt=urn:btih:{x['infoHash']}&dn={name}"
+            else:
+                continue
+        m = re.search(r"btih:([a-zA-Z0-9]+)", mag, re.I)
+        h = (x.get("infoHash") or (m.group(1) if m else "")).lower()
+        out.append({
+            "title": x.get("title", ""), "size": x.get("size") or 0,
+            "seeders": x.get("seeders") or 0,
+            "indexer": x.get("indexer", ""), "magnet": mag, "hash": h,
+        })
+    out.sort(key=lambda i: i["seeders"], reverse=True)
+    return out
+
+
 @app.get("/search")
 def search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify(results=[])
-    if not (PROWLARR_URL and PROWLARR_KEY):
-        return jsonify(error="PROWLARR_URL و PROWLARR_KEY مش متضافين في Variables"), 500
-    params = {"query": q, "type": "search", "limit": 100}
-    cat = CATS.get(request.args.get("cat", ""))
-    if cat:
-        params["categories"] = cat
     try:
-        r = requests.get(f"{PROWLARR_URL}/api/v1/search",
-                         headers={"X-Api-Key": PROWLARR_KEY},
-                         params=params, timeout=45)
-        if r.status_code != 200:
-            return jsonify(error=f"Prowlarr رجّع {r.status_code}: تأكد من الرابط والمفتاح"), 502
-        out = []
-        for x in r.json():
-            mag = x.get("magnetUrl") or ""
-            if not mag.startswith("magnet:"):
-                g = x.get("guid") or ""
-                if g.startswith("magnet:"):
-                    mag = g
-                elif x.get("infoHash"):
-                    name = quote(x.get("title", ""))
-                    mag = f"magnet:?xt=urn:btih:{x['infoHash']}&dn={name}"
-                else:
-                    continue
-            m = re.search(r"btih:([a-zA-Z0-9]+)", mag, re.I)
-            h = (x.get("infoHash") or (m.group(1) if m else "")).lower()
-            out.append({
-                "title": x.get("title", ""), "size": x.get("size") or 0,
-                "seeders": x.get("seeders") or 0,
-                "indexer": x.get("indexer", ""), "magnet": mag, "hash": h,
-            })
-        out.sort(key=lambda i: i["seeders"], reverse=True)
+        out = prowlarr_search(q, CATS.get(request.args.get("cat", "")))
         return jsonify(results=out[:60])
     except requests.Timeout:
         return jsonify(error="البحث أخد وقت طويل، جرب تاني"), 504
@@ -1049,6 +1069,28 @@ def pick_sub(z, season, episode):
     return names[0]
 
 
+def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0):
+    data = get_zip(u)
+    if data[:2] == b"PK":
+        z = zipfile.ZipFile(io.BytesIO(data))
+        info = pick_sub(z, season, episode)
+        if not info:
+            raise LookupError("مفيش ملف ترجمة مدعوم جوه الأرشيف")
+        raw = z.read(info)
+        ext = os.path.splitext(info.filename.lower())[1]
+    else:
+        raw = data
+        ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
+    text = decode_sub(raw, ar)
+    if ext in (".ass", ".ssa"):
+        vtt = ass_to_vtt(text, shift)
+    else:
+        vtt = to_vtt(text, shift)
+    if fmt == "srt":
+        return vtt_to_srt(vtt), "application/x-subrip"
+    return vtt, "text/vtt"
+
+
 def subdl_call(params):
     r = requests.get(SUBDL_API, params=params, timeout=25)
     res = jj(r)
@@ -1077,6 +1119,21 @@ def sub_items(res):
     return out
 
 
+def subdl_search(base, s, e, is_tv):
+    attempts = []
+    if is_tv and s:
+        se = dict(base, season_number=s)
+        if e:
+            attempts.append(("exact", dict(se, episode_number=e)))
+        attempts.append(("season", dict(se, full_season=1)))
+    attempts.append(("loose" if is_tv else "exact", base))
+    for mode, params in attempts:
+        items = sub_items(subdl_call(params))
+        if items:
+            return items, mode
+    return [], "none"
+
+
 @app.get("/subs")
 def subs():
     if not SUBDL_KEY:
@@ -1098,21 +1155,12 @@ def subs():
             base["type"] = typ
     else:
         return jsonify(error="بيانات ناقصة"), 400
-
-    attempts = []
-    if base.get("type") == "tv" and s.isdigit():
-        se = dict(base, season_number=s)
-        if e.isdigit():
-            attempts.append(("exact", dict(se, episode_number=e)))
-        attempts.append(("season", dict(se, full_season=1)))
-    last = "loose" if base.get("type") == "tv" else "exact"
-    attempts.append((last, base))
+    is_tv = base.get("type") == "tv"
+    s_i = int(s) if s.isdigit() else None
+    e_i = int(e) if e.isdigit() else None
     try:
-        for mode, params in attempts:
-            items = sub_items(subdl_call(params))
-            if items:
-                return jsonify(items=items[:40], mode=mode)
-        return jsonify(items=[], mode="none")
+        items, mode = subdl_search(base, s_i, e_i, is_tv)
+        return jsonify(items=items[:40], mode=mode)
     except requests.Timeout:
         return jsonify(error="SubDL بطيء، جرّب تاني"), 504
     except Exception as ex:
@@ -1135,31 +1183,377 @@ def sub_get():
     episode = int(ep) if ep.isdigit() else None
     ar = "ar" in request.args.get("lang", "").lower()
     try:
-        data = get_zip(u)
-        if data[:2] == b"PK":
-            z = zipfile.ZipFile(io.BytesIO(data))
-            info = pick_sub(z, season, episode)
-            if not info:
-                return jsonify(error="مفيش ملف ترجمة مدعوم جوه الأرشيف"), 404
-            raw = z.read(info)
-            ext = os.path.splitext(info.filename.lower())[1]
-        else:
-            raw = data
-            ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
-        text = decode_sub(raw, ar)
-        if ext in (".ass", ".ssa"):
-            vtt = ass_to_vtt(text, shift)
-        else:
-            vtt = to_vtt(text, shift)
-        if fmt == "srt":
-            return Response(vtt_to_srt(vtt), mimetype="application/x-subrip")
-        return Response(vtt, mimetype="text/vtt")
+        text, mt = build_sub(u, season, episode, ar, fmt, shift)
+        return Response(text, mimetype=mt)
+    except LookupError as ex:
+        return jsonify(error=str(ex)), 404
     except zipfile.BadZipFile:
         return jsonify(error="ملف الترجمة تالف"), 502
     except requests.Timeout:
         return jsonify(error="تحميل الترجمة أخد وقت طويل"), 504
     except Exception as ex:
         return jsonify(error=f"الترجمة: {ex}"), 500
+
+
+# ----------------- إضافة Stremio (ستريمز من TorBox + ترجمة) -----------------
+
+ST_CACHE = {}
+STOPW = {"the", "of", "a", "an", "and", "in", "on", "to"}
+
+
+def st_ok(token):
+    return bool(STREMIO_TOKEN) and hmac.compare_digest(
+        token.encode(), STREMIO_TOKEN.encode()
+    )
+
+
+def public_base():
+    proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0]
+    return f"{proto}://{request.host}"
+
+
+def parse_sid(sid):
+    parts = unquote(sid).split(":")
+    imdb = parts[0]
+    if not re.fullmatch(r"tt\d{5,10}", imdb):
+        return None, None, None
+    s = e = None
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+        s, e = int(parts[1]), int(parts[2])
+    return imdb, s, e
+
+
+def human(b):
+    if not b:
+        return "?"
+    u = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    b = float(b)
+    while b >= 1024 and i < 4:
+        b /= 1024
+        i += 1
+    return ("%.2f" % b if i >= 3 else "%d" % b) + " " + u[i]
+
+
+def quality_of(title):
+    low = title.lower()
+    if re.search(r"2160p|\b4k\b", low):
+        return 4, "4K"
+    if "1080p" in low:
+        return 3, "1080p"
+    if "720p" in low:
+        return 2, "720p"
+    if "480p" in low:
+        return 1, "480p"
+    return 0, "SD"
+
+
+def toks(s):
+    return [w for w in re.split(r"[\W_]+", (s or "").lower()) if w]
+
+
+def words_of(name):
+    x = re.sub(r"\bs\d{1,2}(e\d{1,3})?\b", " ", name.lower())
+    x = re.sub(r"\b(19|20)\d{2}\b", " ", x)
+    return [w for w in toks(x) if w not in STOPW and (len(w) > 1 or w.isdigit())]
+
+
+def title_ok(title, words):
+    if not words:
+        return False
+    have = set(toks(title))
+    hit = sum(1 for w in words if w in have)
+    need = len(words) - 1 if len(words) >= 4 else len(words)
+    return hit >= need
+
+
+def year_ok(title, year):
+    if not year:
+        return True
+    ys = re.findall(r"\b(?:19|20)\d{2}\b", title)
+    if not ys:
+        return True
+    return any(abs(int(v) - int(year)) <= 1 for v in ys)
+
+
+def info_of(title):
+    t = re.sub(r"[._]", " ", title)
+    m = (re.search(r"\bS(\d{1,2})\s*[- ]?\s*E(\d{1,3})\b", t, re.I)
+         or re.search(r"\b(\d{1,2})x(\d{2,3})\b", t, re.I))
+    if m:
+        return {"s": int(m.group(1)), "e": int(m.group(2))}
+    m = re.search(r"\bS(\d{1,2})\s*(?:-|to)\s*S?(\d{1,2})\b", t, re.I)
+    if m:
+        return {"s": int(m.group(1)), "s2": int(m.group(2)), "pack": True}
+    m = (re.search(r"\bS(\d{1,2})\b", t, re.I)
+         or re.search(r"\bSeason\s*(\d{1,2})\b", t, re.I))
+    if m:
+        return {"s": int(m.group(1)), "pack": True}
+    if re.search(r"\b(complete|collection)\b", t, re.I):
+        return {"s": None, "pack": True, "all": True}
+    m = (re.search(r"(?:^|[^A-Za-z0-9])(?:Episode|EP|E)[ -]?(\d{1,3})(?!\d)", t, re.I)
+         or re.search(r"الحلقة\s*(\d{1,3})", t))
+    if m:
+        return {"s": None, "e": int(m.group(1))}
+    return {}
+
+
+def ep_ok(title, s, e):
+    i = info_of(title)
+    if i.get("all"):
+        return True
+    if i.get("s") is None and i.get("e") is not None:
+        return i["e"] == e
+    if i.get("s") is None:
+        return False
+    if i.get("e") is not None:
+        return i["s"] == s and i["e"] == e
+    if i.get("pack"):
+        return i["s"] <= s <= (i.get("s2") or i["s"])
+    return False
+
+
+def tmdb_find(imdb, typ):
+    j = tmdb_get(f"/find/{imdb}", external_source="imdb_id", language="en-US")
+    res = j.get("movie_results" if typ == "movie" else "tv_results") or []
+    return res[0] if res else None
+
+
+def st_streams(typ, imdb, s, e):
+    key = f"{typ}:{imdb}:{s}:{e}"
+    hit = ST_CACHE.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    if typ == "series" and (s is None or e is None):
+        return []
+    x = tmdb_find(imdb, typ)
+    if not x:
+        return []
+    name = x.get("title") or x.get("name") or ""
+    orig = x.get("original_title") or x.get("original_name") or ""
+    date = x.get("release_date") or x.get("first_air_date") or ""
+    year = date[:4]
+    names = [name] if is_latin(name) else []
+    if orig and orig.lower() != name.lower() and is_latin(orig):
+        names.append(orig)
+    if not names:
+        return []
+
+    queries = []
+    for n in names:
+        if typ == "movie":
+            queries.append(f"{n} {year}".strip())
+        else:
+            queries.append("%s S%02dE%02d" % (n, s, e))
+            queries.append("%s S%02d" % (n, s))
+
+    def run(q):
+        try:
+            return prowlarr_search(q, timeout=25)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        batches = list(ex.map(run, queries))
+    merged = {}
+    for b in batches:
+        for t in b:
+            h = t.get("hash")
+            if h and (h not in merged or t["seeders"] > merged[h]["seeders"]):
+                merged[h] = t
+
+    ws = [words_of(n) for n in names]
+    good = []
+    for t in merged.values():
+        if not any(title_ok(t["title"], w) for w in ws):
+            continue
+        if typ == "movie":
+            if not year_ok(t["title"], year):
+                continue
+        elif not ep_ok(t["title"], s, e):
+            continue
+        good.append(t)
+
+    ok = cached_hashes([t["hash"] for t in good][:60])
+    good = [t for t in good if t["hash"] in ok]
+    good.sort(key=lambda t: (-quality_of(t["title"])[0], -t["seeders"]))
+    items = [{
+        "hash": t["hash"], "title": t["title"], "size": t["size"],
+        "seeders": t["seeders"], "indexer": t["indexer"],
+        "q": quality_of(t["title"])[1],
+    } for t in good[:12]]
+
+    if len(ST_CACHE) >= 100:
+        ST_CACHE.pop(next(iter(ST_CACHE)))
+    ST_CACHE[key] = (time.time(), items)
+    return items
+
+
+@app.get("/stremio-link")
+def stremio_link():
+    if not STREMIO_TOKEN:
+        return jsonify(error="STREMIO_TOKEN مش متضاف في Variables على Railway"), 400
+    base = public_base()
+    path = f"/stremio/{STREMIO_TOKEN}/manifest.json"
+    return jsonify(https=base + path, app="stremio://" + request.host + path)
+
+
+@app.get("/stremio/<token>/manifest.json")
+def st_manifest(token):
+    if not st_ok(token):
+        return jsonify(error="غير موجود"), 404
+    return jsonify({
+        "id": "com.elkomy.debrid",
+        "version": "1.0.0",
+        "name": "Elkomy ⚡",
+        "description": "نسخ جاهزة من TorBox + ترجمة عربي",
+        "resources": ["stream", "subtitles"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt"],
+        "catalogs": [],
+    })
+
+
+@app.get("/stremio/<token>/stream/<typ>/<sid>.json")
+def st_stream(token, typ, sid):
+    if not st_ok(token):
+        return jsonify(error="غير موجود"), 404
+    imdb, s, e = parse_sid(sid)
+    if typ not in ("movie", "series") or not imdb:
+        return jsonify(streams=[])
+    try:
+        items = st_streams(typ, imdb, s, e)
+    except Exception:
+        return jsonify(streams=[])
+    base = public_base()
+    out = []
+    for t in items:
+        url = f"{base}/stremio/{STREMIO_TOKEN}/play/{t['hash']}"
+        if typ == "series":
+            url += f"?s={s}&e={e}"
+        out.append({
+            "name": "Elkomy ⚡\n" + t["q"],
+            "title": "%s\n💾 %s · 👥 %s · %s" % (
+                t["title"], human(t["size"]), t["seeders"], t["indexer"]
+            ),
+            "url": url,
+        })
+    return jsonify(streams=out)
+
+
+def pick_for_episode(vids, s, e):
+    if not vids:
+        return None
+    if e is None:
+        return max(vids, key=lambda v: v["size"])
+    hits = [
+        v for v in vids
+        if v["episode"] == e and (v["season"] is None or s is None or v["season"] == s)
+    ]
+    if hits:
+        return hits[0]
+    if len(vids) == 1:
+        return vids[0]
+    return None
+
+
+@app.get("/stremio/<token>/play/<h>")
+def st_play(token, h):
+    if not st_ok(token):
+        return "غير موجود", 404
+    if not re.fullmatch(r"[A-Fa-f0-9]{40}", h):
+        return "هاش غير صالح", 400
+    se, ep = request.args.get("s", ""), request.args.get("e", "")
+    s = int(se) if se.isdigit() else None
+    e = int(ep) if ep.isdigit() else None
+    p = tb_provider()
+    if not p:
+        return "TorBox مش متضاف", 503
+    k = p["key"]
+    try:
+        magnet = "magnet:?xt=urn:btih:" + h.lower()
+        tid = find_existing(k, magnet)
+        if not tid:
+            add = tb(k, "POST", "/torrents/createtorrent",
+                     data={"magnet": magnet + TRACKERS, "seed": 1})
+            tid = (add.get("data") or {}).get("torrent_id")
+        if not tid:
+            return "TorBox رفض التورنت", 502
+        info = {}
+        for _ in range(10):
+            raw = tb(k, "GET", "/torrents/mylist",
+                     params={"id": tid, "bypass_cache": "true"}).get("data")
+            info = as_dict(raw)
+            if is_ready(info):
+                break
+            time.sleep(2)
+        if not is_ready(info):
+            return "التورنت لسه بيتجهز في TorBox", 503
+        f = pick_for_episode(video_files(info), s, e)
+        if not f:
+            return "الحلقة مش موجودة في التورنت", 404
+        return redirect(tb_link(k, tid, f["id"]), code=302)
+    except Exception as ex:
+        return f"خطأ: {ex}", 502
+
+
+@app.get("/stremio/<token>/subtitles/<typ>/<sid>.json")
+@app.get("/stremio/<token>/subtitles/<typ>/<sid>/<extra>.json")
+def st_subtitles(token, typ, sid, extra=None):
+    if not st_ok(token):
+        return jsonify(error="غير موجود"), 404
+    imdb, s, e = parse_sid(sid)
+    if not SUBDL_KEY or not imdb or typ not in ("movie", "series"):
+        return jsonify(subtitles=[])
+    is_tv = typ == "series"
+    base = {"api_key": SUBDL_KEY, "languages": "AR,EN", "imdb_id": imdb,
+            "type": "tv" if is_tv else "movie"}
+    try:
+        items, _ = subdl_search(base, s, e, is_tv)
+    except Exception:
+        return jsonify(subtitles=[])
+
+    def lang3(x):
+        low = (x.get("lang") or "").lower()
+        if low.startswith("ar"):
+            return "ara"
+        if low.startswith("en"):
+            return "eng"
+        return low[:3] or "und"
+
+    items.sort(key=lambda x: lang3(x) != "ara")
+    host = public_base()
+    out = []
+    for i, x in enumerate(items[:12]):
+        q = "u=" + quote(x["u"], safe="") + "&lang=" + quote(x.get("lang") or "")
+        if s:
+            q += f"&s={s}"
+        if e:
+            q += f"&e={e}"
+        out.append({
+            "id": f"elkomy-{i}",
+            "url": f"{host}/stremio/{STREMIO_TOKEN}/sub.srt?{q}",
+            "lang": lang3(x),
+        })
+    return jsonify(subtitles=out)
+
+
+@app.get("/stremio/<token>/sub.srt")
+def st_sub(token):
+    if not st_ok(token):
+        return "", 404
+    u = request.args.get("u", "")
+    if not ok_sub_path(u):
+        return "", 400
+    se, ep = request.args.get("s", ""), request.args.get("e", "")
+    season = int(se) if se.isdigit() else None
+    episode = int(ep) if ep.isdigit() else None
+    ar = "ar" in request.args.get("lang", "").lower()
+    try:
+        text, mt = build_sub(u, season, episode, ar, "srt")
+    except Exception:
+        return "", 502
+    return Response(text, mimetype=mt)
 
 
 if __name__ == "__main__":
