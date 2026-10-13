@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from urllib.parse import quote, unquote, urlparse, urljoin
 
 import requests
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, Response, g, make_response
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -38,10 +38,15 @@ PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
+HOME_FILE = os.path.join(DATA_DIR, "home.json")
+ACT_FILE = os.path.join(DATA_DIR, "activity.json")
 UD_LOCK = threading.Lock()
 ST_LOCK = threading.Lock()
 USERS_LOCK = threading.Lock()
 REF_LOCK = threading.Lock()
+ACT_LOCK = threading.Lock()
+LAST = {}
+CAT_CACHE = {}
 MAX_PROFILES = 10
 MAX_ITEMS = 150
 SECRET = os.environ.get("SECRET_KEY") or APP_PASS
@@ -215,7 +220,7 @@ def read_token(tok):
 
 
 def needs_admin(path, method):
-    if path.startswith(("/providers", "/users")):
+    if path.startswith(("/providers", "/users", "/home/", "/activity")):
         return True
     if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
                 "/stremio/library"):
@@ -234,6 +239,7 @@ def guard():
     if not who:
         return jsonify(error="غير مصرّح"), 401
     g.user, g.role = who
+    LAST[g.user] = time.time()
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
     return None
@@ -1178,8 +1184,7 @@ INSTANT = {
 }
 
 
-@app.post("/generate")
-def generate():
+def _generate():
     data = request.get_json() or {}
     q = (data.get("query") or data.get("magnet") or data.get("link") or "").strip()
     tid = data.get("torrent_id")
@@ -1233,11 +1238,65 @@ def generate():
         return jsonify(error=f"مشكلة في السيرفر: {e}"), 500
 
 
+# ----------------- سجل النشاط -----------------
+
+def act_load():
+    try:
+        with open(ACT_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def act_log(user, kind, name, size, prov):
+    try:
+        size = int(size or 0)
+    except (TypeError, ValueError):
+        size = 0
+    name = str(name or "")[:160]
+    now = int(time.time() * 1000)
+    with ACT_LOCK:
+        d = act_load()
+        u = d.setdefault(user, {"bytes": 0, "count": 0, "ev": []})
+        for e in u["ev"][-5:]:
+            if e.get("n") == name and e.get("k") == kind and now - e.get("t", 0) < 300000:
+                return
+        u["bytes"] += max(size, 0)
+        u["count"] += 1
+        u["ev"].append({"t": now, "k": kind, "n": name, "s": size,
+                        "p": str(prov or "")[:40]})
+        del u["ev"][:-300]
+        tmp = ACT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, ACT_FILE)
+
+
+@app.post("/generate")
+def generate():
+    resp = make_response(_generate())
+    if resp.status_code == 200:
+        try:
+            d = resp.get_json(silent=True) or {}
+            if d.get("direct_link"):
+                kind = "zip" if d.get("zip") else ("torrent" if d.get("torrent_id") else "link")
+                act_log(g.user, kind, d.get("name"), d.get("size"), d.get("provider"))
+            elif d.get("links"):
+                act_log(g.user, "all", f"{d.get('name') or ''} ({len(d['links'])} ملف)",
+                        sum((x.get("size") or 0) for x in d["links"]), d.get("provider"))
+        except Exception:
+            pass
+    return resp
+
+
 # ----------------- Stremio (حساب + إضافات + مكتبة) -----------------
 
 DEBRID_RX = re.compile(
     r"(?:^|[/|,;])(realdebrid|alldebrid|premiumize|debridlink|torbox)="
     r"([^/|,;&\s]+)", re.I)
+HASH_RX = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
+TBOFF_RX = re.compile(r"stremio\.torbox\.app/([0-9a-fA-F-]{20,})", re.I)
 SEEDS_RX = re.compile(r"👤\s*(\d+)")
 SIZE_RX = re.compile(r"💾\s*([\d.]+)\s*(TB|GB|MB|KB)", re.I)
 UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
@@ -1296,8 +1355,30 @@ def st_manifest(base):
     return jj(r)
 
 
+def st_catalogs(m):
+    """الكتالوجات اللي تنفع تتعرض كصفوف في الرئيسية (من غير بحث إجباري)"""
+    out = []
+    for c in (m or {}).get("catalogs") or []:
+        if not isinstance(c, dict) or not c.get("id") or c.get("type") not in ("movie", "series"):
+            continue
+        extra = c.get("extra") or []
+        if c.get("extraRequired") or any(
+                isinstance(x, dict) and x.get("isRequired") for x in extra):
+            continue
+        genres = []
+        for x in extra:
+            if isinstance(x, dict) and x.get("name") == "genre":
+                genres = [str(o) for o in (x.get("options") or [])][:40]
+        out.append({"type": c["type"], "id": str(c["id"]),
+                    "name": str(c.get("name") or c["id"])[:50], "genres": genres})
+    return out
+
+
 def st_add(d, base, man):
-    if any(a["base"] == base for a in d["addons"]):
+    ex = next((a for a in d["addons"] if a["base"] == base), None)
+    if ex:
+        if man:
+            ex["catalogs"] = st_catalogs(man)
         return False
     info = st_info(man)
     d["addons"].append({
@@ -1306,6 +1387,7 @@ def st_add(d, base, man):
         "stream": info is not None,
         "types": (info or {}).get("types", []),
         "prefixes": (info or {}).get("prefixes", []),
+        "catalogs": st_catalogs(man),
     })
     return True
 
@@ -1321,6 +1403,11 @@ def st_import_keys(base):
             continue
         ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
                    "key": k, "domains": []})
+        added += 1
+    mt = TBOFF_RX.search(base)
+    if mt and not any(p["type"] == "torbox" for p in ps):
+        ps.append({"id": uuid.uuid4().hex[:8], "type": "torbox", "name": TYPES["torbox"],
+                   "key": mt.group(1), "domains": []})
         added += 1
     if added:
         save(ps)
@@ -1544,15 +1631,23 @@ def st_streams():
         return jsonify(error="العمل ده ملوش IMDb id"), 400
     sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
 
+    own = bool(torrent_providers())
+    all_keys = {p["key"] for p in load() if p.get("key")}
+    for a_ in st_load()["addons"]:
+        all_keys |= {m.group(2) for m in DEBRID_RX.finditer(
+            unquote(urlparse(a_["base"]).path))}
+    low_keys = {k.lower() for k in all_keys}
+
     def usable(a):
         if not a.get("stream"):
             return False
         if a.get("types") and typ not in a["types"]:
             return False
+        if own and st_plain_base(a["base"]) == a["base"] and any(
+                k in unquote(a["base"]) for k in all_keys):
+            return False
         pre = a.get("prefixes")
         return not pre or any(imdb.startswith(p) for p in pre)
-
-    own = bool(torrent_providers())
 
     def one(a):
         qb = st_plain_base(a["base"]) if own else a["base"]
@@ -1575,6 +1670,17 @@ def st_streams():
                     int(float(zm.group(1)) * UNITS[zm.group(2).upper()]) if zm else 0)
                 u = x.get("url") or ""
                 direct = u if u.startswith(("http://", "https://")) else ""
+                keyed = bool(direct) and any(k in unquote(direct) for k in all_keys)
+                if keyed:
+                    if not h:
+                        cand = [m for m in HASH_RX.findall(unquote(direct))
+                                if m.lower() not in low_keys]
+                        if cand:
+                            h = cand[0].lower()
+                    if h and own:
+                        direct = ""
+                    elif own or not is_admin:
+                        continue
                 if not direct and not h:
                     continue
                 out.append({
@@ -1614,7 +1720,8 @@ def st_streams():
 
 @app.post("/stremio/resolve")
 def st_resolve():
-    ref = str((request.get_json(silent=True) or {}).get("ref", ""))
+    req = request.get_json(silent=True) or {}
+    ref = str(req.get("ref", ""))
     url = REFS.get(ref)
     if not url:
         return jsonify(error="الرابط انتهى، دوّر على النتايج تاني"), 404
@@ -1643,9 +1750,207 @@ def st_resolve():
             break
         if g.role != "admin" and any(p.get("key") and p["key"] in cur for p in load()):
             return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
+        act_log(g.user, "stremio", req.get("name"), req.get("size"), "Stremio")
         return jsonify(url=cur)
     except Exception as ex:
         return jsonify(error=f"فشل تجهيز الرابط: {short_err(ex)}"), 502
+
+
+# ----------------- الصفحة الرئيسية (كتالوجات Stremio) + نشاط المستخدمين -----------------
+
+def ensure_catalogs():
+    with ST_LOCK:
+        d = st_load()
+        todo = [a for a in d["addons"] if "catalogs" not in a]
+        if not todo:
+            return d
+
+        def f(a):
+            try:
+                return st_catalogs(st_manifest(a["base"]))
+            except Exception:
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            res = list(ex.map(f, todo))
+        for a, c in zip(todo, res):
+            a["catalogs"] = c
+        st_save(d)
+        return d
+
+
+def type_ar(t):
+    return "أفلام" if t == "movie" else "مسلسلات"
+
+
+def home_default(d):
+    out = []
+    for a in d["addons"]:
+        for c in a.get("catalogs") or []:
+            out.append({
+                "k": hashlib.md5(f"{a['id']}|{c['type']}|{c['id']}".encode()).hexdigest()[:8],
+                "a": a["id"], "ty": c["type"], "c": c["id"], "g": "",
+                "t": f"{c['name']} · {type_ar(c['type'])}", "on": len(out) < 10})
+    return out
+
+
+def home_layout(d):
+    try:
+        with open(HOME_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception:
+        saved = None
+    if isinstance(saved, dict) and isinstance(saved.get("rows"), list):
+        return saved["rows"]
+    return home_default(d)
+
+
+@app.get("/home/catalogs")
+def home_catalogs():
+    d = ensure_catalogs()
+    items = []
+    for a in d["addons"]:
+        for c in a.get("catalogs") or []:
+            items.append({"a": a["id"], "an": a["name"], "ty": c["type"], "c": c["id"],
+                          "name": c["name"], "genres": c.get("genres", [])})
+    return jsonify(items=items)
+
+
+@app.get("/home/layout")
+def home_layout_get():
+    d = ensure_catalogs()
+    ids = {a["id"] for a in d["addons"]}
+    return jsonify(rows=[r for r in home_layout(d) if r.get("a") in ids])
+
+
+@app.post("/home/layout")
+def home_layout_set():
+    d = st_load()
+    ids = {a["id"] for a in d["addons"]}
+    rows_in = (request.get_json(silent=True) or {}).get("rows")
+    if not isinstance(rows_in, list):
+        return jsonify(error="بيانات ناقصة"), 400
+    out, seen = [], set()
+    for r in rows_in[:40]:
+        if not isinstance(r, dict) or r.get("a") not in ids or r.get("ty") not in ("movie", "series"):
+            continue
+        k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
+        if k in seen:
+            k = uuid.uuid4().hex[:8]
+        seen.add(k)
+        out.append({"k": k, "a": r["a"], "ty": r["ty"], "c": str(r.get("c", ""))[:80],
+                    "g": str(r.get("g", ""))[:40], "t": str(r.get("t", ""))[:60] or "صف",
+                    "on": bool(r.get("on"))})
+    tmp = HOME_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"rows": out}, f, ensure_ascii=False)
+    os.replace(tmp, HOME_FILE)
+    return jsonify(ok=True)
+
+
+def cat_items(a, e):
+    key = (a["id"], e["ty"], e["c"], e.get("g", ""))
+    hit = CAT_CACHE.get(key)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1]
+    path = f"/catalog/{e['ty']}/{quote(e['c'], safe='')}"
+    if e.get("g"):
+        path += f"/genre={quote(e['g'], safe='')}"
+    r = requests.get(a["base"] + path + ".json", timeout=20,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    items = []
+    for m in (r.json().get("metas") or []):
+        iid = str(m.get("id", ""))
+        if not m.get("poster"):
+            continue
+        it = {"type": "tv" if (m.get("type") or e["ty"]) == "series" else "movie",
+              "title": m.get("name") or "", "poster": m["poster"],
+              "year": str(m.get("year") or m.get("releaseInfo") or "")[:4]}
+        if re.fullmatch(r"tt\d+", iid):
+            it["imdb"] = iid
+        elif iid.startswith("tmdb:") and iid[5:].isdigit():
+            it["id"] = int(iid[5:])
+        else:
+            continue
+        items.append(it)
+    items = items[:20]
+    if items:
+        CAT_CACHE[key] = (time.time(), items)
+    return items
+
+
+@app.get("/rows")
+def rows():
+    d = ensure_catalogs()
+    amap = {a["id"]: a for a in d["addons"]}
+    ents = [e for e in home_layout(d) if e.get("on") and e.get("a") in amap]
+    if not ents:
+        return tmdb_rows()
+
+    def one(e):
+        try:
+            items = cat_items(amap[e["a"]], e)
+        except Exception:
+            return None
+        return {"id": e["k"], "title": e["t"], "items": items} if items else None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        got = list(ex.map(one, ents))
+    data = [x for x in got if x]
+    if not data:
+        return tmdb_rows()
+    return jsonify(rows=data)
+
+
+def watch_stats(user):
+    ud = ud_load(user)
+    profs = ud.get("profiles", {})
+    secs = titles = last = 0
+    rows_ = []
+    for pid, its in (ud.get("items") or {}).items():
+        pr = profs.get(pid) or {}
+        for k, it in (its or {}).items():
+            if not isinstance(it, dict) or it.get("del") or str(k).startswith("l") or not it.get("title"):
+                continue
+            dur = it.get("dur") or 0
+            pos = it.get("pos") or 0
+            secs += dur if it.get("done") else min(pos, dur or pos)
+            titles += 1
+            last = max(last, tnum(it))
+            rows_.append({"profile": pr.get("name", ""), "title": it.get("title"),
+                          "type": it.get("type"), "s": it.get("s"), "e": it.get("e"),
+                          "pos": pos, "dur": dur, "done": bool(it.get("done")),
+                          "t": tnum(it)})
+    rows_.sort(key=lambda x: x["t"], reverse=True)
+    return secs, titles, last, rows_
+
+
+@app.get("/activity")
+def activity_list():
+    admin = APP_USER.lower()
+    names = [(admin, "admin")] + [(n, "user") for n in sorted(users_load())]
+    act = act_load()
+    out = []
+    for n, role in names:
+        a = act.get(n, {})
+        secs, titles, last_w, _ = watch_stats(n)
+        ev = a.get("ev") or []
+        last = max(last_w, ev[-1]["t"] if ev else 0, int(LAST.get(n, 0) * 1000))
+        out.append({"name": n, "role": role, "bytes": a.get("bytes", 0),
+                    "count": a.get("count", 0), "watch": secs, "titles": titles,
+                    "last": last})
+    return jsonify(items=out)
+
+
+@app.get("/activity/<name>")
+def activity_user(name):
+    name = name.lower()
+    if name != APP_USER.lower() and name not in users_load():
+        return jsonify(error="المستخدم مش موجود"), 404
+    a = act_load().get(name, {})
+    _, _, _, watched = watch_stats(name)
+    return jsonify(pulls=list(reversed(a.get("ev") or []))[:100], watched=watched[:100],
+                   bytes=a.get("bytes", 0), count=a.get("count", 0))
 
 
 # ----------------- TMDB -----------------
@@ -1799,8 +2104,7 @@ def row_items(row):
     return out[:20]
 
 
-@app.get("/rows")
-def rows():
+def tmdb_rows():
     if not TMDB_KEY:
         return jsonify(error="TMDB_KEY مش متضاف في Variables على Railway"), 500
     now = time.time()
