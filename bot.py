@@ -764,11 +764,27 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
         return jsonify(error=f"TorBox: {e}"), 400
 
 
-def cached_hashes(hs):
-    p = tb_provider()
-    if not p or not hs:
-        return set()
-    r = tb(p["key"], "GET", "/torrents/checkcached",
+# ----------------- تورنت على TorBox / Real-Debrid / Debrid-Link -----------------
+
+TORRENT_TYPES = ("torbox", "debridlink", "realdebrid")   # الترتيب = الأولوية
+CHECKABLE = ("torbox", "debridlink")                      # بيدعموا فحص "فوري"
+RD_API = "https://api.real-debrid.com/rest/1.0"
+DL_API = "https://debrid-link.com/api/v2"
+
+
+def torrent_providers():
+    ps = [p for p in load() if p["type"] in TORRENT_TYPES]
+    ps.sort(key=lambda p: TORRENT_TYPES.index(p["type"]))
+    return ps
+
+
+def magnet_hash(q):
+    m = re.search(r"btih:([a-zA-Z0-9]+)", q or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
+def tb_cached(k, hs):
+    r = tb(k, "GET", "/torrents/checkcached",
            params={"hash": ",".join(hs), "format": "list"})
     d = r.get("data") or []
     if isinstance(d, dict):
@@ -778,13 +794,326 @@ def cached_hashes(hs):
     return {str(x).lower() for x in found if x}
 
 
+# ---- Real-Debrid
+def rd(k, method, path, **kw):
+    r = requests.request(method, RD_API + path,
+                         headers={"Authorization": f"Bearer {k}"},
+                         timeout=25, **kw)
+    if r.status_code == 204 or not r.content:
+        return r.status_code, {}
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, {}
+
+
+def rd_err(code, d, default):
+    if isinstance(d, dict) and d.get("error"):
+        return str(d["error"])
+    return f"{default} ({code})"
+
+
+def rd_find(k, q):
+    h = magnet_hash(q)
+    if not h:
+        return None
+    for page in (1, 2):
+        code, d = rd(k, "GET", "/torrents", params={"limit": 100, "page": page})
+        if code != 200 or not isinstance(d, list):
+            return None
+        for x in d:
+            if str(x.get("hash", "")).lower() == h:
+                return x.get("id")
+        if len(d) < 100:
+            break
+    return None
+
+
+def rd_add(k, q):
+    code, d = rd(k, "POST", "/torrents/addMagnet", data={"magnet": q})
+    if code not in (200, 201) or not d.get("id"):
+        raise Exception(rd_err(code, d, "فشل إضافة التورنت"))
+    return d["id"]
+
+
+def rd_info(k, rid):
+    code, d = rd(k, "GET", f"/torrents/info/{rid}")
+    if code != 200 or not isinstance(d, dict) or not d.get("id"):
+        raise Exception(rd_err(code, d, "التورنت مش موجود"))
+    st = str(d.get("status", ""))
+    out = {"ready": False, "status": st,
+           "progress": (d.get("progress") or 0) / 100,
+           "speed": d.get("speed"), "seeds": d.get("seeders"), "peers": None,
+           "size": d.get("bytes"), "name": d.get("filename"), "files": []}
+    if st in ("magnet_error", "error", "virus", "dead"):
+        raise Exception(f"التورنت فشل ({st})")
+    files = d.get("files") or []
+    if st == "waiting_files_selection":
+        vids = [f["id"] for f in files
+                if str(f.get("path", "")).lower().endswith(VIDEO)]
+        ids = vids or [f["id"] for f in files]
+        c2, d2 = rd(k, "POST", f"/torrents/selectFiles/{rid}",
+                    data={"files": ",".join(str(i) for i in ids)})
+        if c2 not in (200, 201, 204):
+            raise Exception(rd_err(c2, d2, "فشل اختيار الملفات"))
+        out["status"] = "selecting"
+        return out
+    if st == "downloaded":
+        sel = [f for f in files if f.get("selected")]
+        links = d.get("links") or []
+        res = []
+        for i, f in enumerate(sel):
+            if i >= len(links):
+                break
+            path = str(f.get("path", "")).lstrip("/")
+            res.append({"id": len(res), "name": path,
+                        "short_name": path.rsplit("/", 1)[-1],
+                        "size": f.get("bytes") or 0, "link": links[i]})
+        if not res:
+            raise Exception("مفيش ملفات جاهزة في التورنت")
+        out.update(ready=True, files=res, progress=1)
+    return out
+
+
+def rd_link(k, f):
+    code, d = rd(k, "POST", "/unrestrict/link", data={"link": f["link"]})
+    if d.get("download"):
+        return d["download"]
+    raise Exception(rd_err(code, d, "فشل فك الرابط"))
+
+
+# ---- Debrid-Link
+def dl(k, method, path, **kw):
+    r = requests.request(method, DL_API + path,
+                         headers={"Authorization": f"Bearer {k}"},
+                         timeout=25, **kw)
+    try:
+        return r.json()
+    except ValueError:
+        return {"success": False, "error": f"Debrid-Link رد غير مفهوم ({r.status_code})"}
+
+
+def dl_list(k, **params):
+    d = dl(k, "GET", "/seedbox/list", params=params)
+    if not d.get("success"):
+        raise Exception(str(d.get("error") or "فشل"))
+    v = d.get("value")
+    return v if isinstance(v, list) else []
+
+
+def dl_find(k, q):
+    h = magnet_hash(q)
+    if not h:
+        return None
+    for x in dl_list(k, perPage=50):
+        if str(x.get("hashString", "")).lower() == h:
+            return x.get("id")
+    return None
+
+
+def dl_add(k, q):
+    d = dl(k, "POST", "/seedbox/add", data={"url": q, "async": "true"})
+    v = d.get("value")
+    if d.get("success") and isinstance(v, dict) and v.get("id"):
+        return v["id"]
+    if "already" in str(d.get("error", "")).lower():
+        rid = dl_find(k, q)
+        if rid:
+            return rid
+    raise Exception(str(d.get("error") or "فشل إضافة التورنت"))
+
+
+def dl_info(k, rid):
+    lst = dl_list(k, ids=rid)
+    d = lst[0] if lst else None
+    if not d:
+        raise Exception("التورنت مش موجود")
+    if d.get("errorString"):
+        raise Exception(str(d["errorString"]))
+    pct = float(d.get("downloadPercent") or 0)
+    res = []
+    for f in d.get("files") or []:
+        if not f.get("downloadUrl"):
+            continue
+        name = str(f.get("name") or "")
+        res.append({"id": len(res), "name": name,
+                    "short_name": name.rsplit("/", 1)[-1],
+                    "size": f.get("size") or 0, "link": f["downloadUrl"]})
+    ready = pct >= 100 and bool(res)
+    return {"ready": ready, "status": "ready" if ready else "downloading",
+            "progress": pct / 100, "speed": d.get("downloadSpeed"),
+            "seeds": None, "peers": d.get("peersConnected"),
+            "size": d.get("totalSize"), "name": d.get("name"),
+            "files": res if ready else []}
+
+
+def dl_cached(k, hs):
+    found = set()
+    for i in range(0, len(hs), 40):
+        d = dl(k, "GET", "/seedbox/cached", params={"url": ",".join(hs[i:i + 40])})
+        v = d.get("value") if d.get("success") else None
+        if isinstance(v, dict):
+            found |= {str(x).lower() for x in v.keys()}
+    return found
+
+
+ADAPT = {
+    "realdebrid": {"find": rd_find, "add": rd_add, "info": rd_info, "link": rd_link},
+    "debridlink": {"find": dl_find, "add": dl_add, "info": dl_info,
+                   "link": lambda k, f: f["link"]},
+}
+
+
+def cached_for(p, hs):
+    if p["type"] == "torbox":
+        return tb_cached(p["key"], hs)
+    if p["type"] == "debridlink":
+        return dl_cached(p["key"], hs)
+    return set()
+
+
+def cached_hashes(hs):
+    out = set()
+    if not hs:
+        return out
+    for p in torrent_providers():
+        if p["type"] in CHECKABLE:
+            try:
+                out |= cached_for(p, hs)
+            except Exception:
+                pass
+    return out
+
+
+def ordered_tprovs(h):
+    ps = torrent_providers()
+    first = []
+    for p in ps:
+        if h and p["type"] in CHECKABLE:
+            try:
+                if h in cached_for(p, [h]):
+                    first.append(p)
+            except Exception:
+                pass
+    return first + [p for p in ps if p not in first]
+
+
+def generic_flow(p, q, rid, file_id=None, want_zip=False, want_all=False):
+    ad = ADAPT[p["type"]]
+    k = p["key"]
+    try:
+        if not rid:
+            rid = ad["find"](k, q)
+            if not rid:
+                if "&tr=" not in q:
+                    q += TRACKERS
+                rid = ad["add"](k, q)
+        tid = f"x:{p['type']}:{p['id']}:{rid}"
+        info = ad["info"](k, rid)
+    except Exception as e:
+        return jsonify(error=f"{p['name']}: {e}"), 400
+    if not info["ready"]:
+        return jsonify(
+            error="جاري التجهيز...", torrent_id=tid, provider=p["name"],
+            status=info.get("status"), progress=info.get("progress"),
+            speed=info.get("speed"), eta=None, seeds=info.get("seeds"),
+            peers=info.get("peers"), size=info.get("size"),
+            file=info.get("name")), 202
+
+    files = info["files"]
+    vids = []
+    for f in files:
+        if not f["short_name"].lower().endswith(VIDEO):
+            continue
+        s, e = parse_ep(f["name"])
+        vids.append({"id": f["id"], "name": f["short_name"], "size": f["size"],
+                     "season": s, "episode": e})
+    vids.sort(key=lambda x: (
+        x["season"] is None, x["season"] or 0,
+        x["episode"] is None, x["episode"] or 0, x["name"].lower()))
+    total = sum(f["size"] for f in files) or info.get("size")
+    by_id = {f["id"]: f for f in files}
+
+    def pack_info(resp):
+        if len(vids) > 1:
+            resp["pack"] = True
+            resp["files"] = vids
+            resp["total_size"] = total
+        return resp
+
+    try:
+        if want_zip:
+            return jsonify(
+                error="ZIP مش متاح على المزوّد ده. استخدم 📋 كل الروابط."), 400
+
+        if want_all:
+            if not vids:
+                return jsonify(error="مفيش ملفات فيديو في التورنت"), 400
+
+            def one(v):
+                try:
+                    return {**v, "url": ad["link"](k, by_id[v["id"]])}
+                except Exception as ex:
+                    return {**v, "url": None, "error": str(ex)}
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                links = list(ex.map(one, vids))
+            return jsonify(links=links, provider=p["name"],
+                           name=info.get("name"), torrent_id=tid)
+
+        if file_id is not None:
+            f = next((x for x in files if str(x["id"]) == str(file_id)), None)
+            if not f:
+                return jsonify(error="الملف مش موجود في التورنت"), 400
+        else:
+            main = main_file(vids, {"files": files})
+            if not main:
+                return jsonify(error="التورنت فاضي مفيهوش ملفات"), 400
+            f = by_id[main["id"]]
+        url = ad["link"](k, f)
+        return jsonify(pack_info({
+            "direct_link": url, "name": f["short_name"], "size": f["size"],
+            "provider": p["name"], "torrent_id": tid, "file_id": f["id"]}))
+    except Exception as e:
+        return jsonify(error=f"{p['name']}: {e}"), 400
+
+
+def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False):
+    t = str(tid) if tid else ""
+    if t.startswith("x:"):
+        _, _, pid, rid = t.split(":", 3)
+        p = next((x for x in load() if x["id"] == pid), None)
+        if not p:
+            return jsonify(error="المزوّد اتحذف"), 400
+        return generic_flow(p, q, rid, file_id, want_zip, want_all)
+    if t:
+        return torrent_flow(q, tid, file_id, want_zip, want_all)
+    ps = ordered_tprovs(magnet_hash(q))
+    if not ps:
+        return jsonify(
+            error="ضيف مزوّد (TorBox أو Real-Debrid أو Debrid-Link) من الإعدادات الأول"), 400
+    last = None
+    for p in ps:
+        if p["type"] == "torbox":
+            r = torrent_flow(q, None, file_id, want_zip, want_all)
+        else:
+            r = generic_flow(p, q, None, file_id, want_zip, want_all)
+        code = r[1] if isinstance(r, tuple) else r.status_code
+        if code in (200, 202):
+            return r
+        last = r  # المزوّد ده فشل (اشتراك منتهي مثلاً)، نجرّب اللي بعده
+    return last
+
+
 @app.get("/cached")
 def cached():
-    hs = [h for h in request.args.get("h", "").lower().split(",") if h][:60]
+    hs = [h for h in request.args.get("h", "").lower().split(",") if h][:100]
+    ps = torrent_providers()
+    nocheck = bool(ps) and not any(p["type"] in CHECKABLE for p in ps)
     try:
-        return jsonify(cached=sorted(cached_hashes(hs)))
+        return jsonify(cached=sorted(cached_hashes(hs)), nocheck=nocheck)
     except Exception:
-        return jsonify(cached=[])
+        return jsonify(cached=[], nocheck=nocheck)
 
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
@@ -871,7 +1200,7 @@ def generate():
 
         # تورنت
         if tid or q.startswith("magnet:"):
-            return torrent_flow(
+            return torrent_dispatch(
                 q, tid,
                 file_id=data.get("file_id"),
                 want_zip=bool(data.get("zip")),
@@ -1163,6 +1492,28 @@ def st_find():
         return jsonify(error=str(e)), 500
 
 
+DEB_KEYS = ("realdebrid", "alldebrid", "premiumize", "debridlink", "torbox",
+            "putio", "offcc", "orion", "debridoptions")
+
+
+def st_plain_base(base):
+    """بيشيل مفتاح الدابريد من رابط إضافة زي Torrentio، فترجّع magnets بدل روابط"""
+    u = urlparse(base)
+    segs = [x for x in u.path.split("/") if x]
+    if not segs:
+        return base
+    last = unquote(segs[-1])
+    if "=" not in last:
+        return base
+    parts = last.split("|")
+    keep = [x for x in parts if x.split("=", 1)[0].lower() not in DEB_KEYS]
+    if len(keep) == len(parts):
+        return base
+    segs = segs[:-1] + (["|".join(keep)] if keep else [])
+    path = "/".join(quote(x, safe="|=,") for x in segs)
+    return f"{u.scheme}://{u.netloc}" + ("/" + path if path else "")
+
+
 def short_err(ex):
     s = str(ex)
     if "CERTIFICATE_VERIFY_FAILED" in s:
@@ -1201,8 +1552,11 @@ def st_streams():
         pre = a.get("prefixes")
         return not pre or any(imdb.startswith(p) for p in pre)
 
+    own = bool(torrent_providers())
+
     def one(a):
-        url = f"{a['base']}/stream/{typ}/{sid}.json"
+        qb = st_plain_base(a["base"]) if own else a["base"]
+        url = f"{qb}/stream/{typ}/{sid}.json"
         try:
             r = requests.get(url, timeout=25,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -1271,12 +1625,21 @@ def st_resolve():
                              headers={"User-Agent": "Mozilla/5.0"})
             loc = r.headers.get("Location")
             code = r.status_code
+            body = ""
+            if code >= 400:
+                try:
+                    body = r.raw.read(300, decode_content=True).decode("utf-8", "ignore")
+                except Exception:
+                    body = ""
             r.close()
             if code in (301, 302, 303, 307, 308) and loc:
                 cur = urljoin(cur, loc)
                 continue
             if code >= 400:
-                return jsonify(error=f"المصدر رد {code}"), 502
+                msg = f"المصدر رد {code}"
+                if g.role == "admin" and body.strip():
+                    msg += ": " + re.sub(r"\s+", " ", body)[:200]
+                return jsonify(error=msg), 502
             break
         if g.role != "admin" and any(p.get("key") and p["key"] in cur for p in load()):
             return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
