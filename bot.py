@@ -4,16 +4,19 @@ import re
 import json
 import uuid
 import hmac
+import base64
+import hashlib
 import time
 import zipfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urljoin
 
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, g
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 CORS(app)
@@ -34,10 +37,17 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "."
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
 UD_LOCK = threading.Lock()
 ST_LOCK = threading.Lock()
+USERS_LOCK = threading.Lock()
+REF_LOCK = threading.Lock()
 MAX_PROFILES = 10
 MAX_ITEMS = 150
+SECRET = os.environ.get("SECRET_KEY") or APP_PASS
+REFS = {}
+FAILS = {}
+USER_RX = re.compile(r"[a-z0-9_.-]{3,20}")
 
 TYPES = {
     "torbox": "TorBox",
@@ -152,14 +162,80 @@ def jj(r):
         raise Exception(f"رد غير مفهوم من الموقع (كود {r.status_code})")
 
 
+# ----------------- المستخدمين والتوكن -----------------
+
+def users_load():
+    try:
+        with open(USERS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def users_save(d):
+    tmp = USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, USERS_FILE)
+
+
+def fp_of(s):
+    return hashlib.sha256(("fp:" + s).encode()).hexdigest()[:10]
+
+
+def sign(body):
+    return hmac.new(SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def make_token(user, role, fp):
+    body = f"{user}|{role}|{int(time.time()) + 30 * 86400}|{fp}"
+    return base64.urlsafe_b64encode(body.encode()).decode() + "." + sign(body)
+
+
+def read_token(tok):
+    try:
+        b64, sig = str(tok).rsplit(".", 1)
+        body = base64.urlsafe_b64decode(b64.encode()).decode()
+        if not hmac.compare_digest(sig.encode(), sign(body).encode()):
+            return None
+        user, role, exp, fp = body.split("|")
+        if int(exp) < time.time():
+            return None
+        if role == "admin":
+            if user != APP_USER.lower() or fp != fp_of(APP_PASS):
+                return None
+        else:
+            rec = users_load().get(user)
+            if not rec or fp != fp_of(rec["h"]):
+                return None
+        return user, role
+    except Exception:
+        return None
+
+
+def needs_admin(path, method):
+    if path.startswith(("/providers", "/users")):
+        return True
+    if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
+                "/stremio/library"):
+        return True
+    if path.startswith("/stremio/addon"):
+        return not (path == "/stremio/addons" and method == "GET")
+    return False
+
+
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
     if request.method == "OPTIONS" or request.path in open_paths:
         return None
-    sent = request.headers.get("X-Pass", "")
-    if not hmac.compare_digest(sent.encode(), APP_PASS.encode()):
+    who = read_token(request.headers.get("X-Token", ""))
+    if not who:
         return jsonify(error="غير مصرّح"), 401
+    g.user, g.role = who
+    if g.role != "admin" and needs_admin(request.path, request.method):
+        return jsonify(error="للأدمن بس"), 403
     return None
 
 
@@ -168,14 +244,92 @@ def home():
     return "Elkomy Server is Active! 🚀"
 
 
+def too_many(ip):
+    now = time.time()
+    lst = [t for t in FAILS.get(ip, []) if now - t < 600]
+    FAILS[ip] = lst
+    return len(lst) >= 10
+
+
 @app.post("/auth")
 def auth():
-    d = request.get_json() or {}
-    u_ok = str(d.get("u", "")).strip().lower() == APP_USER.lower()
-    p_ok = str(d.get("p", "")).strip() == APP_PASS
-    if u_ok and p_ok:
-        return jsonify(ok=True), 200
+    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+          or request.remote_addr or "")
+    if too_many(ip):
+        return jsonify(ok=False, error="محاولات كتير"), 429
+    d = request.get_json(silent=True) or {}
+    u = str(d.get("u", "")).strip().lower()
+    p = str(d.get("p", "")).strip()
+    if u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
+        return jsonify(ok=True, role="admin", user=u,
+                       token=make_token(u, "admin", fp_of(APP_PASS)))
+    rec = users_load().get(u)
+    if rec and check_password_hash(rec["h"], p):
+        return jsonify(ok=True, role="user", user=u,
+                       token=make_token(u, "user", fp_of(rec["h"])))
+    FAILS.setdefault(ip, []).append(time.time())
     return jsonify(ok=False), 401
+
+
+@app.get("/me")
+def me():
+    return jsonify(user=g.user, role=g.role)
+
+
+@app.get("/users")
+def users_list():
+    us = users_load()
+    return jsonify(items=[{"name": n, "c": v.get("c", 0)}
+                          for n, v in sorted(us.items())])
+
+
+@app.post("/users")
+def users_add():
+    d = request.get_json(silent=True) or {}
+    n = str(d.get("username", "")).strip().lower()
+    p = str(d.get("password", "")).strip()
+    if not USER_RX.fullmatch(n):
+        return jsonify(error="الاسم 3-20 حرف إنجليزي أو أرقام أو _ . -"), 400
+    if n == APP_USER.lower():
+        return jsonify(error="الاسم ده محجوز للأدمن"), 400
+    if len(p) < 4:
+        return jsonify(error="الباسورد لازم 4 حروف على الأقل"), 400
+    with USERS_LOCK:
+        us = users_load()
+        if n in us:
+            return jsonify(error="المستخدم موجود بالفعل"), 400
+        us[n] = {"h": generate_password_hash(p), "c": int(time.time())}
+        users_save(us)
+    return jsonify(ok=True)
+
+
+@app.post("/users/<name>/password")
+def users_pass(name):
+    p = str((request.get_json(silent=True) or {}).get("password", "")).strip()
+    if len(p) < 4:
+        return jsonify(error="الباسورد لازم 4 حروف على الأقل"), 400
+    with USERS_LOCK:
+        us = users_load()
+        if name not in us:
+            return jsonify(error="المستخدم مش موجود"), 404
+        us[name]["h"] = generate_password_hash(p)
+        users_save(us)
+    return jsonify(ok=True)
+
+
+@app.delete("/users/<name>")
+def users_del(name):
+    with USERS_LOCK:
+        us = users_load()
+        if name not in us:
+            return jsonify(error="المستخدم مش موجود"), 404
+        us.pop(name)
+        users_save(us)
+    try:
+        os.remove(ud_path(name))
+    except OSError:
+        pass
+    return jsonify(ok=True)
 
 
 @app.get("/providers")
@@ -277,9 +431,15 @@ def tnum(x):
     return t if isinstance(t, (int, float)) else 0
 
 
-def ud_load():
+def ud_path(user):
+    if user == APP_USER.lower():
+        return UDFILE
+    return os.path.join(DATA_DIR, f"ud_{user}.json")
+
+
+def ud_load(user):
     try:
-        with open(UDFILE, encoding="utf-8") as f:
+        with open(ud_path(user), encoding="utf-8") as f:
             d = json.load(f)
     except Exception:
         d = {}
@@ -290,11 +450,12 @@ def ud_load():
     return d
 
 
-def ud_save(d):
-    tmp = UDFILE + ".tmp"
+def ud_save(d, user):
+    path = ud_path(user)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, UDFILE)
+    os.replace(tmp, path)
 
 
 def ud_merge(base, inc):
@@ -341,15 +502,15 @@ def ud_merge(base, inc):
 @app.get("/ud")
 def ud_get():
     with UD_LOCK:
-        return jsonify(ud_load())
+        return jsonify(ud_load(g.user))
 
 
 @app.post("/ud/merge")
 def ud_merge_ep():
     inc = request.get_json(silent=True) or {}
     with UD_LOCK:
-        base = ud_merge(ud_load(), inc)
-        ud_save(base)
+        base = ud_merge(ud_load(g.user), inc)
+        ud_save(base, g.user)
     if request.args.get("lite"):
         return jsonify(ok=True)
     return jsonify(base)
@@ -361,12 +522,12 @@ def ud_beacon():
         d = json.loads(request.get_data(as_text=True) or "{}")
     except ValueError:
         return "", 400
-    sent = str(d.get("p", ""))
-    if not hmac.compare_digest(sent.encode(), APP_PASS.encode()):
+    who = read_token(str(d.get("t", "")))
+    if not who:
         return "", 401
     with UD_LOCK:
-        base = ud_merge(ud_load(), d.get("data") or {})
-        ud_save(base)
+        base = ud_merge(ud_load(who[0]), d.get("data") or {})
+        ud_save(base, who[0])
     return "", 204
 
 
@@ -932,8 +1093,11 @@ def st_add_ep():
 @app.get("/stremio/addons")
 def st_list():
     d = st_load()
+    n = sum(1 for a in d["addons"] if a.get("stream"))
+    if g.role != "admin":
+        return jsonify(logged=False, email="", items=[], n=n)
     return jsonify(
-        logged=bool(d.get("authKey")), email=d.get("email", ""),
+        logged=bool(d.get("authKey")), email=d.get("email", ""), n=n,
         items=[{"id": a["id"], "name": a["name"], "stream": a["stream"]}
                for a in d["addons"]])
 
@@ -999,8 +1163,29 @@ def st_find():
         return jsonify(error=str(e)), 500
 
 
+def short_err(ex):
+    s = str(ex)
+    if "CERTIFICATE_VERIFY_FAILED" in s:
+        return "شهادة SSL مش متوثّقة"
+    if "Name or service not known" in s or "NameResolution" in s or "No address" in s:
+        return "الدومين مش موجود"
+    if isinstance(ex, requests.Timeout):
+        return "انتهى الوقت"
+    return type(ex).__name__
+
+
+def ref_for(url):
+    rid = uuid.uuid4().hex[:16]
+    with REF_LOCK:
+        REFS[rid] = url
+        while len(REFS) > 800:
+            REFS.pop(next(iter(REFS)))
+    return rid
+
+
 @app.get("/stremio/streams")
 def st_streams():
+    is_admin = g.role == "admin"
     typ = "series" if request.args.get("type") == "tv" else "movie"
     imdb = request.args.get("imdb", "")
     s, e = request.args.get("s", ""), request.args.get("e", "")
@@ -1041,23 +1226,63 @@ def st_streams():
                 out.append({
                     "title": title, "size": size,
                     "seeders": int(sm.group(1)) if sm else 0,
-                    "indexer": (a["name"] + " " + nm).strip(),
+                    "indexer": (a["name"] + " " + nm).strip() if is_admin else "Stremio",
                     "hash": h,
                     "magnet": f"magnet:?xt=urn:btih:{h}&dn={quote(title)}" if h else "",
-                    "direct": direct, "cached": bool(direct),
+                    "direct": "",
+                    "ref": ref_for(direct) if direct else "",
+                    "cached": bool(direct),
                 })
             return out, (None if out else f"{a['name']}: رد فاضي (0 نتيجة)")
         except Exception as ex:
-            return [], f"{a['name']}: {ex}"
+            return [], f"{a['name']}: {short_err(ex)}"
 
     addons = [a for a in st_load()["addons"] if usable(a)]
     if not addons:
-        return jsonify(error="مفيش إضافات بتدي نتايج للنوع ده. ضيف إضافة زي Torrentio.")
+        return jsonify(error="مفيش مصادر متاحة للنوع ده حالياً.")
     with ThreadPoolExecutor(max_workers=6) as ex:
         parts = list(ex.map(one, addons))
     res = [i for p, _ in parts for i in p]
-    notes = [n for _, n in parts if n]
+    notes, skipped = [], 0
+    for _, n in parts:
+        if not n:
+            continue
+        if n.endswith("رد 404"):
+            skipped += 1
+        else:
+            notes.append(n)
+    if skipped:
+        notes.append(f"{skipped} إضافة مش بتدعم العمل ده (404)")
+    if not is_admin:
+        notes = []
     return jsonify(results=res[:150], notes=notes)
+
+
+@app.post("/stremio/resolve")
+def st_resolve():
+    ref = str((request.get_json(silent=True) or {}).get("ref", ""))
+    url = REFS.get(ref)
+    if not url:
+        return jsonify(error="الرابط انتهى، دوّر على النتايج تاني"), 404
+    try:
+        cur = url
+        for _ in range(6):
+            r = requests.get(cur, allow_redirects=False, stream=True, timeout=25,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            loc = r.headers.get("Location")
+            code = r.status_code
+            r.close()
+            if code in (301, 302, 303, 307, 308) and loc:
+                cur = urljoin(cur, loc)
+                continue
+            if code >= 400:
+                return jsonify(error=f"المصدر رد {code}"), 502
+            break
+        if g.role != "admin" and any(p.get("key") and p["key"] in cur for p in load()):
+            return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
+        return jsonify(url=cur)
+    except Exception as ex:
+        return jsonify(error=f"فشل تجهيز الرابط: {short_err(ex)}"), 502
 
 
 # ----------------- TMDB -----------------
