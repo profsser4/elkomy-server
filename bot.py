@@ -1621,6 +1621,30 @@ def ref_for(url):
     return rid
 
 
+@app.get("/stremio/lookup")
+def st_lookup():
+    q = request.args.get("q", "").strip()[:100]
+    typ = "tv" if request.args.get("type") == "tv" else "movie"
+    year = request.args.get("year", "")
+    if not q:
+        return jsonify(error="الاسم ناقص"), 400
+    try:
+        for lang in ("ar", "en-US"):
+            res = tmdb_get(f"/search/{typ}", query=q, language=lang,
+                           include_adult="false").get("results", [])
+            if not res:
+                continue
+            if year.isdigit():
+                for x in res:
+                    y = (x.get("release_date") or x.get("first_air_date") or "")[:4]
+                    if y == year:
+                        return jsonify(type=typ, id=x["id"])
+            return jsonify(type=typ, id=res[0]["id"])
+        return jsonify(error="مش لاقي العمل ده على TMDB")
+    except Exception as ex:
+        return jsonify(error=str(ex)), 500
+
+
 @app.get("/stremio/streams")
 def st_streams():
     is_admin = g.role == "admin"
@@ -1683,7 +1707,10 @@ def st_streams():
                         continue
                 if not direct and not h:
                     continue
+                fl_eg, fl_dub = dub_flags(" ".join(
+                    [txt, nm, str(bh.get("filename") or "")]))
                 out.append({
+                    "dub": fl_dub, "eg": fl_eg,
                     "title": title, "size": size,
                     "seeders": int(sm.group(1)) if sm else 0,
                     "indexer": (a["name"] + " " + nm).strip() if is_admin else "Stremio",
@@ -1783,14 +1810,36 @@ def type_ar(t):
     return "أفلام" if t == "movie" else "مسلسلات"
 
 
+DUB_ENTRY = {"k": "dubeg", "a": "_dub", "ty": "movie", "c": "dub-family", "g": "",
+             "t": "🇪🇬 كرتون وعائلي مدبلج بالمصري", "on": True}
+CAT_STATS = {}
+DUB_STATE = {"running": False}
+DUB_FILE = os.path.join(DATA_DIR, "dubbed.json")
+EG_RX = re.compile(r"(مصري|مصرى|المصرية|egypt)", re.I)
+DUB_RX = re.compile(r"(مدبلج|دبلج|dubbed|\bdub\b)", re.I)
+
+
+def dub_flags(text):
+    """(فيه كلمة مصري؟, فيه كلمة مدبلج؟)"""
+    t = str(text or "")
+    return bool(EG_RX.search(t)), bool(DUB_RX.search(t))
+
+
+def cat_key(a, ty, c):
+    return f"{a}|{ty}|{c}"
+
+
+def new_entry(a, c, on=True):
+    return {"k": hashlib.md5(cat_key(a["id"], c["type"], c["id"]).encode()).hexdigest()[:8],
+            "a": a["id"], "ty": c["type"], "c": c["id"], "g": "",
+            "t": f"{c['name']} · {type_ar(c['type'])}", "on": on}
+
+
 def home_default(d):
-    out = []
+    out = [dict(DUB_ENTRY)]
     for a in d["addons"]:
         for c in a.get("catalogs") or []:
-            out.append({
-                "k": hashlib.md5(f"{a['id']}|{c['type']}|{c['id']}".encode()).hexdigest()[:8],
-                "a": a["id"], "ty": c["type"], "c": c["id"], "g": "",
-                "t": f"{c['name']} · {type_ar(c['type'])}", "on": len(out) < 10})
+            out.append(new_entry(a, c, len(out) < 11))
     return out
 
 
@@ -1800,15 +1849,42 @@ def home_layout(d):
             saved = json.load(f)
     except Exception:
         saved = None
-    if isinstance(saved, dict) and isinstance(saved.get("rows"), list):
-        return saved["rows"]
-    return home_default(d)
+    if not (isinstance(saved, dict) and isinstance(saved.get("rows"), list)):
+        return home_default(d)
+    rows_ = list(saved["rows"])
+    seen = set(saved.get("seen") or [])
+    if "dubeg" not in seen and not any(r.get("k") == "dubeg" for r in rows_):
+        rows_.insert(0, dict(DUB_ENTRY))
+    present = {cat_key(r.get("a"), r.get("ty"), r.get("c")) for r in rows_}
+    for a in d["addons"]:          # إضافات جديدة بتظهر لوحدها
+        for c in a.get("catalogs") or []:
+            k = cat_key(a["id"], c["type"], c["id"])
+            if k not in present and k not in seen:
+                rows_.append(new_entry(a, c))
+                present.add(k)
+    return rows_
+
+
+def dub_load():
+    try:
+        with open(DUB_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def dub_status():
+    d = dub_load()
+    return {"t": d.get("t", 0), "n": len(d.get("items") or []),
+            "running": DUB_STATE["running"]}
 
 
 @app.get("/home/catalogs")
 def home_catalogs():
     d = ensure_catalogs()
-    items = []
+    items = [{"a": "_dub", "an": "خاص", "ty": "movie", "c": "dub-family",
+              "name": "مدبلج بالمصري (كرتون وعائلي)", "genres": []}]
     for a in d["addons"]:
         for c in a.get("catalogs") or []:
             items.append({"a": a["id"], "an": a["name"], "ty": c["type"], "c": c["id"],
@@ -1820,30 +1896,43 @@ def home_catalogs():
 def home_layout_get():
     d = ensure_catalogs()
     ids = {a["id"] for a in d["addons"]}
-    return jsonify(rows=[r for r in home_layout(d) if r.get("a") in ids])
+    out = []
+    for r in home_layout(d):
+        if r.get("a") not in ids and r.get("a") != "_dub":
+            continue
+        r = dict(r)
+        st = CAT_STATS.get((r.get("a"), r.get("ty"), r.get("c"), r.get("g", "")))
+        if st:
+            r["stat"] = st
+        out.append(r)
+    return jsonify(rows=out, dub=dub_status())
 
 
 @app.post("/home/layout")
 def home_layout_set():
     d = st_load()
-    ids = {a["id"] for a in d["addons"]}
+    ids = {a["id"] for a in d["addons"]} | {"_dub"}
     rows_in = (request.get_json(silent=True) or {}).get("rows")
     if not isinstance(rows_in, list):
         return jsonify(error="بيانات ناقصة"), 400
-    out, seen = [], set()
+    out, used = [], set()
     for r in rows_in[:40]:
         if not isinstance(r, dict) or r.get("a") not in ids or r.get("ty") not in ("movie", "series"):
             continue
         k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
-        if k in seen:
+        if k in used:
             k = uuid.uuid4().hex[:8]
-        seen.add(k)
+        used.add(k)
         out.append({"k": k, "a": r["a"], "ty": r["ty"], "c": str(r.get("c", ""))[:80],
                     "g": str(r.get("g", ""))[:40], "t": str(r.get("t", ""))[:60] or "صف",
                     "on": bool(r.get("on"))})
+    seen = {"dubeg"}
+    for a in d["addons"]:
+        for c in a.get("catalogs") or []:
+            seen.add(cat_key(a["id"], c["type"], c["id"]))
     tmp = HOME_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"rows": out}, f, ensure_ascii=False)
+        json.dump({"rows": out, "seen": sorted(seen)}, f, ensure_ascii=False)
     os.replace(tmp, HOME_FILE)
     return jsonify(ok=True)
 
@@ -1858,7 +1947,7 @@ def cat_items(a, e):
         path += f"/genre={quote(e['g'], safe='')}"
     r = requests.get(a["base"] + path + ".json", timeout=20,
                      headers={"User-Agent": "Mozilla/5.0"})
-    items = []
+    items, skipped, ex_id = [], 0, ""
     for m in (r.json().get("metas") or []):
         iid = str(m.get("id", ""))
         if not m.get("poster"):
@@ -1870,27 +1959,123 @@ def cat_items(a, e):
             it["imdb"] = iid
         elif iid.startswith("tmdb:") and iid[5:].isdigit():
             it["id"] = int(iid[5:])
+        elif it["title"]:
+            it["lk"] = True        # id خاص بالإضافة: هنلاقيه بالاسم على TMDB وقت الفتح
+            skipped += 1
+            ex_id = ex_id or iid.split(":")[0][:12]
         else:
             continue
         items.append(it)
     items = items[:20]
+    CAT_STATS[key] = {"n": len(items), "lk": skipped, "ex": ex_id}
     if items:
         CAT_CACHE[key] = (time.time(), items)
     return items
+
+
+# ---- قسم المدبلج بالمصري: بنفحص إضافاتك على أفلام الكرتون والعائلي المشهورة
+def dub_hit(a, imdb):
+    try:
+        r = requests.get(f"{a['base']}/stream/movie/{imdb}.json", timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return False
+        for x in (r.json().get("streams") or []):
+            bh = x.get("behaviorHints") or {}
+            text = " ".join(str(x.get(k) or "") for k in ("name", "title", "description"))
+            eg, dub = dub_flags(text + " " + str(bh.get("filename") or ""))
+            if eg and dub:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _dub_scan():
+    d = st_load()
+    addons = [a for a in d["addons"] if a.get("stream")
+              and (not a.get("types") or "movie" in a["types"])
+              and (not a.get("prefixes") or any(str(p).startswith("tt") for p in a["prefixes"]))]
+    items = []
+    if addons and TMDB_KEY:
+        cands = []
+        for page in (1, 2, 3):
+            try:
+                res = tmdb_get("/discover/movie", language="ar", sort_by="popularity.desc",
+                               with_genres="16|10751", include_adult="false", page=page,
+                               **{"vote_count.gte": "50"}).get("results", [])
+            except Exception:
+                break
+            cands += [x for x in res if x.get("poster_path")]
+        cands = cands[:50]
+
+        def check(c):
+            try:
+                imdb = (tmdb_get(f"/movie/{c['id']}/external_ids").get("imdb_id") or "")
+            except Exception:
+                return None
+            if not re.fullmatch(r"tt\d+", imdb):
+                return None
+            if any(dub_hit(a, imdb) for a in addons):
+                return {"id": c["id"], "type": "movie", "title": c.get("title") or "",
+                        "poster": img(c.get("poster_path"), "w342"),
+                        "year": (c.get("release_date") or "")[:4]}
+            return None
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            items = [x for x in ex.map(check, cands) if x][:24]
+    tmp = DUB_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"t": time.time(), "items": items}, f, ensure_ascii=False)
+    os.replace(tmp, DUB_FILE)
+
+
+def start_dub_scan():
+    if DUB_STATE["running"]:
+        return False
+    DUB_STATE["running"] = True
+
+    def run():
+        try:
+            run_exclusive(_dub_scan, "dub")
+        except Exception:
+            pass
+        finally:
+            DUB_STATE["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+def dub_items():
+    d = dub_load()
+    if time.time() - d.get("t", 0) > 24 * 3600:
+        start_dub_scan()
+    return d.get("items") or []
+
+
+@app.post("/home/dub-refresh")
+def dub_refresh():
+    return jsonify(started=start_dub_scan(), running=DUB_STATE["running"])
 
 
 @app.get("/rows")
 def rows():
     d = ensure_catalogs()
     amap = {a["id"]: a for a in d["addons"]}
-    ents = [e for e in home_layout(d) if e.get("on") and e.get("a") in amap]
+    ents = [e for e in home_layout(d)
+            if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
     if not ents:
         return tmdb_rows()
 
     def one(e):
+        if e["a"] == "_dub":
+            items = dub_items()
+            return {"id": e["k"], "title": e["t"], "items": items} if items else None
         try:
             items = cat_items(amap[e["a"]], e)
-        except Exception:
+        except Exception as ex:
+            CAT_STATS[(e["a"], e["ty"], e["c"], e.get("g", ""))] = {"err": short_err(ex)}
             return None
         return {"id": e["k"], "title": e["t"], "items": items} if items else None
 
@@ -2641,13 +2826,13 @@ def check_episodes():
     return res
 
 
-def run_exclusive(fn):
+def run_exclusive(fn, name="push"):
     """بيمنع أكتر من عملية سيرفر تشتغل الفحص في نفس الوقت"""
     try:
         import fcntl
     except ImportError:
         return fn()
-    with open(os.path.join(DATA_DIR, "push.lock"), "w") as lf:
+    with open(os.path.join(DATA_DIR, f"{name}.lock"), "w") as lf:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -2725,9 +2910,30 @@ def push_check():
     return jsonify(r if r is not None else {"error": "فحص تاني شغال دلوقتي"})
 
 
-if webpush is not None and os.environ.get("PUSH_WATCHER", "1") != "0":
-    threading.Thread(target=push_loop, daemon=True).start()
+ST_SYNC_MIN = float(os.environ.get("ST_SYNC_MIN", "60") or 60)
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+def st_auto_sync():
+    with ST_LOCK:
+        d = st_load()
+        if not d.get("authKey"):
+            return
+        try:
+            st_import(d)
+            st_save(d)
+        except Exception:
+            pass
+
+
+def st_sync_loop():
+    time.sleep(120)
+    while True:
+        try:
+            run_exclusive(st_auto_sync, "stsync")
+        except Exception:
+            pass
+        time.sleep(max(ST_SYNC_MIN, 5) * 60)
+
+
+if os.environ.get("ST_AUTOSYNC", "1") != "0":
+    threading.Thread(target=st_sync_loop, daemon=True).start()
