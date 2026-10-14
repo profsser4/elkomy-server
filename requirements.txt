@@ -1,4 +1,7 @@
-requests
 flask
 flask-cors
+requests
 pywebpush
+py-vapid
+cryptography
+gunicorn
