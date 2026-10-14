@@ -1,3 +1,4 @@
+
 import os
 import io
 import re
@@ -34,6 +35,8 @@ SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
@@ -2936,4 +2939,4 @@ def st_sync_loop():
 
 
 if os.environ.get("ST_AUTOSYNC", "1") != "0":
-    threading.Thread(target=st_sync_loop, daemon=True).start()
+    threading.T
