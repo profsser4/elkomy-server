@@ -2900,4 +2900,247 @@ def push_load():
     try:
         with open(PUSH_FILE, encoding="utf-8") as f:
             d = json.load(f)
-    except E
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("subs", {})
+    d.setdefault("state", {})
+    return d
+
+
+def push_save(d):
+    tmp = PUSH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, PUSH_FILE)
+
+
+def vapid_keys():
+    """مفاتيح VAPID بتتعمل أول مرة وتتحفظ في DATA_DIR"""
+    pem = os.path.join(DATA_DIR, "vapid_private.pem")
+    pubf = os.path.join(DATA_DIR, "vapid_public.txt")
+    if not (os.path.exists(pem) and os.path.exists(pubf)):
+        from py_vapid import Vapid
+        from cryptography.hazmat.primitives import serialization
+        v = Vapid()
+        v.generate_keys()
+        v.save_key(pem)
+        raw = v.public_key.public_bytes(
+            serialization.Encoding.X962,
+            serialization.PublicFormat.UncompressedPoint)
+        with open(pubf, "w", encoding="utf-8") as f:
+            f.write(base64.urlsafe_b64encode(raw).rstrip(b"=").decode())
+    with open(pubf, encoding="utf-8") as f:
+        return pem, f.read().strip()
+
+
+def push_send(user, title, body, url="", tag=""):
+    if webpush is None:
+        return 0
+    pem, _ = vapid_keys()
+    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag},
+                         ensure_ascii=False)
+    sent = 0
+    with PUSH_LOCK:
+        d = push_load()
+        keep = []
+        for s in d["subs"].get(user, []):
+            try:
+                webpush(subscription_info=s, data=payload, vapid_private_key=pem,
+                        vapid_claims={"sub": VAPID_SUB}, ttl=86400)
+                sent += 1
+                keep.append(s)
+            except WebPushException as ex:
+                code = getattr(getattr(ex, "response", None), "status_code", 0)
+                if code not in (404, 410):   # الاشتراك مات بس لو 404/410
+                    keep.append(s)
+            except Exception:
+                keep.append(s)
+        d["subs"][user] = keep
+        push_save(d)
+    return sent
+
+
+def follows_of(user):
+    """المسلسلات اللي في "قائمتي" عند المستخدم (كل البروفايلات)"""
+    ud = ud_load(user)
+    profs = ud.get("profiles", {})
+    out = {}
+    for pid, its in (ud.get("items") or {}).items():
+        if (profs.get(pid) or {}).get("del"):
+            continue
+        for k, it in (its or {}).items():
+            if (str(k).startswith("l:tv:") and isinstance(it, dict)
+                    and not it.get("del") and str(it.get("tmdb", "")).isdigit()):
+                out[int(it["tmdb"])] = it.get("title") or ""
+    return out
+
+
+def check_episodes():
+    if not TMDB_KEY:
+        return {"error": "TMDB_KEY مش متضاف"}
+    names = [APP_USER.lower()] + sorted(users_load())
+    cache = {}
+    res = {"shows": 0, "sent": 0, "baseline": 0}
+    for u in names:
+        ids = follows_of(u)
+        if not ids:
+            continue
+        with PUSH_LOCK:
+            st = dict(push_load()["state"].get(u, {}))
+        dirty = False
+        for tid, title in ids.items():
+            res["shows"] += 1
+            if tid not in cache:
+                try:
+                    cache[tid] = tmdb_get(f"/tv/{tid}", language="ar")
+                except Exception:
+                    cache[tid] = None
+            info = cache[tid] or {}
+            le = info.get("last_episode_to_air") or {}
+            s, e = le.get("season_number"), le.get("episode_number")
+            if not s or e is None:
+                continue
+            cur, key = [int(s), int(e)], str(tid)
+            prev = st.get(key)
+            if prev is None:
+                st[key] = cur
+                dirty = True
+                res["baseline"] += 1
+            elif tuple(cur) > tuple(prev):
+                body = f"S{cur[0]:02d}E{cur[1]:02d}" + (
+                    f" · {le['name']}" if le.get("name") else "")
+                res["sent"] += push_send(
+                    u, f"🔔 حلقة جديدة: {info.get('name') or title}", body,
+                    f"#open=tv:{tid}", f"tv{tid}")
+                st[key] = cur
+                dirty = True
+        if dirty:
+            with PUSH_LOCK:
+                d = push_load()
+                d["state"].setdefault(u, {}).update(st)
+                push_save(d)
+    return res
+
+
+def run_exclusive(fn, name="push"):
+    """بيمنع أكتر من عملية سيرفر تشتغل الفحص في نفس الوقت"""
+    try:
+        import fcntl
+    except ImportError:
+        return fn()
+    with open(os.path.join(DATA_DIR, f"{name}.lock"), "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        try:
+            return fn()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def push_loop():
+    time.sleep(90)
+    while True:
+        try:
+            run_exclusive(check_episodes)
+        except Exception:
+            pass
+        time.sleep(max(PUSH_HOURS, 0.25) * 3600)
+
+
+@app.get("/push/key")
+def push_key():
+    if webpush is None:
+        return jsonify(enabled=False, error="ضيف pywebpush في requirements.txt وأعد النشر")
+    try:
+        return jsonify(enabled=True, key=vapid_keys()[1])
+    except Exception as ex:
+        return jsonify(enabled=False, error=f"مفاتيح الإشعارات: {ex}")
+
+
+@app.post("/push/subscribe")
+def push_subscribe():
+    sub = (request.get_json(silent=True) or {}).get("subscription")
+    if (not isinstance(sub, dict) or not isinstance(sub.get("keys"), dict)
+            or not str(sub.get("endpoint", "")).startswith("https://")):
+        return jsonify(error="اشتراك غير صالح"), 400
+    clean = {"endpoint": str(sub["endpoint"])[:600],
+             "keys": {"p256dh": str(sub["keys"].get("p256dh", ""))[:200],
+                      "auth": str(sub["keys"].get("auth", ""))[:100]}}
+    with PUSH_LOCK:
+        d = push_load()
+        lst = [x for x in d["subs"].get(g.user, []) if x["endpoint"] != clean["endpoint"]]
+        lst.append(clean)
+        d["subs"][g.user] = lst[-5:]
+        push_save(d)
+    return jsonify(ok=True)
+
+
+@app.post("/push/unsubscribe")
+def push_unsubscribe():
+    ep = str((request.get_json(silent=True) or {}).get("endpoint", ""))
+    with PUSH_LOCK:
+        d = push_load()
+        d["subs"][g.user] = [x for x in d["subs"].get(g.user, []) if x["endpoint"] != ep]
+        push_save(d)
+    return jsonify(ok=True)
+
+
+@app.post("/push/test")
+def push_test():
+    if webpush is None:
+        return jsonify(error="ضيف pywebpush في requirements.txt وأعد النشر"), 400
+    try:
+        n = push_send(g.user, "🔔 إشعار تجريبي", "الإشعارات شغالة ✅", "", "test")
+    except Exception as ex:
+        return jsonify(error=f"فشل الإرسال: {ex}"), 500
+    return jsonify(sent=n)
+
+
+@app.post("/push/check")
+def push_check():
+    if webpush is None:
+        return jsonify(error="ضيف pywebpush في requirements.txt وأعد النشر"), 400
+    r = run_exclusive(check_episodes)
+    return jsonify(r if r is not None else {"error": "فحص تاني شغال دلوقتي"})
+
+
+ST_SYNC_MIN = float(os.environ.get("ST_SYNC_MIN", "60") or 60)
+
+
+def st_auto_sync():
+    with ST_LOCK:
+        d = st_load()
+        if not d.get("authKey"):
+            return
+        try:
+            st_import(d)
+            st_save(d)
+        except Exception:
+            pass
+
+
+def st_sync_loop():
+    time.sleep(120)
+    while True:
+        try:
+            run_exclusive(st_auto_sync, "stsync")
+        except Exception:
+            pass
+        time.sleep(max(ST_SYNC_MIN, 5) * 60)
+
+
+try:
+    if os.environ.get("ST_AUTOSYNC", "1") != "0":
+        threading.Thread(target=st_sync_loop, daemon=True).start()
+    if webpush is not None and os.environ.get("PUSH_WATCHER", "1") != "0":
+        threading.Thread(target=push_loop, daemon=True).start()
+except Exception:
+    pass
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
