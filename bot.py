@@ -9,10 +9,6 @@ import hashlib
 import time
 import zipfile
 import threading
-import shutil
-import socket
-import ipaddress
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from urllib.parse import quote, unquote, urlparse, urljoin
@@ -245,8 +241,7 @@ def needs_admin(path, method):
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
-    if (request.method == "OPTIONS" or request.path in open_paths
-            or request.path.startswith("/media/stream/")):
+    if request.method == "OPTIONS" or request.path in open_paths:
         return None
     who = read_token(request.headers.get("X-Token", ""))
     if not who:
@@ -1412,6 +1407,28 @@ def st_add(d, base, man):
     return True
 
 
+CFG_DS = {"tb": "torbox", "rd": "realdebrid", "ad": "alldebrid",
+          "pm": "premiumize", "dl": "debridlink"}
+
+
+def cfg_keys(base):
+    """إضافات زي aradeb بتخزّن إعدادها base64 جوه الرابط: بنفكها ونطلّع مفتاح الدابريد"""
+    out = []
+    for seg in urlparse(base).path.split("/"):
+        if len(seg) < 20 or not re.fullmatch(r"[A-Za-z0-9_\-]+={0,2}", seg):
+            continue
+        try:
+            j = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+        except Exception:
+            continue
+        if isinstance(j, dict):
+            t = CFG_DS.get(str(j.get("ds", "")).lower())
+            k = str(j.get("dk", "")).strip()
+            if t and k:
+                out.append((t, k))
+    return out
+
+
 def st_import_keys(base):
     """لو رابط الإضافة فيه مفتاح دابريد (زي Torrentio) بنضيفه كمزوّد"""
     path = unquote(urlparse(base).path)
@@ -1424,6 +1441,11 @@ def st_import_keys(base):
         ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
                    "key": k, "domains": []})
         added += 1
+    for t, k in cfg_keys(base):
+        if not any(p["type"] == t for p in ps):
+            ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
+                       "key": k, "domains": []})
+            added += 1
     mt = TBOFF_RX.search(base)
     if mt and not any(p["type"] == "torbox" for p in ps):
         ps.append({"id": uuid.uuid4().hex[:8], "type": "torbox", "name": TYPES["torbox"],
@@ -1674,12 +1696,24 @@ def st_streams():
     if not re.fullmatch(r"tt\d+", imdb):
         return jsonify(error="العمل ده ملوش IMDb id"), 400
     sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
+    tmdb = request.args.get("tmdb", "")
+    tmdb = tmdb if tmdb.isdigit() else ""
+    tsid = (f"tmdb:{tmdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit()
+            else f"tmdb:{tmdb}")
+
+    def sid_for(a):
+        pre = a.get("prefixes") or []
+        if pre and not any(imdb.startswith(p) for p in pre) and tmdb and any(
+                str(p).startswith("tmdb") for p in pre):
+            return tsid
+        return sid
 
     own = bool(torrent_providers())
     all_keys = {p["key"] for p in load() if p.get("key")}
     for a_ in st_load()["addons"]:
         all_keys |= {m.group(2) for m in DEBRID_RX.finditer(
             unquote(urlparse(a_["base"]).path))}
+        all_keys |= {k for _, k in cfg_keys(a_["base"])}
     low_keys = {k.lower() for k in all_keys}
 
     def usable(a):
@@ -1691,11 +1725,12 @@ def st_streams():
                 k in unquote(a["base"]) for k in all_keys):
             return False
         pre = a.get("prefixes")
-        return not pre or any(imdb.startswith(p) for p in pre)
+        return (not pre or any(imdb.startswith(p) for p in pre)
+                or (bool(tmdb) and any(str(p).startswith("tmdb") for p in pre)))
 
     def one(a):
         qb = st_plain_base(a["base"]) if own else a["base"]
-        url = f"{qb}/stream/{typ}/{sid}.json"
+        url = f"{qb}/stream/{typ}/{sid_for(a)}.json"
         try:
             r = requests.get(url, timeout=25,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -1731,6 +1766,7 @@ def st_streams():
                     [txt, nm, str(bh.get("filename") or "")]))
                 out.append({
                     "dub": fl_dub, "eg": fl_eg,
+                    "nw": bool(bh.get("notWebReady") or bh.get("proxyHeaders")),
                     "title": title, "size": size,
                     "seeders": int(sm.group(1)) if sm else 0,
                     "indexer": (a["name"] + " " + nm).strip() if is_admin else "Stremio",
@@ -1744,11 +1780,16 @@ def st_streams():
         except Exception as ex:
             return [], f"{a['name']}: {short_err(ex)}"
 
-    addons = [a for a in st_load()["addons"] if usable(a)]
+    all_addons = st_load()["addons"]
+    addons = [a for a in all_addons if usable(a)]
     if not addons:
         return jsonify(error="مفيش مصادر متاحة للنوع ده حالياً.")
     with ThreadPoolExecutor(max_workers=6) as ex:
         parts = list(ex.map(one, addons))
+    report = [{"n": a["name"], "c": len(p), "e": "" if p else (n or "")}
+              for a, (p, n) in zip(addons, parts)]
+    report += [{"n": a["name"], "c": 0, "e": "متخطّاة: النوع أو الـ ID مش متوافق"}
+               for a in all_addons if a.get("stream") and not usable(a)]
     res = [i for p, _ in parts for i in p]
     notes, skipped = [], 0
     for _, n in parts:
@@ -1761,8 +1802,8 @@ def st_streams():
     if skipped:
         notes.append(f"{skipped} إضافة مش بتدعم العمل ده (404)")
     if not is_admin:
-        notes = []
-    return jsonify(results=res[:150], notes=notes)
+        notes, report = [], []
+    return jsonify(results=res[:150], notes=notes, report=report)
 
 
 @app.post("/stremio/resolve")
@@ -2702,184 +2743,6 @@ def sub_get():
         return jsonify(error=f"الترجمة: {ex}"), 500
 
 
-# ----------------- تشغيل أي فيديو (تحويل الصوت أو الفيديو بـ ffmpeg) -----------------
-
-FFMPEG = shutil.which("ffmpeg")
-FFPROBE = shutil.which("ffprobe")
-MEDIA = {}                       # mid -> {"url", "user", "name"}
-MEDIA_PROCS = {}                 # user -> عملية ffmpeg الشغالة (واحدة لكل مستخدم)
-MEDIA_LOCK = threading.Lock()
-MEDIA_SLOTS = threading.BoundedSemaphore(int(os.environ.get("TRANSCODE_MAX", "2") or 2))
-MEDIA_PRIVATE_OK = os.environ.get("MEDIA_ALLOW_PRIVATE") == "1"      # للاختبار فقط
-FF_PROTO = "http,https,tcp,tls,crypto"
-
-
-def media_url_ok(u):
-    p = urlparse(u or "")
-    if p.scheme not in ("http", "https") or not p.hostname or len(u) > 4000:
-        return False
-    if MEDIA_PRIVATE_OK:
-        return True
-    try:
-        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80))
-        for i in infos:
-            ip = ipaddress.ip_address(i[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-                return False
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def media_ticket(user, mid):
-    body = f"{user}|{mid}|{int(time.time()) + 12 * 3600}"
-    return base64.urlsafe_b64encode(body.encode()).decode() + "." + sign("m:" + body)
-
-
-def media_check(k, mid):
-    try:
-        b64, sig = str(k).rsplit(".", 1)
-        body = base64.urlsafe_b64decode(b64.encode()).decode()
-        if not hmac.compare_digest(sig.encode(), sign("m:" + body).encode()):
-            return None
-        user, m, exp = body.split("|")
-        if m != mid or int(exp) < time.time():
-            return None
-        if user != APP_USER.lower() and user not in users_load():
-            return None
-        return user
-    except Exception:
-        return None
-
-
-def media_probe(url):
-    cmd = [FFPROBE, "-v", "error", "-protocol_whitelist", FF_PROTO,
-           "-show_entries",
-           "format=duration:stream=index,codec_type,codec_name,channels,width,height:stream_tags=language,title",
-           "-of", "json", url]
-    r = subprocess.run(cmd, capture_output=True, timeout=60)
-    if r.returncode != 0:
-        msg = r.stderr.decode("utf-8", "ignore").replace(url, "<url>")[-200:]
-        raise Exception(msg.strip() or "ffprobe فشل")
-    j = json.loads(r.stdout or b"{}")
-    audio, video = [], None
-    for s in j.get("streams") or []:
-        tags = s.get("tags") or {}
-        if s.get("codec_type") == "audio":
-            audio.append({"n": len(audio), "codec": s.get("codec_name"),
-                          "ch": s.get("channels"), "lang": tags.get("language", ""),
-                          "title": tags.get("title", "")})
-        elif s.get("codec_type") == "video" and video is None:
-            video = {"codec": s.get("codec_name"), "w": s.get("width"), "h": s.get("height")}
-    try:
-        dur = float((j.get("format") or {}).get("duration") or 0)
-    except (TypeError, ValueError):
-        dur = 0.0
-    return {"dur": dur, "audio": audio, "video": video}
-
-
-def ff_cmd(url, a, t, mode):
-    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error",
-           "-protocol_whitelist", FF_PROTO,
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-    if t > 0:
-        cmd += ["-ss", str(t)]
-    cmd += ["-i", url, "-map", "0:v:0", "-map", f"0:a:{a}?"]
-    if mode == "h264":
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "27",
-                "-vf", "scale=-2:'min(720,ih)'", "-pix_fmt", "yuv420p",
-                "-profile:v", "main", "-g", "48"]
-    else:
-        cmd += ["-c:v", "copy"]
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2", "-sn", "-dn",
-            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-f", "mp4", "pipe:1"]
-    return cmd
-
-
-@app.post("/media/open")
-def media_open():
-    if not (FFMPEG and FFPROBE):
-        return jsonify(error="التشغيل المتوافق محتاج ffmpeg على السيرفر (ضيف Dockerfile)"), 501
-    d = request.get_json(silent=True) or {}
-    url = str(d.get("url", "")).strip()
-    if not media_url_ok(url):
-        return jsonify(error="رابط غير صالح"), 400
-    try:
-        info = media_probe(url)
-    except subprocess.TimeoutExpired:
-        return jsonify(error="الملف بطيء في الفتح، جرّب تاني"), 504
-    except Exception as ex:
-        return jsonify(error=f"مش قادر أفتح الملف: {ex}"), 502
-    mid = uuid.uuid4().hex[:16]
-    with MEDIA_LOCK:
-        MEDIA[mid] = {"url": url, "user": g.user, "name": str(d.get("name", ""))[:160]}
-        while len(MEDIA) > 300:
-            MEDIA.pop(next(iter(MEDIA)))
-    return jsonify(mid=mid, k=media_ticket(g.user, mid), **info)
-
-
-@app.get("/media/stream/<mid>")
-def media_stream(mid):
-    user = media_check(request.args.get("k", ""), mid)
-    m = MEDIA.get(mid)
-    if not user or not m:
-        return jsonify(error="الرابط انتهى، افتح التشغيل المتوافق تاني"), 404
-    try:
-        a = max(0, min(int(request.args.get("a", 0)), 30))
-        t = max(0.0, min(float(request.args.get("t", 0)), 200000.0))
-    except ValueError:
-        return jsonify(error="بيانات غلط"), 400
-    mode = "h264" if request.args.get("v") == "h264" else "copy"
-    with MEDIA_LOCK:                      # ستريم واحد لكل مستخدم: الجديد بيقفل القديم
-        old = MEDIA_PROCS.pop(user, None)
-    if old is not None:
-        try:
-            old.kill()
-        except Exception:
-            pass
-    if not MEDIA_SLOTS.acquire(timeout=5):
-        return jsonify(error="السيرفر مشغول بتحويلات تانية، جرّب بعد شوية"), 429
-    try:
-        proc = subprocess.Popen(ff_cmd(m["url"], a, t, mode), stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0)
-    except Exception as ex:
-        MEDIA_SLOTS.release()
-        return jsonify(error=f"فشل تشغيل ffmpeg: {ex}"), 500
-    with MEDIA_LOCK:
-        MEDIA_PROCS[user] = proc
-    name = m.get("name") or "فيديو"
-
-    def gen():
-        sent = 0
-        try:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                sent += len(chunk)
-                yield chunk
-        finally:
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-            with MEDIA_LOCK:
-                if MEDIA_PROCS.get(user) is proc:
-                    MEDIA_PROCS.pop(user, None)
-            MEDIA_SLOTS.release()
-            if sent > 5_000_000:
-                try:
-                    act_log(user, "transcode", name, sent, "Server", merge=True)
-                except Exception:
-                    pass
-
-    return Response(gen(), mimetype="video/mp4",
-                    headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-
-
 # ----------------- إشعارات الحلقات الجديدة (Web Push) -----------------
 
 try:
@@ -3049,6 +2912,7 @@ def push_loop():
         except Exception:
             pass
         time.sleep(max(PUSH_HOURS, 0.25) * 3600)
+
 
 
 @app.get("/push/key")
