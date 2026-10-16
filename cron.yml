@@ -1,0 +1,16 @@
+name: cron
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run backend jobs
+        run: |
+          curl -fsS --max-time 280 \
+            -H "X-Cron-Key: ${{ secrets.CRON_KEY }}" \
+            "${{ secrets.BACKEND_URL }}/cron/run"
