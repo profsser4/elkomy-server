@@ -8,6 +8,8 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
   POST /play/diag      (أدمن) بيفحص كل خطوة ويرجّع الردود الخام عشان نعرف أي مشكلة
 """
 import re
+import time
+from datetime import date, timedelta
 from urllib.parse import quote
 
 import requests
@@ -236,3 +238,78 @@ def register(app, bot):
                 except Exception as ex:
                     steps.append({"step": "manifest", "error": mask(ex)[:200]})
         return jsonify(steps=steps)
+
+    # ---------- بانر الرئيسية: أحدث 5 أعمال ----------
+    HERO = {"t": 0, "items": []}
+
+    @app.get("/hero")
+    def hero():
+        if HERO["items"] and time.time() - HERO["t"] < 1800:
+            return jsonify(items=HERO["items"])
+        iso = lambda n: (date.today() + timedelta(days=n)).isoformat()
+        try:
+            mv = bot.tmdb_get("/discover/movie", language="ar", include_adult="false", sort_by="popularity.desc",
+                              **{"primary_release_date.gte": iso(-60), "primary_release_date.lte": iso(0),
+                                 "vote_count.gte": "3"}).get("results", [])
+            tv = bot.tmdb_get("/discover/tv", language="ar", include_adult="false", sort_by="popularity.desc",
+                              **{"first_air_date.gte": iso(-120), "first_air_date.lte": iso(0)}).get("results", [])
+        except Exception as ex:
+            return jsonify(items=[], error=str(ex)[:120])
+
+        def pack(x, t):
+            if not (x.get("backdrop_path") and x.get("overview")):
+                return None
+            return {"id": x["id"], "type": t, "title": x.get("title") or x.get("name") or "",
+                    "overview": x["overview"], "year": (x.get("release_date") or x.get("first_air_date") or "")[:4],
+                    "rating": round(x.get("vote_average") or 0, 1),
+                    "backdrop": "https://image.tmdb.org/t/p/w1280" + x["backdrop_path"]}
+
+        a = [p for p in (pack(x, "movie") for x in mv) if p][:3]
+        b = [p for p in (pack(x, "tv") for x in tv) if p][:2]
+        items = [p for pair in zip(a, b) for p in pair] + a[len(b):] + b[len(a):]
+        if items:
+            HERO["items"], HERO["t"] = items, time.time()
+        return jsonify(items=items)
+
+    # ---------- "المزيد": صفحات أكتر من نفس الصف ----------
+    def catalog_page(a, e, skip):
+        parts = (["genre=" + quote(e["g"], safe="")] if e.get("g") else []) + (["skip=%d" % skip] if skip else [])
+        path = "/catalog/%s/%s" % (e["ty"], quote(e["c"], safe="")) + ("/" + "&".join(parts) if parts else "")
+        r = requests.get(a["base"] + path + ".json", timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        metas = r.json().get("metas") or []
+        out = []
+        for m in metas:
+            iid = str(m.get("id", ""))
+            if not m.get("poster"):
+                continue
+            it = {"type": "tv" if (m.get("type") or e["ty"]) == "series" else "movie",
+                  "title": m.get("name") or "", "poster": m["poster"],
+                  "year": str(m.get("year") or m.get("releaseInfo") or "")[:4]}
+            if re.fullmatch(r"tt\d+", iid):
+                it["imdb"] = iid
+            elif iid.startswith("tmdb:") and iid[5:].isdigit():
+                it["id"] = int(iid[5:])
+            elif it["title"]:
+                it["lk"] = True
+            else:
+                continue
+            out.append(it)
+        return out, len(metas)
+
+    @app.get("/browse")
+    def browse():
+        k, skip = request.args.get("k", ""), _int(request.args.get("skip")) or 0
+        d = bot.ensure_catalogs()
+        e = next((x for x in bot.home_layout(d) if x.get("k") == k), None)
+        if not e:
+            return jsonify(error="الصف ده مش موجود"), 404
+        if e.get("a") == "_dub":
+            return jsonify(title=e.get("t"), items=bot.dub_items(), skip=0, more=False)
+        a = next((x for x in d["addons"] if x["id"] == e.get("a")), None)
+        if not a:
+            return jsonify(error="الإضافة اتحذفت"), 404
+        try:
+            items, raw = catalog_page(a, e, skip)
+        except Exception:
+            return jsonify(error="فشل تحميل القائمة"), 502
+        return jsonify(title=e.get("t"), items=items, skip=skip + raw, more=raw > 0)
