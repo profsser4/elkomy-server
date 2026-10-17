@@ -3,7 +3,8 @@
 بتشغّل bot.py زي ما هو من غير تعديل عليه، وبتضيف 3 حاجات:
 1) حفظ البيانات في Neon قبل وبعد كل طلب (storage_sync).
 2) روابط التشغيل (ref) بتتشفّر بدل ما تتخزّن في الذاكرة، لأن كل طلب ممكن يروح لنسخة تانية.
-3) رابط /cron/run بيشغّل المهام الدورية (إشعارات الحلقات ومزامنة Stremio) ويناديه GitHub Actions.
+3) مسار التشغيل الجديد (extras.py).
+4) رابط /cron/run بيشغّل المهام الدورية (إشعارات الحلقات ومزامنة Stremio) ويناديه GitHub Actions.
 """
 import base64
 import hashlib
@@ -60,6 +61,10 @@ def _cron():
 
 
 app.before_request_funcs.setdefault(None, []).insert(0, _cron)
+
+# مسار التشغيل الجديد (نسخ + بث محوَّل + تحميل)
+import extras  # noqa: E402
+extras.register(app, bot)
 
 # لازم تتنادى بعد _cron عشان تبقى الأولى في الترتيب (تسحب البيانات قبل أي حاجة)
 storage_sync.attach(app, os.environ["DATA_DIR"])
