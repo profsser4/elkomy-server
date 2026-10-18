@@ -198,6 +198,9 @@ def register(app, bot):
         """بعض الإضافات بترجّع فيديو صغير بدل الملف لما النسخة مش متخزّنة (not cached yet)."""
         try:
             r = requests.get(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"}, timeout=12, stream=True)
+            if r.status_code not in (200, 206):
+                r.close()
+                return False   # رد خطأ من السيرفر مش دليل إن الملف صغير
             m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
             total = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
             r.close()

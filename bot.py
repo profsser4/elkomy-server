@@ -1863,6 +1863,10 @@ def st_resolve():
                 cur = urljoin(cur, loc)
                 continue
             if code >= 400:
+                # AllDebrid بيرفض فحص السيرفر للرابط (IP سيرفر)، لكن الموبايل بيشغّله عادي.
+                # فنسيب المتصفح هو اللي يجرّب الرابط من IP صاحبه بدل ما نفشل هنا.
+                if code >= 500 and "alldebrid" in body.lower() and cur != url:
+                    return jsonify(url=cur, probe_failed=code)
                 msg = f"المصدر رد {code}"
                 if g.role == "admin" and body.strip():
                     msg += ": " + re.sub(r"\s+", " ", body)[:200]
