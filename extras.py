@@ -477,20 +477,77 @@ def register(app, bot):
     }
     ICACHE = {}
 
-    def tmdb_mix(specs, page):
+    def tmdb_mix(specs, page, drop_ar=False, sort="popularity.desc", votes="20"):
         lists, more = [], False
         for typ, q in specs:
+            params = {"vote_count.gte": votes}
+            params.update(q)
             try:
-                r = bot.tmdb_get("/discover/" + typ, language="ar", include_adult="false", sort_by="popularity.desc",
-                                 page=page, **{"vote_count.gte": "20"}, **q)
+                r = bot.tmdb_get("/discover/" + typ, language="ar", include_adult="false", sort_by=sort,
+                                 page=page, **params)
             except Exception:
                 continue
             more = more or page < min(int(r.get("total_pages") or 1), 40)
             lists.append([{"id": x["id"], "type": typ, "title": x.get("title") or x.get("name") or "",
                            "poster": "https://image.tmdb.org/t/p/w342" + x["poster_path"],
                            "year": (x.get("release_date") or x.get("first_air_date") or "")[:4]}
-                          for x in r.get("results", []) if x.get("poster_path")])
+                          for x in r.get("results", [])
+                          if x.get("poster_path") and not (drop_ar and x.get("original_language") == "ar")])
         return mix(lists, 40), more
+
+    # ---------- أحدث الإضافات: عربي/أجنبي × أفلام/مسلسلات (بيتجدد كل 20 دقيقة) ----------
+    FRESH = {"ar_movie": "🆕 أحدث الأفلام العربي", "ar_tv": "🆕 جديد المسلسلات العربي",
+             "fr_movie": "🆕 أحدث الأفلام الأجنبي", "fr_tv": "🆕 جديد المسلسلات الأجنبي"}
+    FCACHE = {}
+
+    def fresh_specs(k):
+        iso = lambda n: (date.today() + timedelta(days=n)).isoformat()
+        is_movie = k.endswith("movie")
+        q = ({"primary_release_date.gte": iso(-45), "primary_release_date.lte": iso(0)} if is_movie
+             else {"air_date.gte": iso(-14), "air_date.lte": iso(0)})
+        if k.startswith("ar"):
+            q["with_original_language"] = "ar"
+        return [("movie" if is_movie else "tv", q)], k.startswith("fr")
+
+    @app.get("/fresh")
+    def fresh():
+        def one(k):
+            hit = FCACHE.get(k)
+            if hit and time.time() - hit[0] < 1200:
+                return k, hit[1]
+            specs, drop = fresh_specs(k)
+            items = tmdb_mix(specs, 1, drop, votes="1")[0][:20]
+            if items:
+                FCACHE[k] = (time.time(), items)
+            return k, items
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            got = dict(ex.map(one, FRESH))
+        return jsonify(rows=[{"id": "fresh:" + k, "title": t, "items": got[k]} for k, t in FRESH.items() if got.get(k)])
+
+    # ---------- التريلر ----------
+    TCACHE = {}
+
+    @app.get("/trailer")
+    def trailer():
+        typ, tid = request.args.get("type"), _int(request.args.get("id"))
+        if typ not in ("movie", "tv") or not tid:
+            return jsonify(error="بيانات ناقصة"), 400
+        if (typ, tid) in TCACHE:
+            return jsonify(key=TCACHE[(typ, tid)])
+        vid = ""
+        for lang in ("ar", "en-US"):
+            try:
+                res = bot.tmdb_get("/%s/%s/videos" % (typ, tid), language=lang).get("results", [])
+            except Exception:
+                continue
+            yt = [v for v in res if v.get("site") == "YouTube" and v.get("key")]
+            best = (next((v for v in yt if v.get("type") == "Trailer" and v.get("official")), None)
+                    or next((v for v in yt if v.get("type") == "Trailer"), None) or (yt[0] if yt else None))
+            if best:
+                vid = best["key"]
+                break
+        TCACHE[(typ, tid)] = vid
+        return jsonify(key=vid)
 
     @app.get("/interest/list")
     def interest_list():
@@ -541,19 +598,18 @@ def register(app, bot):
             got = sorted([x for x in ex.map(one, list(bot.follows_of(g.user).items())[:20]) if x],
                          key=lambda x: x[0], reverse=True)
         items = [x[1] for x in got]
-        try:
-            mrow = next(r for r in bot.ROWS_DEF if r["id"] == "new_movies")
-            have = {(i["type"], i["id"]) for i in items}
-            items += [x for x in bot.row_items(mrow) if (x["type"], x["id"]) not in have][:12]
-        except Exception:
-            pass
         LAT[g.user] = (time.time(), items[:20])
         return jsonify(items=items[:20])
 
     # ---------- "المزيد": صفحات أكتر (صفوف الموقع، التصنيفات، الاهتمامات) ----------
     @app.get("/browse")
     def browse():
-        gen, it = request.args.get("genre"), request.args.get("int")
+        gen, it, fr = request.args.get("genre"), request.args.get("int"), request.args.get("fresh")
+        if fr in FRESH:
+            page = (_int(request.args.get("skip")) or 0) + 1
+            specs, drop = fresh_specs(fr)
+            items, more = tmdb_mix(specs, page, drop, votes="1")
+            return jsonify(items=items, skip=str(page), more=more)
         if gen or it:
             page = (_int(request.args.get("skip")) or 0) + 1
             if it == "dub":
