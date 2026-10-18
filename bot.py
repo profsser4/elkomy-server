@@ -34,14 +34,6 @@ SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
-try:                                   # لو المسار مش موجود أو مش بيتكتب فيه بنرجع لمجلد البرنامج
-    os.makedirs(DATA_DIR, exist_ok=True)
-    _probe = os.path.join(DATA_DIR, ".w")
-    with open(_probe, "w") as _f:
-        _f.write("1")
-    os.remove(_probe)
-except Exception:
-    DATA_DIR = "."
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
@@ -780,8 +772,10 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
 
 # ----------------- تورنت على TorBox / Real-Debrid / Debrid-Link -----------------
 
-TORRENT_TYPES = ("torbox", "debridlink", "realdebrid")   # الترتيب = الأولوية
-CHECKABLE = ("torbox", "debridlink")                      # بيدعموا فحص "فوري"
+TORRENT_TYPES = ("torbox", "debridlink", "realdebrid", "alldebrid")  # الترتيب = الأولوية
+CHECKABLE = ("torbox", "debridlink", "alldebrid")         # بيدعموا فحص "فوري"
+AD_API = "https://api.alldebrid.com/v4"
+AD_API41 = "https://api.alldebrid.com/v4.1"
 RD_API = "https://api.real-debrid.com/rest/1.0"
 DL_API = "https://debrid-link.com/api/v2"
 
@@ -971,7 +965,96 @@ def dl_cached(k, hs):
     return found
 
 
+# ---- AllDebrid
+def ad(k, method, path, base=AD_API, **kw):
+    params = kw.pop("params", {}) or {}
+    params.update({"agent": "Elkomy", "apikey": k})
+    r = requests.request(method, base + path, params=params, timeout=25, **kw)
+    try:
+        j = r.json()
+    except ValueError:
+        raise Exception(f"AllDebrid رد غير مفهوم ({r.status_code})")
+    if j.get("status") != "success":
+        e = j.get("error") or {}
+        raise Exception(str(e.get("message") or e.get("code") or "فشل"))
+    return j.get("data") or {}
+
+
+def ad_magnets(d):
+    m = d.get("magnets")
+    if isinstance(m, dict):
+        return [m]
+    return m if isinstance(m, list) else []
+
+
+def ad_find(k, q):
+    h = magnet_hash(q)
+    if not h:
+        return None
+    for x in ad_magnets(ad(k, "GET", "/magnet/status", AD_API41)):
+        if str(x.get("hash", "")).lower() == h:
+            return x.get("id")
+    return None
+
+
+def ad_add(k, q):
+    d = ad(k, "POST", "/magnet/upload", data={"magnets[]": q})
+    lst = ad_magnets(d)
+    if not lst:
+        raise Exception("فشل إضافة التورنت")
+    first = lst[0]
+    if first.get("error"):
+        e = first["error"]
+        raise Exception(str(e.get("message") if isinstance(e, dict) else e))
+    return first.get("id")
+
+
+def ad_info(k, rid):
+    lst = ad_magnets(ad(k, "GET", "/magnet/status", AD_API41, params={"id": rid}))
+    d = lst[0] if lst else None
+    if not d:
+        raise Exception("التورنت مش موجود")
+    code = int(d.get("statusCode") or 0)
+    if code >= 5:
+        raise Exception(f"التورنت فشل ({d.get('status') or code})")
+    size = d.get("size") or 0
+    done = d.get("downloaded") or 0
+    res = []
+    for x in d.get("links") or []:
+        if not x.get("link"):
+            continue
+        name = str(x.get("filename") or "")
+        res.append({"id": len(res), "name": name,
+                    "short_name": name.rsplit("/", 1)[-1],
+                    "size": x.get("size") or 0, "link": x["link"]})
+    ready = code == 4 and bool(res)
+    return {"ready": ready, "status": str(d.get("status") or "processing"),
+            "progress": 1 if ready else (done / size if size else 0),
+            "speed": d.get("downloadSpeed"), "seeds": d.get("seeders"),
+            "peers": None, "size": size, "name": d.get("filename"),
+            "files": res if ready else []}
+
+
+def ad_link(k, f):
+    d = ad(k, "GET", "/link/unlock", params={"link": f["link"]})
+    if d.get("link"):
+        return d["link"]
+    raise Exception("فشل فك الرابط")
+
+
+def ad_cached(k, hs):
+    found = set()
+    for i in range(0, len(hs), 40):
+        d = ad(k, "POST", "/magnet/instant",
+               data=[("magnets[]", h) for h in hs[i:i + 40]])
+        for m in ad_magnets(d):
+            if m.get("instant") and m.get("hash"):
+                found.add(str(m["hash"]).lower())
+    return found
+
+
 ADAPT = {
+    "alldebrid": {"find": ad_find, "add": ad_add, "info": ad_info, "link": ad_link},
     "realdebrid": {"find": rd_find, "add": rd_add, "info": rd_info, "link": rd_link},
     "debridlink": {"find": dl_find, "add": dl_add, "info": dl_info,
                    "link": lambda k, f: f["link"]},
@@ -983,6 +1066,8 @@ def cached_for(p, hs):
         return tb_cached(p["key"], hs)
     if p["type"] == "debridlink":
         return dl_cached(p["key"], hs)
+    if p["type"] == "alldebrid":
+        return ad_cached(p["key"], hs)
     return set()
 
 
@@ -1257,7 +1342,7 @@ def act_load():
         return {}
 
 
-def act_log(user, kind, name, size, prov, merge=False):
+def act_log(user, kind, name, size, prov):
     try:
         size = int(size or 0)
     except (TypeError, ValueError):
@@ -1267,21 +1352,14 @@ def act_log(user, kind, name, size, prov, merge=False):
     with ACT_LOCK:
         d = act_load()
         u = d.setdefault(user, {"bytes": 0, "count": 0, "ev": []})
-        hit = None
         for e in u["ev"][-5:]:
-            if e.get("n") == name and e.get("k") == kind and now - e.get("t", 0) < (1800000 if merge else 300000):
-                hit = e
-        if hit is not None and not merge:
-            return
-        if hit is not None:
-            hit["s"] = hit.get("s", 0) + max(size, 0)
-            hit["t"] = now
-        else:
-            u["count"] += 1
-            u["ev"].append({"t": now, "k": kind, "n": name, "s": max(size, 0),
-                            "p": str(prov or "")[:40]})
-            del u["ev"][:-300]
+            if e.get("n") == name and e.get("k") == kind and now - e.get("t", 0) < 300000:
+                return
         u["bytes"] += max(size, 0)
+        u["count"] += 1
+        u["ev"].append({"t": now, "k": kind, "n": name, "s": size,
+                        "p": str(prov or "")[:40]})
+        del u["ev"][:-300]
         tmp = ACT_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False)
@@ -1407,28 +1485,6 @@ def st_add(d, base, man):
     return True
 
 
-CFG_DS = {"tb": "torbox", "rd": "realdebrid", "ad": "alldebrid",
-          "pm": "premiumize", "dl": "debridlink"}
-
-
-def cfg_keys(base):
-    """إضافات زي aradeb بتخزّن إعدادها base64 جوه الرابط: بنفكها ونطلّع مفتاح الدابريد"""
-    out = []
-    for seg in urlparse(base).path.split("/"):
-        if len(seg) < 20 or not re.fullmatch(r"[A-Za-z0-9_\-]+={0,2}", seg):
-            continue
-        try:
-            j = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
-        except Exception:
-            continue
-        if isinstance(j, dict):
-            t = CFG_DS.get(str(j.get("ds", "")).lower())
-            k = str(j.get("dk", "")).strip()
-            if t and k:
-                out.append((t, k))
-    return out
-
-
 def st_import_keys(base):
     """لو رابط الإضافة فيه مفتاح دابريد (زي Torrentio) بنضيفه كمزوّد"""
     path = unquote(urlparse(base).path)
@@ -1441,11 +1497,6 @@ def st_import_keys(base):
         ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
                    "key": k, "domains": []})
         added += 1
-    for t, k in cfg_keys(base):
-        if not any(p["type"] == t for p in ps):
-            ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
-                       "key": k, "domains": []})
-            added += 1
     mt = TBOFF_RX.search(base)
     if mt and not any(p["type"] == "torbox" for p in ps):
         ps.append({"id": uuid.uuid4().hex[:8], "type": "torbox", "name": TYPES["torbox"],
@@ -1696,24 +1747,12 @@ def st_streams():
     if not re.fullmatch(r"tt\d+", imdb):
         return jsonify(error="العمل ده ملوش IMDb id"), 400
     sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
-    tmdb = request.args.get("tmdb", "")
-    tmdb = tmdb if tmdb.isdigit() else ""
-    tsid = (f"tmdb:{tmdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit()
-            else f"tmdb:{tmdb}")
-
-    def sid_for(a):
-        pre = a.get("prefixes") or []
-        if pre and not any(imdb.startswith(p) for p in pre) and tmdb and any(
-                str(p).startswith("tmdb") for p in pre):
-            return tsid
-        return sid
 
     own = bool(torrent_providers())
     all_keys = {p["key"] for p in load() if p.get("key")}
     for a_ in st_load()["addons"]:
         all_keys |= {m.group(2) for m in DEBRID_RX.finditer(
             unquote(urlparse(a_["base"]).path))}
-        all_keys |= {k for _, k in cfg_keys(a_["base"])}
     low_keys = {k.lower() for k in all_keys}
 
     def usable(a):
@@ -1725,12 +1764,11 @@ def st_streams():
                 k in unquote(a["base"]) for k in all_keys):
             return False
         pre = a.get("prefixes")
-        return (not pre or any(imdb.startswith(p) for p in pre)
-                or (bool(tmdb) and any(str(p).startswith("tmdb") for p in pre)))
+        return not pre or any(imdb.startswith(p) for p in pre)
 
     def one(a):
         qb = st_plain_base(a["base"]) if own else a["base"]
-        url = f"{qb}/stream/{typ}/{sid_for(a)}.json"
+        url = f"{qb}/stream/{typ}/{sid}.json"
         try:
             r = requests.get(url, timeout=25,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -1766,7 +1804,6 @@ def st_streams():
                     [txt, nm, str(bh.get("filename") or "")]))
                 out.append({
                     "dub": fl_dub, "eg": fl_eg,
-                    "nw": bool(bh.get("notWebReady") or bh.get("proxyHeaders")),
                     "title": title, "size": size,
                     "seeders": int(sm.group(1)) if sm else 0,
                     "indexer": (a["name"] + " " + nm).strip() if is_admin else "Stremio",
@@ -1780,16 +1817,11 @@ def st_streams():
         except Exception as ex:
             return [], f"{a['name']}: {short_err(ex)}"
 
-    all_addons = st_load()["addons"]
-    addons = [a for a in all_addons if usable(a)]
+    addons = [a for a in st_load()["addons"] if usable(a)]
     if not addons:
         return jsonify(error="مفيش مصادر متاحة للنوع ده حالياً.")
     with ThreadPoolExecutor(max_workers=6) as ex:
         parts = list(ex.map(one, addons))
-    report = [{"n": a["name"], "c": len(p), "e": "" if p else (n or "")}
-              for a, (p, n) in zip(addons, parts)]
-    report += [{"n": a["name"], "c": 0, "e": "متخطّاة: النوع أو الـ ID مش متوافق"}
-               for a in all_addons if a.get("stream") and not usable(a)]
     res = [i for p, _ in parts for i in p]
     notes, skipped = [], 0
     for _, n in parts:
@@ -1802,8 +1834,8 @@ def st_streams():
     if skipped:
         notes.append(f"{skipped} إضافة مش بتدعم العمل ده (404)")
     if not is_admin:
-        notes, report = [], []
-    return jsonify(results=res[:150], notes=notes, report=report)
+        notes = []
+    return jsonify(results=res[:150], notes=notes)
 
 
 @app.post("/stremio/resolve")
@@ -2725,7 +2757,7 @@ def sub_get():
         shift = float(request.args.get("shift", 0))
     except ValueError:
         shift = 0.0
-    shift = max(-20000.0, min(20000.0, shift))
+    shift = max(-600.0, min(600.0, shift))
     se, ep = request.args.get("s", ""), request.args.get("e", "")
     season = int(se) if se.isdigit() else None
     episode = int(ep) if ep.isdigit() else None
@@ -2914,7 +2946,6 @@ def push_loop():
         time.sleep(max(PUSH_HOURS, 0.25) * 3600)
 
 
-
 @app.get("/push/key")
 def push_key():
     if webpush is None:
@@ -2997,14 +3028,5 @@ def st_sync_loop():
         time.sleep(max(ST_SYNC_MIN, 5) * 60)
 
 
-try:
-    if os.environ.get("ST_AUTOSYNC", "1") != "0":
-        threading.Thread(target=st_sync_loop, daemon=True).start()
-    if webpush is not None and os.environ.get("PUSH_WATCHER", "1") != "0":
-        threading.Thread(target=push_loop, daemon=True).start()
-except Exception:
-    pass
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+if os.environ.get("ST_AUTOSYNC", "1") != "0":
+    threading.Thread(target=st_sync_loop, daemon=True).start()
