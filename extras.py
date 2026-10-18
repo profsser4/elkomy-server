@@ -7,8 +7,16 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
   POST /play/start     بيجهّز النسخة ويرجّع رابط البث المحوَّل (hls) والرابط الأصلي (direct)
   POST /play/diag      (أدمن) بيفحص كل خطوة ويرجّع الردود الخام عشان نعرف أي مشكلة
 """
+import json
+import os
+import json
+import os
 import re
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from urllib.parse import quote
 
@@ -296,20 +304,291 @@ def register(app, bot):
             out.append(it)
         return out, len(metas)
 
+    # ---------- دمج الصفوف + "المزيد" + التصنيفات ----------
+    def srcs(e):
+        return [{"a": e.get("a"), "ty": e.get("ty"), "c": e.get("c"), "g": e.get("g", "")}] + list(e.get("m") or [])
+
+    def interleave(lists, cap=60):
+        out, seen = [], set()
+        for i in range(max((len(x) for x in lists), default=0)):
+            for lst in lists:
+                if i < len(lst):
+                    x = lst[i]
+                    k = x.get("imdb") or x.get("id") or (x.get("title"), x.get("year"))
+                    if k not in seen:
+                        seen.add(k)
+                        out.append(x)
+        return out[:cap]
+
+    def row_of(e, amap):
+        lists = []
+        for sc in srcs(e):
+            if sc["a"] == "_dub":
+                lists.append(bot.dub_items())
+            elif sc["a"] in amap:
+                try:
+                    lists.append(bot.cat_items(amap[sc["a"]], sc))
+                except Exception:
+                    pass
+        items = interleave(lists, 20)
+        return {"id": e["k"], "title": e["t"], "items": items} if items else None
+
+    def my_rows():
+        d = bot.ensure_catalogs()
+        amap = {a["id"]: a for a in d["addons"]}
+        ents = [e for e in bot.home_layout(d)
+                if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
+        if not ents:
+            return bot.tmdb_rows()
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            data = [x for x in ex.map(lambda e: row_of(e, amap), ents) if x]
+        return jsonify(rows=data) if data else bot.tmdb_rows()
+
+    def my_layout_set():
+        d = bot.st_load()
+        ids = {a["id"] for a in d["addons"]} | {"_dub"}
+        rows_in = (request.get_json(silent=True) or {}).get("rows")
+        if not isinstance(rows_in, list):
+            return jsonify(error="بيانات ناقصة"), 400
+        ok_src = lambda r: isinstance(r, dict) and r.get("a") in ids and r.get("ty") in ("movie", "series")
+        out, used = [], set()
+        for r in rows_in[:40]:
+            if not ok_src(r):
+                continue
+            k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
+            if k in used:
+                k = uuid.uuid4().hex[:8]
+            used.add(k)
+            ent = {"k": k, "a": r["a"], "ty": r["ty"], "c": str(r.get("c", ""))[:80],
+                   "g": str(r.get("g", ""))[:40], "t": str(r.get("t", ""))[:60] or "صف", "on": bool(r.get("on"))}
+            m = [{"a": x["a"], "ty": x["ty"], "c": str(x.get("c", ""))[:80], "g": str(x.get("g", ""))[:40]}
+                 for x in (r.get("m") or [])[:8] if ok_src(x)]
+            if m:
+                ent["m"] = m
+            out.append(ent)
+        seen = {"dubeg"} | {bot.cat_key(a["id"], c["type"], c["id"])
+                            for a in d["addons"] for c in a.get("catalogs") or []}
+        tmp = bot.HOME_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"rows": out, "seen": sorted(seen)}, f, ensure_ascii=False)
+        os.replace(tmp, bot.HOME_FILE)
+        return jsonify(ok=True)
+
+    app.view_functions["rows"] = my_rows
+    app.view_functions["home_layout_set"] = my_layout_set
+
+    # ---------- دمج الصفوف ----------
+    def src_list(e):
+        return [{"a": e.get("a"), "ty": e.get("ty"), "c": e.get("c"), "g": e.get("g", "")}] + (e.get("m") or [])
+
+    def ikey(x):
+        return x.get("imdb") or x.get("id") or ((x.get("title") or "") + (x.get("year") or ""))
+
+    def mix(lists, cap=20):
+        out, seen = [], set()
+        for i in range(max((len(l) for l in lists), default=0)):
+            for l in lists:
+                if i < len(l) and ikey(l[i]) not in seen:
+                    seen.add(ikey(l[i]))
+                    out.append(l[i])
+        return out[:cap]
+
+    def rows2():
+        d = bot.ensure_catalogs()
+        amap = {a["id"]: a for a in d["addons"]}
+        ents = [e for e in bot.home_layout(d) if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
+        if not ents:
+            return bot.tmdb_rows()
+
+        def fetch(s_):
+            if s_.get("a") == "_dub":
+                return bot.dub_items()
+            ad = amap.get(s_.get("a"))
+            try:
+                return bot.cat_items(ad, s_) if ad else []
+            except Exception as ex:
+                bot.CAT_STATS[(s_["a"], s_["ty"], s_["c"], s_.get("g", ""))] = {"err": bot.short_err(ex)}
+                return []
+
+        def one(e):
+            items = mix([fetch(x) for x in src_list(e)])
+            return {"id": e["k"], "title": e["t"], "items": items} if items else None
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            data = [x for x in ex.map(one, ents) if x]
+        return jsonify(rows=data) if data else bot.tmdb_rows()
+
+    def layout_set():
+        d = bot.st_load()
+        ids = {a["id"] for a in d["addons"]} | {"_dub"}
+        rows_in = (request.get_json(silent=True) or {}).get("rows")
+        if not isinstance(rows_in, list):
+            return jsonify(error="بيانات ناقصة"), 400
+        ok = lambda r: isinstance(r, dict) and r.get("a") in ids and r.get("ty") in ("movie", "series")
+        out, used = [], set()
+        for r in rows_in[:40]:
+            if not ok(r):
+                continue
+            k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
+            if k in used:
+                k = uuid.uuid4().hex[:8]
+            used.add(k)
+            ent = {"k": k, "a": r["a"], "ty": r["ty"], "c": str(r.get("c", ""))[:80], "g": str(r.get("g", ""))[:40],
+                   "t": str(r.get("t", ""))[:60] or "صف", "on": bool(r.get("on"))}
+            ms = [{"a": m["a"], "ty": m["ty"], "c": str(m.get("c", ""))[:80], "g": str(m.get("g", ""))[:40]}
+                  for m in (r.get("m") or []) if ok(m)][:8]
+            if ms:
+                ent["m"] = ms
+            out.append(ent)
+        seen = {"dubeg"}
+        for ad in d["addons"]:
+            for c in ad.get("catalogs") or []:
+                seen.add(bot.cat_key(ad["id"], c["type"], c["id"]))
+        tmp = bot.HOME_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"rows": out, "seen": sorted(seen)}, f, ensure_ascii=False)
+        os.replace(tmp, bot.HOME_FILE)
+        return jsonify(ok=True)
+
+    if "rows" in app.view_functions:
+        app.view_functions["rows"] = rows2
+    if "home_layout_set" in app.view_functions:
+        app.view_functions["home_layout_set"] = layout_set
+
+    # ---------- التصنيفات والاهتمامات (من TMDB) ----------
+    GENRES = {"action": (28, 10759), "drama": (18, 18), "comedy": (35, 35), "crime": (80, 80), "scifi": (878, 10765),
+              "horror": (27, 9648), "romance": (10749, 18), "cartoon": (16, 16), "family": (10751, 10751), "doc": (99, 99)}
+    L = lambda t, **q: (t, q)
+    INTERESTS = {
+        "cartoon": ("كرتون وأنيميشن", [L("movie", with_genres="16"), L("tv", with_genres="16")]),
+        "kids": ("أطفال وعائلة", [L("movie", with_genres="10751"), L("tv", with_genres="10762")]),
+        "ar": ("عربي", [L("movie", with_original_language="ar"), L("tv", with_original_language="ar")]),
+        "hi": ("هندي", [L("movie", with_original_language="hi"), L("tv", with_original_language="hi")]),
+        "tr": ("تركي", [L("tv", with_original_language="tr"), L("movie", with_original_language="tr")]),
+        "ko": ("كوري", [L("tv", with_original_language="ko"), L("movie", with_original_language="ko")]),
+        "anime": ("أنمي", [L("tv", with_genres="16", with_original_language="ja"),
+                           L("movie", with_genres="16", with_original_language="ja")]),
+        "act": ("أكشن", [L("movie", with_genres="28"), L("tv", with_genres="10759")]),
+        "com": ("كوميدي", [L("movie", with_genres="35"), L("tv", with_genres="35")]),
+        "hor": ("رعب", [L("movie", with_genres="27")]),
+        "sci": ("خيال علمي", [L("movie", with_genres="878"), L("tv", with_genres="10765")]),
+        "doc": ("وثائقي", [L("movie", with_genres="99"), L("tv", with_genres="99")]),
+        "dub": ("🇪🇬 مدبلج مصري", None),
+    }
+    ICACHE = {}
+
+    def tmdb_mix(specs, page):
+        lists, more = [], False
+        for typ, q in specs:
+            try:
+                r = bot.tmdb_get("/discover/" + typ, language="ar", include_adult="false", sort_by="popularity.desc",
+                                 page=page, **{"vote_count.gte": "20"}, **q)
+            except Exception:
+                continue
+            more = more or page < min(int(r.get("total_pages") or 1), 40)
+            lists.append([{"id": x["id"], "type": typ, "title": x.get("title") or x.get("name") or "",
+                           "poster": "https://image.tmdb.org/t/p/w342" + x["poster_path"],
+                           "year": (x.get("release_date") or x.get("first_air_date") or "")[:4]}
+                          for x in r.get("results", []) if x.get("poster_path")])
+        return mix(lists, 40), more
+
+    @app.get("/interest/list")
+    def interest_list():
+        return jsonify(items=[{"k": k, "name": v[0]} for k, v in INTERESTS.items()])
+
+    @app.get("/interest")
+    def interest_rows():
+        rows = []
+        for k in [x for x in request.args.get("k", "").split(",") if x in INTERESTS][:8]:
+            name, specs = INTERESTS[k]
+            hit = ICACHE.get(k)
+            if hit and time.time() - hit[0] < 1800:
+                items = hit[1]
+            else:
+                items = bot.dub_items() if specs is None else tmdb_mix(specs, 1)[0][:20]
+                if items:
+                    ICACHE[k] = (time.time(), items)
+            if items:
+                rows.append({"id": "int:" + k, "title": name, "items": items})
+        return jsonify(rows=rows)
+
+    # ---------- آخر الإضافات (مسلسلات قائمتك + أحدث الأفلام) ----------
+    LAT = {}
+
+    @app.get("/latest")
+    def latest():
+        hit = LAT.get(g.user)
+        if hit and time.time() - hit[0] < 900:
+            return jsonify(items=hit[1])
+        limit = (date.today() - timedelta(days=30)).isoformat()
+
+        def one(kv):
+            tid, title = kv
+            try:
+                info = bot.tmdb_get("/tv/%s" % tid, language="ar")
+            except Exception:
+                return None
+            le = info.get("last_episode_to_air") or {}
+            ad = le.get("air_date") or ""
+            if not ad or ad < limit or not info.get("poster_path"):
+                return None
+            return ad, {"id": tid, "type": "tv", "title": info.get("name") or title,
+                        "poster": "https://image.tmdb.org/t/p/w342" + info["poster_path"],
+                        "year": (info.get("first_air_date") or "")[:4],
+                        "badge": "S%02dE%02d" % (le.get("season_number") or 0, le.get("episode_number") or 0)}
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            got = sorted([x for x in ex.map(one, list(bot.follows_of(g.user).items())[:20]) if x],
+                         key=lambda x: x[0], reverse=True)
+        items = [x[1] for x in got]
+        try:
+            mrow = next(r for r in bot.ROWS_DEF if r["id"] == "new_movies")
+            have = {(i["type"], i["id"]) for i in items}
+            items += [x for x in bot.row_items(mrow) if (x["type"], x["id"]) not in have][:12]
+        except Exception:
+            pass
+        LAT[g.user] = (time.time(), items[:20])
+        return jsonify(items=items[:20])
+
+    # ---------- "المزيد": صفحات أكتر (صفوف الموقع، التصنيفات، الاهتمامات) ----------
     @app.get("/browse")
     def browse():
-        k, skip = request.args.get("k", ""), _int(request.args.get("skip")) or 0
+        gen, it = request.args.get("genre"), request.args.get("int")
+        if gen or it:
+            page = (_int(request.args.get("skip")) or 0) + 1
+            if it == "dub":
+                return jsonify(items=bot.dub_items(), skip="0", more=False)
+            if gen in GENRES:
+                specs = [L("movie", with_genres=str(GENRES[gen][0])), L("tv", with_genres=str(GENRES[gen][1]))]
+            elif it in INTERESTS and INTERESTS[it][1]:
+                specs = INTERESTS[it][1]
+            else:
+                return jsonify(error="القسم ده مش موجود"), 404
+            items, more = tmdb_mix(specs, page)
+            return jsonify(items=items, skip=str(page), more=more)
         d = bot.ensure_catalogs()
-        e = next((x for x in bot.home_layout(d) if x.get("k") == k), None)
+        e = next((x for x in bot.home_layout(d) if x.get("k") == request.args.get("k", "")), None)
         if not e:
             return jsonify(error="الصف ده مش موجود"), 404
-        if e.get("a") == "_dub":
-            return jsonify(title=e.get("t"), items=bot.dub_items(), skip=0, more=False)
-        a = next((x for x in d["addons"] if x["id"] == e.get("a")), None)
-        if not a:
-            return jsonify(error="الإضافة اتحذفت"), 404
-        try:
-            items, raw = catalog_page(a, e, skip)
-        except Exception:
+        srcs = src_list(e)
+        skips = [(_int(x) or 0) for x in str(request.args.get("skip", "")).split(",")]
+        skips += [0] * (len(srcs) - len(skips))
+        lists, new = [], []
+        for s_, sk in zip(srcs, skips):
+            if s_.get("a") == "_dub":
+                its = bot.dub_items() if sk == 0 else []
+                lists.append(its)
+                new.append(sk + len(its))
+                continue
+            ad = next((x for x in d["addons"] if x["id"] == s_.get("a")), None)
+            try:
+                its, raw = catalog_page(ad, s_, sk) if ad else ([], 0)
+            except Exception:
+                its, raw = [], 0
+            lists.append(its)
+            new.append(sk + raw)
+        items = mix(lists, 80)
+        if not items and not any(skips):
             return jsonify(error="فشل تحميل القائمة"), 502
-        return jsonify(title=e.get("t"), items=items, skip=skip + raw, more=raw > 0)
+        return jsonify(title=e.get("t"), items=items, skip=",".join(str(n) for n in new),
+                       more=any(n > sk for n, sk in zip(new, skips)))
