@@ -143,7 +143,7 @@ def dom(x):
 
 def candidates(u):
     host = urlparse(u).netloc.lower().replace("www.", "")
-    ps = load()
+    ps = [p for p in load() if p["type"] != "alldebrid" or AD_SERVER]
 
     def hit(p):
         return any(
@@ -772,6 +772,11 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
 
 # ----------------- تورنت على TorBox / Real-Debrid / Debrid-Link -----------------
 
+# 1 = الأعضاء العاديين يقدروا يشغّلوا الروابط اللي فيها مفتاح الدابريد (للعيلة بس). 0 = للأدمن بس
+# AllDebrid بيرفض طلبات السيرفرات وممكن يوقف الحساب، فالسيرفر مايكلّمهوش (التشغيل بيتم من Stremio).
+# لو السيرفر بقى على جهاز في البيت: ALLDEBRID_SERVER=1
+AD_SERVER = os.environ.get("ALLDEBRID_SERVER", "0") == "1"
+SHARE_KEYS = os.environ.get("SHARE_KEYS", "1") == "1"
 TORRENT_TYPES = ("torbox", "debridlink", "realdebrid", "alldebrid")  # الترتيب = الأولوية
 CHECKABLE = ("torbox", "debridlink", "alldebrid")         # بيدعموا فحص "فوري"
 AD_API = "https://api.alldebrid.com/v4"
@@ -781,7 +786,8 @@ DL_API = "https://debrid-link.com/api/v2"
 
 
 def torrent_providers():
-    ps = [p for p in load() if p["type"] in TORRENT_TYPES]
+    ps = [p for p in load() if p["type"] in TORRENT_TYPES
+          and (p["type"] != "alldebrid" or AD_SERVER)]
     ps.sort(key=lambda p: TORRENT_TYPES.index(p["type"]))
     return ps
 
@@ -1192,6 +1198,7 @@ def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False):
         return jsonify(
             error="ضيف مزوّد (TorBox أو Real-Debrid أو Debrid-Link) من الإعدادات الأول"), 400
     last = None
+    errs = []
     for p in ps:
         if p["type"] == "torbox":
             r = torrent_flow(q, None, file_id, want_zip, want_all)
@@ -1201,6 +1208,15 @@ def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False):
         if code in (200, 202):
             return r
         last = r  # المزوّد ده فشل (اشتراك منتهي مثلاً)، نجرّب اللي بعده
+        try:
+            resp = r[0] if isinstance(r, tuple) else r
+            msg = (resp.get_json(silent=True) or {}).get("error")
+            if msg:
+                errs.append(str(msg))
+        except Exception:
+            pass
+    if len(errs) > 1:
+        return jsonify(error=" | ".join(errs)), 400
     return last
 
 
@@ -1748,7 +1764,8 @@ def st_streams():
         return jsonify(error="العمل ده ملوش IMDb id"), 400
     sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
 
-    own = bool(torrent_providers())
+    # AllDebrid بيرفض طلبات السيرفر (NO_SERVER)، فمايتحسبش مزوّد يسحب من عندنا
+    own = any(p["type"] != "alldebrid" for p in torrent_providers())
     all_keys = {p["key"] for p in load() if p.get("key")}
     for a_ in st_load()["addons"]:
         all_keys |= {m.group(2) for m in DEBRID_RX.finditer(
@@ -1796,7 +1813,7 @@ def st_streams():
                             h = cand[0].lower()
                     if h and own:
                         direct = ""
-                    elif own or not is_admin:
+                    elif own or (not is_admin and not SHARE_KEYS):
                         continue
                 if not direct and not h:
                     continue
@@ -1872,7 +1889,7 @@ def st_resolve():
                     msg += ": " + re.sub(r"\s+", " ", body)[:200]
                 return jsonify(error=msg), 502
             break
-        if g.role != "admin" and any(p.get("key") and p["key"] in cur for p in load()):
+        if g.role != "admin" and not SHARE_KEYS and any(p.get("key") and p["key"] in cur for p in load()):
             return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
         act_log(g.user, "stremio", req.get("name"), req.get("size"), "Stremio")
         return jsonify(url=cur)
