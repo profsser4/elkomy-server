@@ -1872,7 +1872,7 @@ def st_resolve():
             body = ""
             if code >= 400:
                 try:
-                    body = r.raw.read(300, decode_content=True).decode("utf-8", "ignore")
+                    body = r.raw.read(3000, decode_content=True).decode("utf-8", "ignore")
                 except Exception:
                     body = ""
             r.close()
@@ -1886,7 +1886,16 @@ def st_resolve():
                     return jsonify(url=cur, probe_failed=code)
                 msg = f"المصدر رد {code}"
                 if g.role == "admin" and body.strip():
-                    msg += ": " + re.sub(r"\s+", " ", body)[:200]
+                    tm = re.search(r"<title>(.*?)</title>", body, re.I | re.S)
+                    if tm:
+                        txt = tm.group(1)
+                    elif "<" in body[:50]:
+                        txt = re.sub(r"<[^>]+>", " ", body)
+                    else:
+                        txt = body
+                    txt = re.sub(r"\s+", " ", txt).strip()
+                    if txt:
+                        msg += " (" + urlparse(cur).netloc + "): " + txt[:200]
                 return jsonify(error=msg), 502
             break
         if g.role != "admin" and not SHARE_KEYS and any(p.get("key") and p["key"] in cur for p in load()):
