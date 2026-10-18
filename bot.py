@@ -1564,6 +1564,7 @@ def st_login():
             d = st_load()
             d["authKey"] = key
             d["email"] = email
+            d["ignored"] = []   # تسجيل الدخول من جديد = رجّع كل إضافات الحساب حتى المحذوفة
             added, keys = st_import(d)
             st_save(d)
         return jsonify(ok=True, added=added, keys=keys)
