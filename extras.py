@@ -156,11 +156,75 @@ def register(app, bot):
                     return None, (jsonify(error="الملف ده مش الحلقة المطلوبة"), 400)
         return d, None
 
+    # ---------- بحث TorBox (بيجيب النسخ وعلامة "فوري" من TorBox نفسه) ----------
+    TBS = "https://search-api.torbox.app"
+
+    def tb_items(path, params):
+        p = bot.tb_provider()
+        if not p:
+            return []
+        try:
+            r = requests.get(TBS + path, params=params, timeout=20,
+                             headers={"Authorization": "Bearer " + p["key"], "User-Agent": "Mozilla/5.0"})
+            data = (r.json() or {}).get("data")
+        except Exception:
+            return []
+        out = []
+        for x in (data.get("torrents") if isinstance(data, dict) else None) or []:
+            if not isinstance(x, dict):
+                continue
+            mag = x.get("magnet") or ""
+            m = re.search(r"btih:([a-zA-Z0-9]{40})", mag)
+            h = str(x.get("hash") or (m.group(1) if m else "")).lower()
+            title = str(x.get("raw_title") or x.get("title") or "")
+            if len(h) != 40 or not title:
+                continue
+            eg, dub = bot.dub_flags(title)
+            out.append({"title": title, "size": x.get("size") or 0,
+                        "seeders": x.get("last_known_seeders") or x.get("seeders") or 0,
+                        "hash": h, "ref": "", "dub": dub, "eg": eg, "cached": bool(x.get("cached")),
+                        "magnet": mag, "indexer": str(x.get("tracker") or "TorBox")})
+        return out
+
+    def tb_search(imdb, s, e):
+        if not re.fullmatch(r"tt\d+", imdb or ""):
+            return []
+        q = {"check_cache": "true"}
+        if s:
+            q.update(season=s, episode=e or 1)
+        return tb_items("/torrents/imdb:" + imdb, q)
+
+    def too_small(url, expected):
+        """بعض الإضافات بترجّع فيديو صغير بدل الملف لما النسخة مش متخزّنة (not cached yet)."""
+        try:
+            r = requests.get(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"}, timeout=12, stream=True)
+            m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
+            total = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
+            r.close()
+        except Exception:
+            return False
+        return bool(total) and total < 40000000 and (not expected or total < expected * 0.1)
+
+    def resolve_checked():
+        resp = bot.st_resolve()
+        d, _ = _jr(resp)
+        size = _int((request.get_json(silent=True) or {}).get("size"))
+        if d.get("url") and too_small(d["url"], size):
+            return jsonify(error="النسخة دي لسه مش متخزّنة على خدمة الدابريد (بتتحمّل). جرّب نسخة تانية."), 409
+        return resp
+
+    if "st_resolve" in app.view_functions:
+        app.view_functions["st_resolve"] = resolve_checked
+
     # ---------- النسخ ----------
     @app.get("/play/versions")
     def play_versions():
-        d, code = _jr(bot.st_streams())
-        res = d.get("results") or []
+        try:
+            d, code = _jr(bot.st_streams())
+        except Exception:
+            d = {}
+        tbs = tb_search(request.args.get("imdb", ""), _int(request.args.get("s")), _int(request.args.get("e")))
+        res = (d.get("results") or []) + tbs
         if not res:
             return jsonify(versions=[], error=d.get("error") or "مفيش نسخ متاحة للعمل ده")
         hashes = list({(x.get("hash") or "").lower() for x in res if x.get("hash")})[:100]
@@ -168,6 +232,7 @@ def register(app, bot):
             cached = bot.cached_hashes(hashes) if hashes else set()
         except Exception:
             cached = set()
+        cached |= {x["hash"] for x in tbs if x["cached"]}
         best = {}
         for x in res:
             h = (x.get("hash") or "").lower()
@@ -177,7 +242,7 @@ def register(app, bot):
                 "title": title, "size": x.get("size") or 0,
                 "seeders": x.get("seeders") or 0, "hash": h,
                 "ref": x.get("ref") or "",
-                "instant": bool((h and h in cached) or x.get("ref")),
+                "instant": bool(h and h in cached),
                 "dub": bool(x.get("dub")), "eg": bool(x.get("eg")),
                 "risky": bool(RISKY_RX.search(title.replace("_", " "))),
                 "q": m.group(0).upper() if m else "",
@@ -199,7 +264,7 @@ def register(app, bot):
         if not h:
             if not b.get("ref"):
                 return jsonify(error="النسخة ناقصة"), 400
-            d, code = _jr(bot.st_resolve())
+            d, code = _jr(resolve_checked())
             if not d.get("url"):
                 return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), code if code >= 400 else 502
             return jsonify(direct=d["url"], hls="", name=b.get("name") or "",
@@ -648,3 +713,19 @@ def register(app, bot):
             return jsonify(error="فشل تحميل القائمة"), 502
         return jsonify(title=e.get("t"), items=items, skip=",".join(str(n) for n in new),
                        more=any(n > sk for n, sk in zip(new, skips)))
+
+    def search2():
+        q = request.args.get("q", "").strip()
+        if not q:
+            return jsonify(results=[])
+        if bot.PROWLARR_URL and bot.PROWLARR_KEY:
+            return orig_search()
+        items = tb_items("/torrents/search/" + quote(q, safe=""), {"check_cache": "true"})
+        if not items:
+            return jsonify(error="مفيش نتايج من بحث TorBox. جرّب اسم تاني (بالإنجليزي من غير سنة)."), 200
+        items.sort(key=lambda i: (not i["cached"], -(i["seeders"] or 0)))
+        return jsonify(results=items[:60])
+
+    if "search" in app.view_functions:
+        orig_search = app.view_functions["search"]
+        app.view_functions["search"] = search2
