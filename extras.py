@@ -420,7 +420,7 @@ def register(app, bot):
             return jsonify(error="بيانات ناقصة"), 400
         ok_src = lambda r: isinstance(r, dict) and r.get("a") in ids and r.get("ty") in ("movie", "series")
         out, used = [], set()
-        for r in rows_in[:40]:
+        for r in rows_in[:300]:
             if not ok_src(r):
                 continue
             k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
@@ -494,7 +494,7 @@ def register(app, bot):
             return jsonify(error="بيانات ناقصة"), 400
         ok = lambda r: isinstance(r, dict) and r.get("a") in ids and r.get("ty") in ("movie", "series")
         out, used = [], set()
-        for r in rows_in[:40]:
+        for r in rows_in[:300]:
             if not ok(r):
                 continue
             k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]

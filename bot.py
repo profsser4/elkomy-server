@@ -2039,7 +2039,7 @@ def home_layout_set():
     if not isinstance(rows_in, list):
         return jsonify(error="بيانات ناقصة"), 400
     out, used = [], set()
-    for r in rows_in[:40]:
+    for r in rows_in[:300]:
         if not isinstance(r, dict) or r.get("a") not in ids or r.get("ty") not in ("movie", "series"):
             continue
         k = re.sub(r"[^a-z0-9]", "", str(r.get("k", "")).lower())[:16] or uuid.uuid4().hex[:8]
