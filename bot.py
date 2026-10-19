@@ -2552,7 +2552,18 @@ def fmt_secs(t):
     )
 
 
-def to_vtt(text, shift=0.0):
+RLE, PDF = "\u202b", "\u202c"
+
+
+def rtl_wrap(line):
+    """بيلفّ سطر الترجمة العربي عشان علامات الترقيم متتقلبش"""
+    t = line.strip()
+    if not t or re.fullmatch(r"\d+", t):
+        return line
+    return RLE + t + PDF
+
+
+def to_vtt(text, shift=0.0, scale=1.0, rtl=False):
     text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\{\\[^}]*\}", "", text).strip()
     if text.startswith("WEBVTT"):
@@ -2560,7 +2571,9 @@ def to_vtt(text, shift=0.0):
     lines = []
     for line in text.split("\n"):
         if "-->" in line:
-            line = TS_RE.sub(lambda m: fmt_secs(ts_secs(m) + shift), line)
+            line = TS_RE.sub(lambda m: fmt_secs(ts_secs(m) * scale + shift), line)
+        elif rtl:
+            line = rtl_wrap(line)
         lines.append(line)
     return "WEBVTT\n\n" + "\n".join(lines).strip() + "\n"
 
@@ -2570,7 +2583,7 @@ def ass_secs(t):
     return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def ass_to_vtt(text, shift=0.0):
+def ass_to_vtt(text, shift=0.0, scale=1.0, rtl=False):
     cols, in_ev, cues = [], False, []
     body = text.replace("\r\n", "\n").replace("\r", "\n")
     for raw in body.split("\n"):
@@ -2601,8 +2614,8 @@ def ass_to_vtt(text, shift=0.0):
     cues.sort(key=lambda c: c[0])
     out = ["WEBVTT", ""]
     for st, en, txt in cues:
-        out.append(fmt_secs(st + shift) + " --> " + fmt_secs(en + shift))
-        out.append(txt)
+        out.append(fmt_secs(st * scale + shift) + " --> " + fmt_secs(en * scale + shift))
+        out.append("\n".join(rtl_wrap(x) for x in txt.split("\n")) if rtl else txt)
         out.append("")
     return "\n".join(out)
 
@@ -2680,7 +2693,7 @@ def pick_sub(z, season, episode):
     return names[0]
 
 
-def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0):
+def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0):
     data = get_zip(u)
     if data[:2] == b"PK":
         z = zipfile.ZipFile(io.BytesIO(data))
@@ -2693,10 +2706,11 @@ def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0):
         raw = data
         ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
     text = decode_sub(raw, ar)
+    rtl = bool(ar) and fmt != "srt"
     if ext in (".ass", ".ssa"):
-        vtt = ass_to_vtt(text, shift)
+        vtt = ass_to_vtt(text, shift, scale, rtl)
     else:
-        vtt = to_vtt(text, shift)
+        vtt = to_vtt(text, shift, scale, rtl)
     if fmt == "srt":
         return vtt_to_srt(vtt), "application/x-subrip"
     return vtt, "text/vtt"
@@ -2789,12 +2803,17 @@ def sub_get():
     except ValueError:
         shift = 0.0
     shift = max(-600.0, min(600.0, shift))
+    try:
+        scale = float(request.args.get("scale", 1))
+    except ValueError:
+        scale = 1.0
+    scale = max(0.8, min(1.25, scale))
     se, ep = request.args.get("s", ""), request.args.get("e", "")
     season = int(se) if se.isdigit() else None
     episode = int(ep) if ep.isdigit() else None
     ar = "ar" in request.args.get("lang", "").lower()
     try:
-        text, mt = build_sub(u, season, episode, ar, fmt, shift)
+        text, mt = build_sub(u, season, episode, ar, fmt, shift, scale)
         return Response(text, mimetype=mt)
     except LookupError as ex:
         return jsonify(error=str(ex)), 404
