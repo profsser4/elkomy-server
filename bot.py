@@ -1738,6 +1738,27 @@ def ref_for(url):
     return rid
 
 
+_NOISE_RX = re.compile(
+    r"(\(.*?\)|\[.*?\]|\b(19|20)\d{2}\b|مدبلج\w*|دبلج\w*|مترجم\w*|مصري\w*|كلاسيك\w*|كامل\w*|"
+    r"\b(4k|uhd|hd|fhd|1080p|720p|dubbed|dub|arabic)\b)", re.I)
+
+
+def _lookup_variants(q):
+    """نفس الاسم بصيغ مختلفة: الأصلي، من غير الزوايد (سنة/دبلجة/جودة)، وبهمزات موحّدة"""
+    out = []
+    def add(x):
+        x = re.sub(r"\s+", " ", x or "").strip(" -–:|")
+        if x and x not in out:
+            out.append(x)
+    add(q)
+    add(_NOISE_RX.sub(" ", q))
+    add(re.split(r"\s[-–|:]\s", q)[0])
+    for v in list(out):
+        add(v.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا"))
+        add(re.sub(r"^ال", "", v))
+    return out[:6]
+
+
 @app.get("/stremio/lookup")
 def st_lookup():
     q = request.args.get("q", "").strip()[:100]
@@ -1745,19 +1766,33 @@ def st_lookup():
     year = request.args.get("year", "")
     if not q:
         return jsonify(error="الاسم ناقص"), 400
+
+    def yr(x):
+        return (x.get("release_date") or x.get("first_air_date") or "")[:4]
+
+    def pick(res, t):
+        if year.isdigit():
+            for x in res:
+                if yr(x) == year:
+                    return jsonify(type=t, id=x["id"])
+            for x in res:                      # سنة قريبة (±1) لأن الإضافات بتختلف أحياناً
+                if yr(x).isdigit() and abs(int(yr(x)) - int(year)) <= 1:
+                    return jsonify(type=t, id=x["id"])
+        return jsonify(type=t, id=res[0]["id"])
+
+    other = "movie" if typ == "tv" else "tv"
     try:
-        for lang in ("ar", "en-US"):
-            res = tmdb_get(f"/search/{typ}", query=q, language=lang,
-                           include_adult="false").get("results", [])
-            if not res:
-                continue
-            if year.isdigit():
-                for x in res:
-                    y = (x.get("release_date") or x.get("first_air_date") or "")[:4]
-                    if y == year:
-                        return jsonify(type=typ, id=x["id"])
-            return jsonify(type=typ, id=res[0]["id"])
-        return jsonify(error="مش لاقي العمل ده على TMDB")
+        for v in _lookup_variants(q):
+            for t in (typ, other):
+                for lang in ("ar", "en-US"):
+                    res = tmdb_get(f"/search/{t}", query=v, language=lang,
+                                   include_adult="false").get("results", [])
+                    if res:
+                        # النوع التاني بنقبله بس لو السنة بتطابق
+                        if t == other and not (year.isdigit() and any(yr(x) == year for x in res)):
+                            continue
+                        return pick(res, t)
+        return jsonify(error="مش لاقي العمل ده على TMDB", q=q)
     except Exception as ex:
         return jsonify(error=str(ex)), 500
 
