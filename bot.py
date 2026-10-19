@@ -889,9 +889,16 @@ def rd_info(k, rid):
     return out
 
 
+_RD_IDS = {}   # رابط التحميل -> id الفك (محتاجينه لرابط البث المحوَّل)
+
+
 def rd_link(k, f):
     code, d = rd(k, "POST", "/unrestrict/link", data={"link": f["link"]})
     if d.get("download"):
+        if d.get("id"):
+            if len(_RD_IDS) > 200:
+                _RD_IDS.clear()
+            _RD_IDS[d["download"]] = d["id"]
         return d["download"]
     raise Exception(rd_err(code, d, "فشل فك الرابط"))
 

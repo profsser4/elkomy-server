@@ -108,7 +108,31 @@ def register(app, bot):
         return url, ("" if url else "TorBox رجّع رد من غير رابط HLS"), r
 
     # مزوّد -> دالة بتجيب رابط HLS محوَّل. بنضيف مزوّد لما نراجع توثيقه ونجرّبه.
-    STREAMERS = {"torbox": lambda d: torbox_stream(d["torrent_id"], d.get("file_id"))}
+    def rd_stream(d):
+        """Real-Debrid: رابط التحميل غير رابط البث. البث المحوَّل (m3u8) من /streaming/transcode/{id}"""
+        parts = str(d.get("torrent_id") or "").split(":", 3)     # x:realdebrid:<pid>:<rid>
+        p = next((x for x in bot.load() if len(parts) > 2 and x["id"] == parts[2]), None)
+        if not p:
+            return "", "Real-Debrid: المزوّد مش لاقيه", {}
+        rid = getattr(bot, "_RD_IDS", {}).get(d.get("direct_link"))
+        if not rid:
+            return "", "Real-Debrid: مفيش id للفك، بيتشغّل الملف الأصلي", {}
+        try:
+            code, r = bot.rd(p["key"], "GET", "/streaming/transcode/" + str(rid))
+        except Exception as ex:
+            return "", "Real-Debrid transcode: " + str(ex)[:150], {}
+        if code != 200 or not isinstance(r, dict):
+            return "", "Real-Debrid transcode فشل (%s)" % code, r if isinstance(r, dict) else {}
+        a = r.get("apple")
+        url = ""
+        if isinstance(a, str):
+            url = a
+        elif isinstance(a, dict):
+            url = a.get("full") or next((v for v in a.values() if isinstance(v, str) and v.startswith("http")), "")
+        return url, ("" if url else "Real-Debrid رجّع رد من غير رابط HLS"), r
+
+    STREAMERS = {"torbox": lambda d: torbox_stream(d["torrent_id"], d.get("file_id")),
+                 "realdebrid": rd_stream}
 
     def stream_for(d):
         """بيرجّع (رابط_hls, ملاحظة, الرد_الخام) حسب المزوّد اللي جهّز الملف."""
