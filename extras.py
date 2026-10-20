@@ -9,12 +9,8 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
 """
 import json
 import os
-import json
-import os
 import re
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -153,7 +149,8 @@ def register(app, bot):
         if not tid and not b.get("slow") and not is_instant(h, magnet):
             return None, (jsonify(
                 error="النسخة دي مش فورية على المزوّد. اختار نسخة عليها ⚡ أو اضغط (سحب بطيء)."), 409)
-        d, code = _jr(bot.torrent_dispatch(magnet, tid))
+        pf, stc = bot.prov_pref(g.user, "download" if b.get("mode") == "download" else "watch")
+        d, code = _jr(bot.torrent_dispatch(magnet, tid, prefer=pf, strict=stc))
         if code == 202:
             return None, (jsonify(d), 202)
         if code != 200 or not d.get("direct_link"):
@@ -283,6 +280,32 @@ def register(app, bot):
                      key=lambda v: (not v["instant"], -v["seeders"]))[:60]
         return jsonify(versions=out)
 
+    def hls_fallback(h, b):
+        """مزوّد المشاهدة مفيهوش بث محوَّل (صوت AC3/DTS مثلاً): لو الملف فوري على TorBox نجيب منه الـ HLS."""
+        try:
+            tp = bot.tb_provider()
+            if not tp or not h or h not in bot.cached_for(tp, [h]):
+                return ""
+            name = str(b.get("name") or "")[:200]
+            magnet = "magnet:?xt=urn:btih:" + h + ("&dn=" + quote(name) if name else "")
+            d, code = _jr(bot.torrent_dispatch(magnet, None, prefer="torbox", strict=True))
+            if code != 200 or not d.get("direct_link"):
+                return ""
+            s, e = _int(b.get("s")), _int(b.get("e"))
+            files = d.get("files") or []
+            if s is not None and e is not None and files:
+                pick = next((f for f in files if f.get("season") == s and f.get("episode") == e), None) \
+                    or next((f for f in files if f.get("season") is None and f.get("episode") == e), None)
+                if not pick:
+                    return ""
+                if str(pick["id"]) != str(d.get("file_id")):
+                    d, code = _jr(bot.torrent_dispatch(magnet, d.get("torrent_id"), file_id=pick["id"]))
+                    if code != 200 or not d.get("direct_link"):
+                        return ""
+            return stream_for(d)[0]
+        except Exception:
+            return ""
+
     # ---------- تجهيز النسخة ----------
     @app.post("/play/start")
     def play_start():
@@ -306,6 +329,10 @@ def register(app, bot):
                 "stream_note": ""}
         if mode == "watch":
             resp["hls"], resp["stream_note"], _ = stream_for(d)
+            if not resp["hls"]:
+                alt = hls_fallback(h, b)
+                if alt:
+                    resp["hls"], resp["stream_note"] = alt, ""
         return jsonify(resp)
 
     # ---------- فحص (أدمن) ----------

@@ -39,6 +39,7 @@ UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 HOME_FILE = os.path.join(DATA_DIR, "home.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 ACT_FILE = os.path.join(DATA_DIR, "activity.json")
 UD_LOCK = threading.Lock()
 ST_LOCK = threading.Lock()
@@ -220,7 +221,7 @@ def read_token(tok):
 
 
 def needs_admin(path, method):
-    if path.startswith(("/providers", "/users", "/home/", "/activity", "/push/check")):
+    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check")):
         return True
     if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
                 "/stremio/library"):
@@ -286,6 +287,81 @@ def auth():
     return jsonify(ok=False), 401
 
 
+# ----------------- اختيار مزوّد المشاهدة والتحميل -----------------
+# الإعداد العام (للأدمن وللمستخدمين اللي معندهمش اختيار خاص):
+#   watch: "auto" (الأولوية العادية) أو id/نوع المزوّد (torbox, realdebrid, debridlink, alldebrid أو id مزوّد)
+#   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
+#   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
+# وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
+SET_DEF = {"watch": "auto", "dl": "same", "strict": False}
+
+
+def settings_load():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        d = d if isinstance(d, dict) else {}
+    except Exception:
+        d = {}
+    out = dict(SET_DEF)
+    for k in ("watch", "dl"):
+        if isinstance(d.get(k), str) and d[k].strip():
+            out[k] = d[k].strip()[:40]
+    out["strict"] = bool(d.get("strict"))
+    return out
+
+
+def settings_save(d):
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, SETTINGS_FILE)
+
+
+def prov_pref(user, mode):
+    """بيرجّع (المزوّد المفضّل أو None, strict) للمستخدم حسب نوع العملية: watch أو download."""
+    st = settings_load()
+    rec = users_load().get(user) or {}
+    w = str(rec.get("wp") or st["watch"] or "auto")
+    if mode == "download":
+        d = str(rec.get("dp") or st["dl"] or "same")
+        sel = w if d == "same" else d
+    else:
+        sel = w
+    return (None if sel in ("auto", "", "same") else sel), bool(st["strict"])
+
+
+def prov_ok(v):
+    """قيمة صالحة لاختيار مزوّد: فاضي/auto/same أو نوع معروف أو id مزوّد موجود."""
+    v = str(v or "").strip()
+    if v in ("", "auto", "same") or v in TORRENT_TYPES:
+        return True
+    return any(p["id"] == v for p in load())
+
+
+@app.get("/settings")
+def settings_get():
+    ps = [{"id": p["id"], "name": p["name"], "type": p["type"]}
+          for p in load() if p["type"] in TORRENT_TYPES]
+    return jsonify(settings=settings_load(), providers=ps)
+
+
+@app.post("/settings")
+def settings_set():
+    d = request.get_json(silent=True) or {}
+    cur = settings_load()
+    for k, dflt in (("watch", "auto"), ("dl", "same")):
+        if k in d:
+            v = str(d.get(k) or dflt).strip()
+            if not prov_ok(v):
+                return jsonify(error="المزوّد ده مش موجود"), 400
+            cur[k] = v or dflt
+    if "strict" in d:
+        cur["strict"] = bool(d["strict"])
+    settings_save(cur)
+    return jsonify(ok=True, settings=cur)
+
+
 def lock_of(user):
     """مستوى الصلاحية: 0 عادي، 1 ممنوع التحميل، 2 تصفح فقط (ممنوع المشاهدة والتحميل) + رسالة الأدمن"""
     rec = users_load().get(user) or {}
@@ -307,6 +383,8 @@ def me():
         lk, msg = lock_of(g.user)
         out["lock"] = lk
         out["lock_msg"] = msg
+        out["watch_prov"] = prov_pref(g.user, "watch")[0] or "auto"
+        out["dl_prov"] = prov_pref(g.user, "download")[0] or "auto"
     return jsonify(out)
 
 
@@ -314,7 +392,8 @@ def me():
 def users_list():
     us = users_load()
     return jsonify(items=[{"name": n, "c": v.get("c", 0), "lock": lock_of(n)[0],
-                           "msg": v.get("nodl_msg", "")}
+                           "msg": v.get("nodl_msg", ""),
+                           "wp": v.get("wp", ""), "dp": v.get("dp", "")}
                           for n, v in sorted(us.items())])
 
 
@@ -366,6 +445,15 @@ def users_perms(name):
         us[name]["lock"] = lk
         us[name].pop("nodl", None)
         us[name]["nodl_msg"] = str(d.get("msg") or "").strip()[:300]
+        for k in ("wp", "dp"):
+            if k in d:
+                v = str(d.get(k) or "").strip()
+                if not prov_ok(v):
+                    return jsonify(error="المزوّد ده مش موجود"), 400
+                if v in ("", "auto", "same"):
+                    us[name].pop(k, None)
+                else:
+                    us[name][k] = v
         users_save(us)
     return jsonify(ok=True)
 
@@ -1144,8 +1232,7 @@ def cached_hashes(hs):
     return out
 
 
-def ordered_tprovs(h):
-    ps = torrent_providers()
+def _cached_first(ps, h):
     first = []
     for p in ps:
         if h and p["type"] in CHECKABLE:
@@ -1155,6 +1242,19 @@ def ordered_tprovs(h):
             except Exception:
                 pass
     return first + [p for p in ps if p not in first]
+
+
+def ordered_tprovs(h, prefer=None, strict=False):
+    """ترتيب المزوّدين: المفضّل أولاً (لو محدد)، وجوّه كل مجموعة اللي عنده الملف فوري يتقدّم."""
+    ps = torrent_providers()
+    if prefer:
+        m = [p for p in ps if prefer in (p["id"], p["type"])]
+        rest = [p for p in ps if p not in m]
+        if m:
+            return _cached_first(m, h) + ([] if strict else _cached_first(rest, h))
+        if strict:
+            return []
+    return _cached_first(ps, h)
 
 
 def generic_flow(p, q, rid, file_id=None, want_zip=False, want_all=False):
@@ -1237,7 +1337,7 @@ def generic_flow(p, q, rid, file_id=None, want_zip=False, want_all=False):
         return jsonify(error=f"{p['name']}: {e}"), 400
 
 
-def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False):
+def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False, prefer=None, strict=False):
     t = str(tid) if tid else ""
     if t.startswith("x:"):
         _, _, pid, rid = t.split(":", 3)
@@ -1247,7 +1347,9 @@ def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False):
         return generic_flow(p, q, rid, file_id, want_zip, want_all)
     if t:
         return torrent_flow(q, tid, file_id, want_zip, want_all)
-    ps = ordered_tprovs(magnet_hash(q))
+    ps = ordered_tprovs(magnet_hash(q), prefer, strict)
+    if not ps and prefer and strict:
+        return jsonify(error="المزوّد المختار مش متاح أو مش مضاف"), 400
     if not ps:
         return jsonify(
             error="ضيف مزوّد (TorBox أو Real-Debrid أو Debrid-Link) من الإعدادات الأول"), 400
@@ -1368,11 +1470,13 @@ def _generate():
 
         # تورنت
         if tid or q.startswith("magnet:"):
+            pf, stc = prov_pref(g.user, "download" if (data.get("zip") or data.get("all")) else "watch")
             return torrent_dispatch(
                 q, tid,
                 file_id=data.get("file_id"),
                 want_zip=bool(data.get("zip")),
                 want_all=bool(data.get("all")),
+                prefer=pf, strict=stc,
             )
 
         # رابط عادي
