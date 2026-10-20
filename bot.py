@@ -242,6 +242,15 @@ def guard():
     LAST[g.user] = time.time()
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
+    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/generate", "/stremio/resolve"):
+        lk, msg = lock_of(g.user)
+        if lk >= 2:                                   # تصفح فقط: مفيش مشاهدة ولا تحميل
+            return jsonify(error=msg, nodl=True, lock=2), 403
+        if lk == 1:                                   # ممنوع التحميل بس
+            b = request.get_json(silent=True) or {}
+            if (request.path == "/play/start" and b.get("mode") == "download") or \
+                    (request.path == "/generate" and (b.get("zip") or b.get("all"))):
+                return jsonify(error=msg, nodl=True, lock=1), 403
     return None
 
 
@@ -277,15 +286,35 @@ def auth():
     return jsonify(ok=False), 401
 
 
+def lock_of(user):
+    """مستوى الصلاحية: 0 عادي، 1 ممنوع التحميل، 2 تصفح فقط (ممنوع المشاهدة والتحميل) + رسالة الأدمن"""
+    rec = users_load().get(user) or {}
+    lk = rec.get("lock")
+    if lk is None:
+        lk = 1 if rec.get("nodl") else 0
+    try:
+        lk = int(lk)
+    except (TypeError, ValueError):
+        lk = 0
+    msg = rec.get("nodl_msg") or ("المشاهدة والتحميل مش متاحين لحسابك." if lk >= 2 else "التحميل مش متاح لحسابك.")
+    return lk, msg
+
+
 @app.get("/me")
 def me():
-    return jsonify(user=g.user, role=g.role)
+    out = {"user": g.user, "role": g.role}
+    if g.role != "admin":
+        lk, msg = lock_of(g.user)
+        out["lock"] = lk
+        out["lock_msg"] = msg
+    return jsonify(out)
 
 
 @app.get("/users")
 def users_list():
     us = users_load()
-    return jsonify(items=[{"name": n, "c": v.get("c", 0)}
+    return jsonify(items=[{"name": n, "c": v.get("c", 0), "lock": lock_of(n)[0],
+                           "msg": v.get("nodl_msg", "")}
                           for n, v in sorted(us.items())])
 
 
@@ -319,6 +348,24 @@ def users_pass(name):
         if name not in us:
             return jsonify(error="المستخدم مش موجود"), 404
         us[name]["h"] = generate_password_hash(p)
+        users_save(us)
+    return jsonify(ok=True)
+
+
+@app.post("/users/<name>/perms")
+def users_perms(name):
+    d = request.get_json(silent=True) or {}
+    with USERS_LOCK:
+        us = users_load()
+        if name not in us:
+            return jsonify(error="المستخدم مش موجود"), 404
+        try:
+            lk = max(0, min(2, int(d.get("lock") or 0)))
+        except (TypeError, ValueError):
+            lk = 0
+        us[name]["lock"] = lk
+        us[name].pop("nodl", None)
+        us[name]["nodl_msg"] = str(d.get("msg") or "").strip()[:300]
         users_save(us)
     return jsonify(ok=True)
 
