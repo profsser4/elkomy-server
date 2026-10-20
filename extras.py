@@ -131,6 +131,44 @@ def register(app, bot):
     STREAMERS = {"torbox": lambda d: torbox_stream(d["torrent_id"], d.get("file_id")),
                  "realdebrid": rd_stream}
 
+    # عند المشاهدة: المزوّد اللي بيحوّل الصوت (TorBox / Real-Debrid) ييجي الأول.
+    # Debrid-Link و AllDebrid مفيهمش بث محوَّل، فلو اتسحب منهم الملف هيتشغل أصلي (والمتصفح مابيفكش AC3/DTS).
+    STREAM_KINDS = tuple(STREAMERS.keys())
+    _orig_ordered = bot.ordered_tprovs
+
+    def _ordered_for_watch(h):
+        ps = _orig_ordered(h)
+        if not getattr(g, "want_stream", False):
+            return ps
+        cap = [p for p in ps if p["type"] in STREAM_KINDS]
+        if not cap:
+            return ps
+        # لو أول مزوّد أصلاً بيحوّل سيبه، وإلا قدّم المزوّد اللي بيحوّل (بس لو النسخة فورية عنده أو مفيش حد فوري)
+        if ps and ps[0]["type"] in STREAM_KINDS:
+            return ps
+        cached_cap = []
+        for p in cap:
+            try:
+                if h and p["type"] in bot.CHECKABLE and h in bot.cached_for(p, [h]):
+                    cached_cap.append(p)
+            except Exception:
+                pass
+        other_cached = ps[0] if ps else None
+        try:
+            other_is_cached = bool(other_cached and h and other_cached["type"] in bot.CHECKABLE
+                                   and h in bot.cached_for(other_cached, [h]))
+        except Exception:
+            other_is_cached = False
+        if cached_cap or not other_is_cached:
+            first = cached_cap or cap
+            return first + [p for p in ps if p not in first]
+        return ps
+
+    bot.ordered_tprovs = _ordered_for_watch
+
+    def has_streamer():
+        return any(p["type"] in STREAM_KINDS for p in bot.load())
+
     def stream_for(d):
         """بيرجّع (رابط_hls, ملاحظة, الرد_الخام) حسب المزوّد اللي جهّز الملف."""
         tid = str(d.get("torrent_id") or "")
@@ -278,7 +316,7 @@ def register(app, bot):
                 best[key] = v
         out = sorted(best.values(),
                      key=lambda v: (not v["instant"], -v["seeders"]))[:60]
-        return jsonify(versions=out)
+        return jsonify(versions=out, stream=has_streamer())
 
     # ---------- تجهيز النسخة ----------
     @app.post("/play/start")
@@ -294,6 +332,7 @@ def register(app, bot):
                 return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), code if code >= 400 else 502
             return jsonify(direct=d["url"], hls="", name=b.get("name") or "",
                            size=b.get("size") or 0, provider="Stremio", file_id=None)
+        g.want_stream = (mode == "watch")
         d, err = prepare(b)
         if err:
             return err
@@ -303,6 +342,17 @@ def register(app, bot):
                 "stream_note": ""}
         if mode == "watch":
             resp["hls"], resp["stream_note"], _ = stream_for(d)
+            if not resp["hls"] and "createstream" not in resp["stream_note"] and "TorBox" in (d.get("provider") or ""):
+                # TorBox أحياناً بيحتاج ثواني لحد ما البث يتجهّز: جرّب تاني قبل ما نرجّع الملف الأصلي
+                for _ in range(2):
+                    time.sleep(1.5)
+                    resp["hls"], resp["stream_note"], _r = stream_for(d)
+                    if resp["hls"]:
+                        break
+            # من غير بث محوَّل = الملف الأصلي، والصوت ممكن مايشتغلش في المتصفح
+            resp["no_transcode"] = not resp["hls"]
+            resp["audio_risk"] = (not resp["hls"]) and bool(RISKY_RX.search(
+                (str(b.get("name") or "") + " " + str(d.get("name") or "")).replace("_", " ")))
         return jsonify(resp)
 
     # ---------- فحص (أدمن) ----------
