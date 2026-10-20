@@ -9,9 +9,12 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
 """
 import json
 import os
+import json
+import os
 import re
-import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -130,44 +133,6 @@ def register(app, bot):
 
     STREAMERS = {"torbox": lambda d: torbox_stream(d["torrent_id"], d.get("file_id")),
                  "realdebrid": rd_stream}
-
-    # عند المشاهدة: المزوّد اللي بيحوّل الصوت (TorBox / Real-Debrid) ييجي الأول.
-    # Debrid-Link و AllDebrid مفيهمش بث محوَّل، فلو اتسحب منهم الملف هيتشغل أصلي (والمتصفح مابيفكش AC3/DTS).
-    STREAM_KINDS = tuple(STREAMERS.keys())
-    _orig_ordered = bot.ordered_tprovs
-
-    def _ordered_for_watch(h):
-        ps = _orig_ordered(h)
-        if not getattr(g, "want_stream", False):
-            return ps
-        cap = [p for p in ps if p["type"] in STREAM_KINDS]
-        if not cap:
-            return ps
-        # لو أول مزوّد أصلاً بيحوّل سيبه، وإلا قدّم المزوّد اللي بيحوّل (بس لو النسخة فورية عنده أو مفيش حد فوري)
-        if ps and ps[0]["type"] in STREAM_KINDS:
-            return ps
-        cached_cap = []
-        for p in cap:
-            try:
-                if h and p["type"] in bot.CHECKABLE and h in bot.cached_for(p, [h]):
-                    cached_cap.append(p)
-            except Exception:
-                pass
-        other_cached = ps[0] if ps else None
-        try:
-            other_is_cached = bool(other_cached and h and other_cached["type"] in bot.CHECKABLE
-                                   and h in bot.cached_for(other_cached, [h]))
-        except Exception:
-            other_is_cached = False
-        if cached_cap or not other_is_cached:
-            first = cached_cap or cap
-            return first + [p for p in ps if p not in first]
-        return ps
-
-    bot.ordered_tprovs = _ordered_for_watch
-
-    def has_streamer():
-        return any(p["type"] in STREAM_KINDS for p in bot.load())
 
     def stream_for(d):
         """بيرجّع (رابط_hls, ملاحظة, الرد_الخام) حسب المزوّد اللي جهّز الملف."""
@@ -316,7 +281,7 @@ def register(app, bot):
                 best[key] = v
         out = sorted(best.values(),
                      key=lambda v: (not v["instant"], -v["seeders"]))[:60]
-        return jsonify(versions=out, stream=has_streamer())
+        return jsonify(versions=out)
 
     # ---------- تجهيز النسخة ----------
     @app.post("/play/start")
@@ -332,7 +297,6 @@ def register(app, bot):
                 return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), code if code >= 400 else 502
             return jsonify(direct=d["url"], hls="", name=b.get("name") or "",
                            size=b.get("size") or 0, provider="Stremio", file_id=None)
-        g.want_stream = (mode == "watch")
         d, err = prepare(b)
         if err:
             return err
@@ -342,17 +306,6 @@ def register(app, bot):
                 "stream_note": ""}
         if mode == "watch":
             resp["hls"], resp["stream_note"], _ = stream_for(d)
-            if not resp["hls"] and "createstream" not in resp["stream_note"] and "TorBox" in (d.get("provider") or ""):
-                # TorBox أحياناً بيحتاج ثواني لحد ما البث يتجهّز: جرّب تاني قبل ما نرجّع الملف الأصلي
-                for _ in range(2):
-                    time.sleep(1.5)
-                    resp["hls"], resp["stream_note"], _r = stream_for(d)
-                    if resp["hls"]:
-                        break
-            # من غير بث محوَّل = الملف الأصلي، والصوت ممكن مايشتغلش في المتصفح
-            resp["no_transcode"] = not resp["hls"]
-            resp["audio_risk"] = (not resp["hls"]) and bool(RISKY_RX.search(
-                (str(b.get("name") or "") + " " + str(d.get("name") or "")).replace("_", " ")))
         return jsonify(resp)
 
     # ---------- فحص (أدمن) ----------
@@ -614,7 +567,6 @@ def register(app, bot):
         "sci": ("خيال علمي", [L("movie", with_genres="878"), L("tv", with_genres="10765")]),
         "doc": ("وثائقي", [L("movie", with_genres="99"), L("tv", with_genres="99")]),
         "dub": ("🇪🇬 مدبلج مصري", None),
-        "oldar": ("🎞 كلاسيكيات عربي", [L("movie", with_original_language="ar", **{"primary_release_date.lte": "1995-12-31"})]),
     }
     ICACHE = {}
 
@@ -805,88 +757,3 @@ def register(app, bot):
     if "search" in app.view_functions:
         orig_search = app.view_functions["search"]
         app.view_functions["search"] = search2
-
-
-    # ---------- تثبيت النسخة لكل حلقة (مشترك بين كل المستخدمين) ----------
-    PINS_FILE = os.path.join(bot.DATA_DIR, "pins.json")
-    PIN_LOCK = threading.Lock()
-    HEX40 = re.compile(r"^[a-f0-9]{40}$")
-
-    def pins_load():
-        try:
-            with open(PINS_FILE, encoding="utf-8") as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            return {}
-
-    def pins_save(d):
-        tmp = PINS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
-        os.replace(tmp, PINS_FILE)
-
-    def pin_out(p, with_ref):
-        o = {k: p.get(k) for k in ("hash", "name", "size", "by", "t")}
-        if p.get("url"):
-            o["has_ref"] = True
-            if with_ref:
-                o["ref"] = bot.ref_for(p["url"])
-        return o
-
-    @app.get("/pins")
-    def pins_get():
-        tmdb = str(_int(request.args.get("tmdb")) or "")
-        if not tmdb:
-            return jsonify(error="بيانات ناقصة"), 400
-        eps = pins_load().get(tmdb, {})
-        s_, e_ = _int(request.args.get("s")), _int(request.args.get("e"))
-        if s_ is not None and e_ is not None:
-            p = eps.get("%d:%d" % (s_, e_))
-            return jsonify(pin=pin_out(p, True) if p else None)
-        return jsonify(eps={k: pin_out(p, False) for k, p in eps.items()})
-
-    @app.post("/pins")
-    def pins_set():
-        b = request.get_json(silent=True) or {}
-        tmdb, s_, e_ = _int(b.get("tmdb")), _int(b.get("s")), _int(b.get("e"))
-        if not tmdb or s_ is None or e_ is None or s_ < 0 or e_ < 0:
-            return jsonify(error="بيانات ناقصة"), 400
-        h = str(b.get("hash") or "").lower()
-        rec = {"name": str(b.get("name") or "")[:200], "size": _int(b.get("size")) or 0,
-               "by": g.user, "t": int(time.time() * 1000)}
-        if h:
-            if not HEX40.match(h):
-                return jsonify(error="النسخة غير صالحة"), 400
-            rec["hash"] = h
-        else:
-            url = bot.REFS.get(str(b.get("ref") or ""))
-            if not url:
-                return jsonify(error="رابط النسخة انتهى، افتح قائمة النسخ تاني وثبّتها"), 400
-            rec["url"] = url
-        with PIN_LOCK:
-            d = pins_load()
-            d.setdefault(str(tmdb), {})["%d:%d" % (s_, e_)] = rec
-            if len(d) > 3000:
-                d.pop(next(iter(d)))
-            pins_save(d)
-        return jsonify(ok=True, pin=pin_out(rec, False))
-
-    @app.delete("/pins")
-    def pins_del():
-        tmdb, s_, e_ = _int(request.args.get("tmdb")), _int(request.args.get("s")), _int(request.args.get("e"))
-        if not tmdb or s_ is None or e_ is None:
-            return jsonify(error="بيانات ناقصة"), 400
-        with PIN_LOCK:
-            d = pins_load()
-            k = "%d:%d" % (s_, e_)
-            p = d.get(str(tmdb), {}).get(k)
-            if not p:
-                return jsonify(ok=True)
-            if g.role != "admin" and p.get("by") != g.user:
-                return jsonify(error="التثبيت ده بتاع مستخدم تاني. الأدمن أو صاحبه بس يلغيه"), 403
-            d[str(tmdb)].pop(k, None)
-            if not d[str(tmdb)]:
-                d.pop(str(tmdb), None)
-            pins_save(d)
-        return jsonify(ok=True)
