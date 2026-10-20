@@ -269,7 +269,8 @@ def register(app, bot):
                 "title": title, "size": x.get("size") or 0,
                 "seeders": x.get("seeders") or 0, "hash": h,
                 "ref": x.get("ref") or "",
-                "instant": bool(h and h in cached),
+                # نسخ Stremio (ref) رابطها جاهز من الإضافة: تتحسب فورية. التورنت بس هو اللي بيتفحص كاش.
+                "instant": bool((h and h in cached) or x.get("ref")),
                 "dub": bool(x.get("dub")), "eg": bool(x.get("eg")),
                 "risky": bool(RISKY_RX.search(title.replace("_", " "))),
                 "q": m.group(0).upper() if m else "",
