@@ -277,7 +277,7 @@ def register(app, bot):
             if o is None or (v["instant"], v["seeders"]) > (o["instant"], o["seeders"]):
                 best[key] = v
         out = sorted(best.values(),
-                     key=lambda v: (not v["instant"], -v["seeders"]))[:60]
+                     key=lambda v: (not v["instant"], -v["seeders"]))[:120]
         return jsonify(versions=out)
 
     def hls_fallback(h, b):
