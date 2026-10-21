@@ -15,7 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from flask import g, jsonify, request
@@ -151,6 +151,8 @@ def register(app, bot):
             return None, (jsonify(
                 error="النسخة دي مش فورية على المزوّد. اختار نسخة عليها ⚡ أو اضغط (سحب بطيء)."), 409)
         pf, stc = bot.prov_pref(g.user, "download" if b.get("mode") == "download" else "watch")
+        if b.get("prefer"):                       # مزوّد محدّد (مثلاً نفس مزوّد رابط Stremio)
+            pf, stc = str(b["prefer"]), True
         d, code = _jr(bot.torrent_dispatch(magnet, tid, prefer=pf, strict=stc))
         if code == 202:
             return None, (jsonify(d), 202)
@@ -336,7 +338,15 @@ def register(app, bot):
                 try:
                     hh = hash_from_ref(b.get("ref"), d["url"])
                     if hh:
-                        dd, err2 = prepare(dict(b, hash=hh, slow=False, torrent_id=None))
+                        # الرابط جاي من مزوّد معيّن (RD / AD / TorBox / DebridLink)؟ النسخة أكيد متخزنة عنده،
+                        # فنستخدم نفس المزوّد (لو مضاف عندنا) من غير ما نحتاج TorBox ومن غير سحب بطيء.
+                        host = (urlparse(d["url"]).netloc or "").lower()
+                        kind = ("realdebrid" if "real-debrid" in host else "alldebrid" if "alldebrid" in host
+                                else "torbox" if "torbox" in host else "debridlink" if "debrid-link" in host else "")
+                        b2 = dict(b, hash=hh, torrent_id=None, slow=bool(kind))
+                        if kind:
+                            b2["prefer"] = kind
+                        dd, err2 = prepare(b2)
                         if not err2 and dd:
                             url, note, _ = stream_for(dd)
                             if url:
@@ -428,6 +438,7 @@ def register(app, bot):
 
     # ---------- بلاغات فحص الفيديو (بتتبعت تلقائي من المشغّل لما فيه مشكلة) ----------
     REP_FILE = os.path.join(bot.DATA_DIR, "play_reports.jsonl")
+    REP_LAST = {}
 
     @app.post("/play/report")
     def play_report():
@@ -438,6 +449,10 @@ def register(app, bot):
                "ua": str(b.get("ua") or "")[:160]}
         if not row["msg"]:
             return jsonify(ok=False)
+        k = (g.user, row["title"], re.sub(r"\d+", "#", row["msg"]))
+        if time.time() - REP_LAST.get(k, 0) < 300:      # نفس البلاغ من نفس المستخدم خلال 5 دقايق: تجاهل
+            return jsonify(ok=True, dup=True)
+        REP_LAST[k] = time.time()
         try:
             with open(REP_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
