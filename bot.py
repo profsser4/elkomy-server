@@ -1880,13 +1880,55 @@ def short_err(ex):
     return type(ex).__name__
 
 
+REFS_FILE = os.path.join(DATA_DIR, "refs.jsonl")
+
+
+def _refs_compact():
+    try:
+        with open(REFS_FILE, encoding="utf-8") as f:
+            lines = f.readlines()[-1500:]
+        tmp = REFS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp, REFS_FILE)
+    except Exception:
+        pass
+
+
 def ref_for(url):
     rid = uuid.uuid4().hex[:16]
     with REF_LOCK:
         REFS[rid] = url
         while len(REFS) > 800:
             REFS.pop(next(iter(REFS)))
+        try:
+            with open(REFS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps([rid, url], ensure_ascii=False) + "\n")
+            if os.path.getsize(REFS_FILE) > 3_000_000:
+                _refs_compact()
+        except Exception:
+            pass        # لو الدسك مش متاح: بنكمّل بالذاكرة بس
     return rid
+
+
+def ref_get(rid):
+    url = REFS.get(rid)
+    if url:
+        return url
+    try:
+        with open(REFS_FILE, encoding="utf-8") as f:
+            for line in reversed(f.readlines()[-2500:]):
+                try:
+                    k, u = json.loads(line)
+                except Exception:
+                    continue
+                if k == rid:
+                    with REF_LOCK:
+                        REFS[rid] = u
+                    return u
+    except Exception:
+        pass
+    return None
 
 
 _NOISE_RX = re.compile(
@@ -2053,7 +2095,7 @@ def st_streams():
 def st_resolve():
     req = request.get_json(silent=True) or {}
     ref = str(req.get("ref", ""))
-    url = REFS.get(ref)
+    url = ref_get(ref)
     if not url:
         return jsonify(error="الرابط انتهى، دوّر على النتايج تاني"), 404
     try:
