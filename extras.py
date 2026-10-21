@@ -452,7 +452,7 @@ def register(app, bot):
     def webdl_hls(url):
         """نضيف رابط Stremio المباشر لحساب TorBox بتاعك (تحميل ويب) ونطلب منه بث HLS محوَّل.
         لو لسه بيتحمّل نرجّع سبب وبنفس الرابط المرة الجاية هيلاقيه جاهز في المجلة."""
-        if os.environ.get("WEBDL_HLS", "0") != "1":
+        if os.environ.get("WEBDL_HLS", "1") != "1":   # مفعّل افتراضياً. WEBDL_HLS=0 يقفله
             return "", ""
         p = bot.tb_provider()
         if not p:
@@ -476,7 +476,7 @@ def register(app, bot):
                 dd = add.get("data") or {}
                 wid = dd.get("webdownload_id") or dd.get("id")
             info = {}
-            for _ in range(4):
+            for _ in range(12):
                 info = bot.as_dict(bot.tb(k, "GET", "/webdl/mylist", params={"id": wid, "bypass_cache": "true"}).get("data"))
                 st = str(info.get("download_state", "")).lower()
                 if st in ("error", "failed", "expired"):
@@ -563,7 +563,7 @@ def register(app, bot):
                 except Exception as ex:
                     resp["stream_note"] = "تعذّر تجهيز البث المحوَّل: " + str(ex)[:120]
                 if not resp["hls"]:
-                    u3, n3 = webdl_hls(d["url"])
+                    u3, n3 = webdl_hls(bot.ref_get(str(b.get("ref") or "")) or d["url"])   # الرابط الأصلي ثابت: مايتكررش التحميل
                     if u3:
                         resp["hls"], resp["stream_note"], resp["provider"] = u3, "", "TorBox (حسابك)"
                     elif n3:
