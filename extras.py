@@ -113,6 +113,21 @@ def register(app, bot):
             return "", "Real-Debrid: المزوّد مش لاقيه", {}
         rid = getattr(bot, "_RD_IDS", {}).get(d.get("direct_link"))
         if not rid:
+            # الذاكرة اتمسحت/السيرفر اتعمله ريستارت: نرجّع نفك رابط الملف من التورنت نفسه
+            try:
+                info = bot.rd_info(p["key"], parts[3])
+                fl = info.get("files") or []
+                fid = d.get("file_id")
+                f = next((x for x in fl if str(x["id"]) == str(fid)), None) if fid is not None else None
+                if not f and fl:
+                    f = max(fl, key=lambda x: x.get("size") or 0)
+                if f and f.get("link"):
+                    c0, r0 = bot.rd(p["key"], "POST", "/unrestrict/link", data={"link": f["link"]})
+                    if c0 == 200 and isinstance(r0, dict):
+                        rid = r0.get("id")
+            except Exception:
+                rid = None
+        if not rid:
             return "", "Real-Debrid: مفيش id للفك، بيتشغّل الملف الأصلي", {}
         try:
             code, r = bot.rd(p["key"], "GET", "/streaming/transcode/" + str(rid))
@@ -319,6 +334,27 @@ def register(app, bot):
                 return m.group(1).lower()
         return ""
 
+    def rd_hls_from_url(u):
+        """رابط Real-Debrid جاي من Stremio من غير hash: id الفك جوه الرابط نفسه (/d/<id>/)."""
+        m = re.search(r"real-debrid\.com/d/([A-Za-z0-9]+)", u or "")
+        if not m:
+            return "", "Real-Debrid: مش لاقي id الفك في الرابط"
+        for p in bot.load():
+            if p.get("type") != "realdebrid":
+                continue
+            try:
+                code, r = bot.rd(p["key"], "GET", "/streaming/transcode/" + m.group(1))
+            except Exception:
+                continue
+            if code == 200 and isinstance(r, dict):
+                a = r.get("apple")
+                url = a if isinstance(a, str) else (
+                    (a.get("full") or next((v for v in a.values() if isinstance(v, str) and v.startswith("http")), ""))
+                    if isinstance(a, dict) else "")
+                if url:
+                    return url, ""
+        return "", "Real-Debrid transcode مش متاح للرابط ده"
+
     @app.post("/play/start")
     def play_start():
         b = request.get_json(silent=True) or {}
@@ -331,18 +367,16 @@ def register(app, bot):
             if not d.get("url"):
                 return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), code if code >= 400 else 502
             resp = {"direct": d["url"], "hls": "", "name": b.get("name") or "",
-                    "size": b.get("size") or 0, "provider": "Stremio", "file_id": None}
+                    "size": b.get("size") or 0, "provider": "Stremio", "file_id": None, "stream_note": ""}
             if mode == "watch":
-                # نسخ Stremio: لو رابطها فيه hash التورنت وهو فوري على TorBox، نجيب بث HLS محوَّل (الصوت والصورة يشتغلوا في المتصفح).
-                # التحميل بيفضل على الرابط الأصلي (direct). لو أي خطوة فشلت نرجع للتشغيل المباشر زي الأول.
+                # نسخ Stremio: نحاول نجيب بث HLS محوَّل (الصوت والصورة يشتغلوا في المتصفح). التحميل بيفضل على الرابط الأصلي.
+                # لو أي خطوة فشلت نرجع للتشغيل المباشر ونرجّع السبب في stream_note (قبل كده كان بيتبلع من غير ما نعرف).
                 try:
+                    host = (urlparse(d["url"]).netloc or "").lower()
+                    kind = ("realdebrid" if "real-debrid" in host else "alldebrid" if "alldebrid" in host
+                            else "torbox" if "torbox" in host else "debridlink" if "debrid-link" in host else "")
                     hh = hash_from_ref(b.get("ref"), d["url"])
                     if hh:
-                        # الرابط جاي من مزوّد معيّن (RD / AD / TorBox / DebridLink)؟ النسخة أكيد متخزنة عنده،
-                        # فنستخدم نفس المزوّد (لو مضاف عندنا) من غير ما نحتاج TorBox ومن غير سحب بطيء.
-                        host = (urlparse(d["url"]).netloc or "").lower()
-                        kind = ("realdebrid" if "real-debrid" in host else "alldebrid" if "alldebrid" in host
-                                else "torbox" if "torbox" in host else "debridlink" if "debrid-link" in host else "")
                         b2 = dict(b, hash=hh, torrent_id=None, slow=bool(kind))
                         if kind:
                             b2["prefer"] = kind
@@ -351,8 +385,21 @@ def register(app, bot):
                             url, note, _ = stream_for(dd)
                             if url:
                                 resp.update(hls=url, torrent_id=dd.get("torrent_id"), file_id=dd.get("file_id"))
-                except Exception:
-                    pass
+                            else:
+                                resp["stream_note"] = note or ""
+                        elif err2:
+                            resp["stream_note"] = str((err2[0].get_json(silent=True) or {}).get("error") or "")[:200]
+                    if not resp["hls"] and kind == "realdebrid":
+                        u2, n2 = rd_hls_from_url(d["url"])
+                        if u2:
+                            resp["hls"], resp["stream_note"] = u2, ""
+                        elif not resp["stream_note"]:
+                            resp["stream_note"] = n2
+                    if not resp["hls"] and not resp["stream_note"]:
+                        resp["stream_note"] = ("البث المحوَّل مش متاح للنسخة دي (مفيش hash في الرابط أو المزوّد "
+                                               "%s ملوش بث محوَّل)، بيتشغّل الملف الأصلي" % (kind or "؟"))
+                except Exception as ex:
+                    resp["stream_note"] = "تعذّر تجهيز البث المحوَّل: " + str(ex)[:120]
             return jsonify(resp)
         d, err = prepare(b)
         if err:
@@ -490,7 +537,8 @@ def register(app, bot):
         if not tid:
             return jsonify(hls="", note="torrent_id ناقص")
         url, note, _ = stream_for({"torrent_id": tid, "file_id": b.get("file_id"),
-                                   "provider": b.get("provider") or ""})
+                                   "provider": b.get("provider") or "",
+                                   "direct_link": str(b.get("direct_link") or "")[:2000]})
         return jsonify(hls=url or "", note=note or "")
 
     # ---------- فحص (أدمن) ----------
