@@ -504,6 +504,10 @@ def register(app, bot):
                                 resp["stream_note"] = note or ""
                         elif err2:
                             resp["stream_note"] = str((err2[0].get_json(silent=True) or {}).get("error") or "")[:200]
+                    if not resp["hls"] and hh:
+                        alt = hls_fallback(hh, b)
+                        if alt:
+                            resp["hls"], resp["stream_note"], resp["provider"] = alt, "", "TorBox (بث محوَّل)"
                     if not resp["hls"] and kind == "realdebrid":
                         u2, n2 = rd_hls_from_url(d["url"])
                         if u2:
@@ -594,6 +598,32 @@ def register(app, bot):
             ent.setdefault("eps", {})["%d:%d" % (sn, en)] = dict(clean, by=g.user, ts=int(time.time()))
             _sm_save(m)
         return jsonify(ok=True, eps=ent["eps"])
+
+
+    @app.post("/series/map/bulk")
+    def series_map_bulk():
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        b = request.get_json(silent=True) or {}
+        tid, sn, cnt = _int(b.get("id")), _int(b.get("s")), _int(b.get("count"))
+        sp = b.get("spec") or {}
+        h = str(sp.get("hash") or "").lower()
+        if not tid or sn is None or not cnt or not (0 < cnt <= 120) or not re.fullmatch(r"[0-9a-f]{40}", h):
+            return jsonify(error="بيانات الموسم ناقصة"), 400
+        added = 0
+        with SM_LOCK:
+            m = _sm_load()
+            ent = m.setdefault(str(tid), {"eps": {}})
+            eps = ent.setdefault("eps", {})
+            for en in range(1, cnt + 1):
+                k = "%d:%d" % (sn, en)
+                if k in eps:
+                    continue
+                eps[k] = {"hash": h, "name": str(sp.get("name") or "")[:200], "src": "", "ref": "",
+                          "fid": None, "by": g.user, "ts": int(time.time())}
+                added += 1
+            _sm_save(m)
+        return jsonify(ok=True, added=added, eps=eps)
 
     @app.post("/series/unmap")
     def series_map_del():
