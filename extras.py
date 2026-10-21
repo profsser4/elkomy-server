@@ -538,6 +538,19 @@ def register(app, bot):
                         alt = hls_fallback(hh, b)
                         if alt:
                             resp["hls"], resp["stream_note"], resp["provider"] = alt, "", "TorBox (بث محوَّل)"
+                    if not resp["hls"]:
+                        # رابط TorBox فيه torrent_id / file_id (إضافات زي Aradeb): بث محوَّل مباشرة من حسابك من غير تحميل تاني
+                        for src_u in (bot.ref_get(str(b.get("ref") or "")) or "", d["url"]):
+                            from urllib.parse import unquote as _uq
+                            src_u = _uq(str(src_u))
+                            mt = re.search(r"torrent_?id=(\d+)", src_u, re.I)
+                            if mt:
+                                mf = re.search(r"file_?id=(\d+)", src_u, re.I)
+                                u4, n4, _r = torbox_stream(int(mt.group(1)), int(mf.group(1)) if mf else 0)
+                                if u4:
+                                    resp.update(hls=u4, stream_note="", provider="TorBox (بث محوَّل)")
+                                    break
+                                resp["stream_note"] = n4 or resp["stream_note"]
                     if not resp["hls"] and kind == "realdebrid":
                         u2, n2 = rd_hls_from_url(d["url"])
                         if u2:
