@@ -308,6 +308,15 @@ def register(app, bot):
             return ""
 
     # ---------- تجهيز النسخة ----------
+    HASH_RX = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{40})(?![0-9a-fA-F])")
+
+    def hash_from_ref(ref, url):
+        for u in (bot.ref_get(str(ref or "")) or "", url or ""):
+            m = HASH_RX.search(str(u))
+            if m:
+                return m.group(1).lower()
+        return ""
+
     @app.post("/play/start")
     def play_start():
         b = request.get_json(silent=True) or {}
@@ -319,8 +328,22 @@ def register(app, bot):
             d, code = _jr(resolve_checked())
             if not d.get("url"):
                 return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), code if code >= 400 else 502
-            return jsonify(direct=d["url"], hls="", name=b.get("name") or "",
-                           size=b.get("size") or 0, provider="Stremio", file_id=None)
+            resp = {"direct": d["url"], "hls": "", "name": b.get("name") or "",
+                    "size": b.get("size") or 0, "provider": "Stremio", "file_id": None}
+            if mode == "watch":
+                # نسخ Stremio: لو رابطها فيه hash التورنت وهو فوري على TorBox، نجيب بث HLS محوَّل (الصوت والصورة يشتغلوا في المتصفح).
+                # التحميل بيفضل على الرابط الأصلي (direct). لو أي خطوة فشلت نرجع للتشغيل المباشر زي الأول.
+                try:
+                    hh = hash_from_ref(b.get("ref"), d["url"])
+                    if hh:
+                        dd, err2 = prepare(dict(b, hash=hh, slow=False, torrent_id=None))
+                        if not err2 and dd:
+                            url, note, _ = stream_for(dd)
+                            if url:
+                                resp.update(hls=url, torrent_id=dd.get("torrent_id"), file_id=dd.get("file_id"))
+                except Exception:
+                    pass
+            return jsonify(resp)
         d, err = prepare(b)
         if err:
             return err
@@ -402,6 +425,41 @@ def register(app, bot):
                 m.pop(str(tid), None)
             _sm_save(m)
         return jsonify(ok=True, eps=ent.get("eps") or {})
+
+    # ---------- بلاغات فحص الفيديو (بتتبعت تلقائي من المشغّل لما فيه مشكلة) ----------
+    REP_FILE = os.path.join(bot.DATA_DIR, "play_reports.jsonl")
+
+    @app.post("/play/report")
+    def play_report():
+        b = request.get_json(silent=True) or {}
+        row = {"t": int(time.time()), "u": g.user, "msg": str(b.get("msg") or "")[:300],
+               "title": str(b.get("title") or "")[:120], "s": _int(b.get("s")), "e": _int(b.get("e")),
+               "mode": str(b.get("mode") or "")[:20], "f": str(b.get("f") or "")[:200],
+               "ua": str(b.get("ua") or "")[:160]}
+        if not row["msg"]:
+            return jsonify(ok=False)
+        try:
+            with open(REP_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        return jsonify(ok=True)
+
+    @app.get("/play/reports")
+    def play_reports():
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        rows = []
+        try:
+            with open(REP_FILE, encoding="utf-8") as f:
+                for ln in f.readlines()[-40:]:
+                    try:
+                        rows.append(json.loads(ln))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return jsonify(items=rows[::-1])
 
     # ---------- رابط HLS لملف جاهز (للمسارات اللي بتجيب الرابط من /generate: حلقات الباك وغيرها) ----------
     @app.post("/play/hls")
