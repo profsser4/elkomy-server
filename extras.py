@@ -422,7 +422,7 @@ def register(app, bot):
     def webdl_hls(url):
         """نضيف رابط Stremio المباشر لحساب TorBox بتاعك (تحميل ويب) ونطلب منه بث HLS محوَّل.
         لو لسه بيتحمّل نرجّع سبب وبنفس الرابط المرة الجاية هيلاقيه جاهز في المجلة."""
-        if os.environ.get("WEBDL_HLS", "1") == "0":
+        if os.environ.get("WEBDL_HLS", "0") != "1":
             return "", ""
         p = bot.tb_provider()
         if not p:
