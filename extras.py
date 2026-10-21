@@ -10,6 +10,7 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -334,6 +335,73 @@ def register(app, bot):
                 if alt:
                     resp["hls"], resp["stream_note"] = alt, ""
         return jsonify(resp)
+
+    # ---------- تسلسل المسلسل المتضاف (مشترك لكل الأعضاء): tmdb -> {"س:ح": مصدر الحلقة} ----------
+    SM_FILE = os.path.join(bot.DATA_DIR, "series_map.json")
+    SM_LOCK = threading.Lock()
+
+    def _sm_load():
+        try:
+            with open(SM_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _sm_save(m):
+        tmp = SM_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False)
+        os.replace(tmp, SM_FILE)
+
+    @app.get("/series/map")
+    def series_map_get():
+        tid = str(request.args.get("id") or "")
+        m = _sm_load()
+        if tid:
+            return jsonify(eps=(m.get(tid) or {}).get("eps") or {})
+        return jsonify(counts={k: len(v.get("eps") or {}) for k, v in m.items()})
+
+    @app.post("/series/map")
+    def series_map_set():
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        b = request.get_json(silent=True) or {}
+        tid, sn, en = _int(b.get("id")), _int(b.get("s")), _int(b.get("e"))
+        sp = b.get("spec") or {}
+        h = str(sp.get("hash") or "").lower()
+        clean = {"hash": h if re.fullmatch(r"[0-9a-f]{40}", h) else "",
+                 "name": str(sp.get("name") or "")[:200], "src": str(sp.get("src") or "")[:2000],
+                 "ref": str(sp.get("ref") or "")[:2000], "fid": _int(sp.get("fid"))}
+        if not tid or sn is None or en is None or not (clean["hash"] or clean["ref"] or clean["src"]):
+            return jsonify(error="بيانات الحلقة ناقصة"), 400
+        with SM_LOCK:
+            m = _sm_load()
+            ent = m.setdefault(str(tid), {"eps": {}})
+            ent.setdefault("eps", {})["%d:%d" % (sn, en)] = dict(clean, by=g.user, ts=int(time.time()))
+            _sm_save(m)
+        return jsonify(ok=True, eps=ent["eps"])
+
+    @app.post("/series/unmap")
+    def series_map_del():
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        b = request.get_json(silent=True) or {}
+        tid, sn, en = _int(b.get("id")), _int(b.get("s")), _int(b.get("e"))
+        if not tid:
+            return jsonify(error="بيانات ناقصة"), 400
+        with SM_LOCK:
+            m = _sm_load()
+            ent = m.get(str(tid)) or {"eps": {}}
+            if sn is not None and en is not None:
+                ent.get("eps", {}).pop("%d:%d" % (sn, en), None)
+            else:
+                ent["eps"] = {}
+            if ent.get("eps"):
+                m[str(tid)] = ent
+            else:
+                m.pop(str(tid), None)
+            _sm_save(m)
+        return jsonify(ok=True, eps=ent.get("eps") or {})
 
     # ---------- رابط HLS لملف جاهز (للمسارات اللي بتجيب الرابط من /generate: حلقات الباك وغيرها) ----------
     @app.post("/play/hls")
