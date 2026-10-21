@@ -6,6 +6,7 @@ extras.py: مسار التشغيل الجديد (اختيار النسخة، ا�
   GET  /play/versions  نسخ العمل (فيلم أو حلقة) من إضافات Stremio مع علامة "فوري"
   POST /play/start     بيجهّز النسخة ويرجّع رابط البث المحوَّل (hls) والرابط الأصلي (direct)
   POST /play/diag      (أدمن) بيفحص كل خطوة ويرجّع الردود الخام عشان نعرف أي مشكلة
+  POST /play/probe     (أدمن) بيفتح أول 1MB من الملف ويقول الحاوية والكودكات والسبب
 """
 import json
 import os
@@ -26,6 +27,14 @@ RISKY_RX = re.compile(
 Q_RX = re.compile(r"2160p|4K|1080p|720p|480p", re.I)
 HLS_KEYS = ("hls_url", "hlsUrl", "hls", "playlist", "stream_url", "url")
 _MASK = re.compile(r"""(?i)(token['"]?\s*[:=]\s*['"]?)[^'"&\s,}]+""")
+
+# كودكات بنبحث عنها جوه أول 1MB من الملف (MKV و MP4)
+CODECS = [(b"V_MPEGH/ISO/HEVC", "HEVC"), (b"V_MPEG4/ISO/AVC", "H264"), (b"V_AV1", "AV1"),
+          (b"A_EAC3", "EAC3"), (b"A_AC3", "AC3"), (b"A_DTS", "DTS"), (b"A_TRUEHD", "TrueHD"),
+          (b"A_AAC", "AAC"), (b"A_OPUS", "OPUS"), (b"A_FLAC", "FLAC"),
+          (b"hvc1", "HEVC"), (b"hev1", "HEVC"), (b"avc1", "H264"),
+          (b"mp4a", "AAC"), (b"ec-3", "EAC3"), (b"ac-3", "AC3"), (b"dtsc", "DTS")]
+BAD_CODECS = ("HEVC", "AC3", "EAC3", "DTS", "TrueHD", "AV1")
 
 
 def mask(x):
@@ -70,6 +79,53 @@ def find_hls(obj):
     elif isinstance(obj, str) and obj.startswith("http") and ".m3u8" in obj:
         return obj
     return ""
+
+
+def sniff(u, nbytes=1048576):
+    """بيحمّل أول nbytes من الرابط ويحدد: الحاوية، الكودكات، والسبب المتوقع لو المتصفح مش هيشغّله.
+    بيرجّع dict فيه: status, type, total, ranges, host, container, codecs, bad, fix. أو error."""
+    try:
+        r = requests.get(u, headers={"Range": "bytes=0-%d" % (nbytes - 1), "User-Agent": "Mozilla/5.0"},
+                         timeout=20, stream=True, allow_redirects=True)
+        buf = b""
+        for ch in r.iter_content(65536):
+            buf += ch
+            if len(buf) >= nbytes:
+                break
+        r.close()
+    except Exception as ex:
+        return {"error": "الفحص فشل: " + mask(ex)[:150]}
+    m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
+    total = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
+    ctype = (r.headers.get("content-type") or "").lower()
+    if buf[:4] == b"\x1a\x45\xdf\xa3":
+        cont = "MKV"
+    elif b"ftyp" in buf[:16]:
+        cont = "MP4"
+    elif buf[:3] == b"\x47\x40\x00" or buf[:1] == b"\x47" and len(buf) > 188 and buf[188:189] == b"\x47":
+        cont = "TS"
+    elif ctype.startswith("text/") or "json" in ctype or "html" in ctype or buf.lstrip()[:1] in (b"<", b"{"):
+        cont = "HTML/JSON (مش فيديو)"
+    else:
+        cont = "غير معروف"
+    found = sorted({n for k, n in CODECS if k in buf}) if not cont.startswith("HTML") else []
+    if cont == "MP4" and b"moov" not in buf:
+        found.append("moov في آخر الملف (بيحمّل ببطء)")
+    bad = [c for c in found if c in BAD_CODECS]
+    if cont.startswith("HTML"):
+        fix = "الرابط مش فيديو: " + mask(buf[:150].decode("utf-8", "ignore"))
+    elif r.status_code not in (200, 206):
+        fix = "السيرفر رد %s" % r.status_code
+    elif bad:
+        fix = "المتصفح مش بيفك: " + ", ".join(bad) + " ← لازم HLS محوَّل أو نسخة تانية"
+    elif cont == "MKV":
+        fix = "حاوية MKV: بعض المتصفحات بترفضها حتى لو الكودكات سليمة ← HLS أو نسخة MP4"
+    elif cont == "غير معروف":
+        fix = "صيغة الملف مش معروفة (Content-Type: %s)" % (ctype or "؟")
+    else:
+        fix = "الكودكات تمام، شوف الـ Content-Type / الـ CORS"
+    return {"status": r.status_code, "type": ctype, "total": total, "ranges": r.headers.get("accept-ranges"),
+            "host": urlparse(r.url).netloc, "container": cont, "codecs": found, "bad": bad, "fix": fix}
 
 
 def register(app, bot):
@@ -233,26 +289,34 @@ def register(app, bot):
             q.update(season=s, episode=e or 1)
         return tb_items("/torrents/imdb:" + imdb, q)
 
-    def too_small(url, expected):
-        """بعض الإضافات بترجّع فيديو صغير بدل الملف لما النسخة مش متخزّنة (not cached yet)."""
+    def bad_media(url, expected):
+        """بيرجّع سبب نصي لو الرابط مش فيديو سليم (صفحة HTML/JSON أو فيديو صغير بدل الملف)، وإلا فاضي.
+        بعض الإضافات بترجّع فيديو صغير أو صفحة خطأ لما النسخة مش متخزّنة (not cached yet)."""
         try:
             r = requests.get(url, headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"}, timeout=12, stream=True)
             if r.status_code not in (200, 206):
                 r.close()
-                return False   # رد خطأ من السيرفر مش دليل إن الملف صغير
+                return ""   # رد خطأ من السيرفر مش دليل إن الملف صغير
+            ct = (r.headers.get("Content-Type") or "").lower()
             m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
             total = int(m.group(1)) if m else int(r.headers.get("Content-Length") or 0)
             r.close()
         except Exception:
-            return False
-        return bool(total) and total < 40000000 and (not expected or total < expected * 0.1)
+            return ""
+        if ct.startswith("text/") or "json" in ct or "html" in ct:
+            return "الرابط مش فيديو (رجّع %s). جرّب نسخة تانية." % ct.split(";")[0]
+        if total and total < 40000000 and (not expected or total < expected * 0.1):
+            return "النسخة دي لسه مش متخزّنة على خدمة الدابريد (بتتحمّل). جرّب نسخة تانية."
+        return ""
 
     def resolve_checked():
         resp = bot.st_resolve()
         d, _ = _jr(resp)
         size = _int((request.get_json(silent=True) or {}).get("size"))
-        if d.get("url") and too_small(d["url"], size):
-            return jsonify(error="النسخة دي لسه مش متخزّنة على خدمة الدابريد (بتتحمّل). جرّب نسخة تانية."), 409
+        if d.get("url"):
+            why = bad_media(d["url"], size)
+            if why:
+                return jsonify(error=why), 409
         return resp
 
     if "st_resolve" in app.view_functions:
@@ -400,6 +464,19 @@ def register(app, bot):
                                                "%s ملوش بث محوَّل)، بيتشغّل الملف الأصلي" % (kind or "؟"))
                 except Exception as ex:
                     resp["stream_note"] = "تعذّر تجهيز البث المحوَّل: " + str(ex)[:120]
+                # مفيش HLS: هنفحص الملف الأصلي قبل ما نسلّمه للمتصفح.
+                # لو مش فيديو أصلاً نرجّع 409 فالواجهة تجرّب النسخة اللي بعدها لوحدها بدل ما تعرض "الصيغة مش مدعومة".
+                if not resp["hls"]:
+                    try:
+                        sn = sniff(d["url"], 524288)
+                    except Exception:
+                        sn = None
+                    if sn and not sn.get("error"):
+                        if sn["container"].startswith("HTML"):
+                            return jsonify(error="النسخة دي رجّعت صفحة مش فيديو. " + sn["fix"][:120]), 409
+                        if sn["bad"]:
+                            resp["stream_note"] = ((resp["stream_note"] + " | ") if resp["stream_note"] else "") + sn["fix"]
+                            resp["bad_codecs"] = sn["bad"]
             return jsonify(resp)
         d, err = prepare(b)
         if err:
@@ -572,6 +649,16 @@ def register(app, bot):
                 except Exception as ex:
                     steps.append({"step": "manifest", "error": mask(ex)[:200]})
         return jsonify(steps=steps)
+
+    # ---------- فحص عميق للملف (أدمن): الحاوية والكودكات والسبب ----------
+    @app.post("/play/probe")
+    def play_probe():
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        u = str((request.get_json(silent=True) or {}).get("url") or "")
+        if not u.startswith("http"):
+            return jsonify(error="رابط ناقص"), 400
+        return jsonify(sniff(u))
 
     # ---------- بانر الرئيسية: أحدث 5 أعمال ----------
     HERO = {"t": 0, "items": []}
