@@ -419,6 +419,57 @@ def register(app, bot):
                     return url, ""
         return "", "Real-Debrid transcode مش متاح للرابط ده"
 
+    def webdl_hls(url):
+        """نضيف رابط Stremio المباشر لحساب TorBox بتاعك (تحميل ويب) ونطلب منه بث HLS محوَّل.
+        لو لسه بيتحمّل نرجّع سبب وبنفس الرابط المرة الجاية هيلاقيه جاهز في المجلة."""
+        if os.environ.get("WEBDL_HLS", "1") == "0":
+            return "", ""
+        p = bot.tb_provider()
+        if not p:
+            return "", "TorBox مش مضاف في المزوّدين (مفيش تحويل من حسابك)"
+        k = p["key"]
+        try:
+            wid = None
+            items = bot.tb(k, "GET", "/webdl/mylist", params={"bypass_cache": "true"}).get("data") or []
+            for x in (items if isinstance(items, list) else []):
+                if str(x.get("original_url") or "") == url:
+                    wid = x.get("id")
+                    break
+            if not wid:
+                add = bot.tb(k, "POST", "/webdl/createwebdownload", data={"link": url})
+                msg = str(add.get("detail") or add.get("error") or "").lower()
+                if not add.get("success") and "limit" in msg:
+                    bot.clean_torbox(k)
+                    add = bot.tb(k, "POST", "/webdl/createwebdownload", data={"link": url})
+                if not add.get("success"):
+                    return "", "TorBox رفض الرابط: " + str(add.get("detail") or add.get("error") or "؟")[:120]
+                dd = add.get("data") or {}
+                wid = dd.get("webdownload_id") or dd.get("id")
+            info = {}
+            for _ in range(4):
+                info = bot.as_dict(bot.tb(k, "GET", "/webdl/mylist", params={"id": wid, "bypass_cache": "true"}).get("data"))
+                st = str(info.get("download_state", "")).lower()
+                if st in ("error", "failed", "expired"):
+                    return "", "تحميل الرابط في حسابك فشل (%s)" % st
+                if bot.is_ready(info):
+                    break
+                time.sleep(1.5)
+            if not bot.is_ready(info):
+                return "", "الملف لسه بيتحمّل في حسابك (%s%%)، جرّب تاني بعد شوية" % (info.get("progress") if info.get("progress") is not None else "؟")
+            last = ""
+            for typ in ("webdl", "webdownload"):
+                r = bot.tb(k, "GET", "/stream/createstream", params={"id": wid, "file_id": 0, "type": typ})
+                if isinstance(r, dict) and r.get("success"):
+                    u = find_hls(r.get("data"))
+                    if u:
+                        return u, ""
+                    last = "TorBox رجّع رد من غير رابط HLS"
+                else:
+                    last = str((r or {}).get("detail") or (r or {}).get("error") or "createstream فشل")[:150]
+            return "", "بث حسابك: " + last
+        except Exception as ex:
+            return "", "تحويل من حسابك: " + str(ex)[:120]
+
     @app.post("/play/start")
     def play_start():
         b = request.get_json(silent=True) or {}
@@ -464,6 +515,12 @@ def register(app, bot):
                                                "%s ملوش بث محوَّل)، بيتشغّل الملف الأصلي" % (kind or "؟"))
                 except Exception as ex:
                     resp["stream_note"] = "تعذّر تجهيز البث المحوَّل: " + str(ex)[:120]
+                if not resp["hls"]:
+                    u3, n3 = webdl_hls(d["url"])
+                    if u3:
+                        resp["hls"], resp["stream_note"], resp["provider"] = u3, "", "TorBox (حسابك)"
+                    elif n3:
+                        resp["stream_note"] = ((resp["stream_note"] + " | ") if resp["stream_note"] else "") + n3
                 # مفيش HLS: هنفحص الملف الأصلي قبل ما نسلّمه للمتصفح.
                 # لو مش فيديو أصلاً نرجّع 409 فالواجهة تجرّب النسخة اللي بعدها لوحدها بدل ما تعرض "الصيغة مش مدعومة".
                 if not resp["hls"]:
