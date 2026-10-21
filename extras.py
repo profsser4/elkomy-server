@@ -25,6 +25,17 @@ RISKY_RX = re.compile(
     r"(?:\bDDP?\s?\d|\bDD\+|\bAC-?3\b|\bE-?AC-?3\b|\bDTS|\bTrueHD|\bAtmos"
     r"|\bHEVC|\bx265|\bH[. ]?265|\b10-?bit|\.avi\b)", re.I)
 Q_RX = re.compile(r"2160p|4K|1080p|720p|480p", re.I)
+# ترتيب النسخ: H.264/x264 + AAC أول، وDDP/DTS/HEVC/x265 آخر
+GOOD_V_RX = re.compile(r"\b(?:x264|H[. ]?264|AVC)\b", re.I)
+GOOD_A_RX = re.compile(r"\bAAC", re.I)
+
+
+def ver_score(title, risky):
+    """0 = خطرة (DDP/DTS/HEVC/x265..) | 1 = عادية | 2 = H.264 أو AAC | 3 = H.264 + AAC"""
+    if risky:
+        return 0
+    t = title.replace("_", " ")
+    return 1 + bool(GOOD_V_RX.search(t)) + bool(GOOD_A_RX.search(t))
 HLS_KEYS = ("hls_url", "hlsUrl", "hls", "playlist", "stream_url", "url")
 _MASK = re.compile(r"""(?i)(token['"]?\s*[:=]\s*['"]?)[^'"&\s,}]+""")
 
@@ -344,6 +355,7 @@ def register(app, bot):
             h = (x.get("hash") or "").lower()
             title = x.get("title") or ""
             m = Q_RX.search(title)
+            risky = bool(RISKY_RX.search(title.replace("_", " ")))
             v = {
                 "title": title, "size": x.get("size") or 0,
                 "seeders": x.get("seeders") or 0, "hash": h,
@@ -351,15 +363,15 @@ def register(app, bot):
                 # نسخ Stremio (ref) رابطها جاهز من الإضافة: تتحسب فورية. التورنت بس هو اللي بيتفحص كاش.
                 "instant": bool((h and h in cached) or x.get("ref")),
                 "dub": bool(x.get("dub")), "eg": bool(x.get("eg")),
-                "risky": bool(RISKY_RX.search(title.replace("_", " "))),
+                "risky": risky, "score": ver_score(title, risky),
                 "q": m.group(0).upper() if m else "",
             }
             key = h or v["ref"] or title
             o = best.get(key)
-            if o is None or (v["instant"], v["seeders"]) > (o["instant"], o["seeders"]):
+            if o is None or (v["instant"], v["score"], v["seeders"]) > (o["instant"], o["score"], o["seeders"]):
                 best[key] = v
         out = sorted(best.values(),
-                     key=lambda v: (not v["instant"], -v["seeders"]))[:120]
+                     key=lambda v: (not v["instant"], -v["score"], -v["seeders"]))[:120]
         return jsonify(versions=out)
 
     def hls_fallback(h, b):
@@ -617,7 +629,7 @@ def register(app, bot):
             eps = ent.setdefault("eps", {})
             for en in range(1, cnt + 1):
                 k = "%d:%d" % (sn, en)
-                if k in eps:
+                if k in eps and not b.get("force"):
                     continue
                 eps[k] = {"hash": h, "name": str(sp.get("name") or "")[:200], "src": "", "ref": "",
                           "fid": None, "by": g.user, "ts": int(time.time())}
