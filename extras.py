@@ -300,6 +300,21 @@ def register(app, bot):
             q.update(season=s, episode=e or 1)
         return tb_items("/torrents/imdb:" + imdb, q)
 
+    AR_KEEP = re.compile(r"[\u0600-\u06FF]|arab|dubbed|\bdub\b|\bHC\b|hard.?cod|hard.?sub|egypt", re.I)
+
+    def ar_search(q):
+        """بحث إضافي عن نسخ مدبلجة/مترجمة بالعربي باسم العمل (بيتضاف لنتايج الـ imdb)."""
+        qs = [q + " مدبلج مصري", q + " arabic dubbed"]
+        out = []
+        try:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                for items in ex.map(lambda t: tb_items("/torrents/search/" + quote(t, safe=""),
+                                                       {"check_cache": "true"}), qs):
+                    out += [x for x in items if AR_KEEP.search(x["title"])]
+        except Exception:
+            pass
+        return out
+
     def bad_media(url, expected):
         """بيرجّع سبب نصي لو الرابط مش فيديو سليم (صفحة HTML/JSON أو فيديو صغير بدل الملف)، وإلا فاضي.
         بعض الإضافات بترجّع فيديو صغير أو صفحة خطأ لما النسخة مش متخزّنة (not cached yet)."""
@@ -341,6 +356,9 @@ def register(app, bot):
         except Exception:
             d = {}
         tbs = tb_search(request.args.get("imdb", ""), _int(request.args.get("s")), _int(request.args.get("e")))
+        qn = (request.args.get("q") or "").strip()[:80]
+        if qn:
+            tbs = tbs + ar_search(qn)
         res = (d.get("results") or []) + tbs
         if not res:
             return jsonify(versions=[], error=d.get("error") or "مفيش نسخ متاحة للعمل ده")
