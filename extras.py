@@ -335,6 +335,23 @@ def register(app, bot):
                     resp["hls"], resp["stream_note"] = alt, ""
         return jsonify(resp)
 
+    # ---------- رابط HLS لملف جاهز (للمسارات اللي بتجيب الرابط من /generate: حلقات الباك وغيرها) ----------
+    @app.post("/play/hls")
+    def play_hls():
+        try:
+            lk, msg = bot.lock_of(g.user)
+        except Exception:
+            lk, msg = 0, ""
+        if g.role != "admin" and lk >= 2:
+            return jsonify(error=msg, nodl=True, lock=2), 403
+        b = request.get_json(silent=True) or {}
+        tid = str(b.get("torrent_id") or "")
+        if not tid:
+            return jsonify(hls="", note="torrent_id ناقص")
+        url, note, _ = stream_for({"torrent_id": tid, "file_id": b.get("file_id"),
+                                   "provider": b.get("provider") or ""})
+        return jsonify(hls=url or "", note=note or "")
+
     # ---------- فحص (أدمن) ----------
     @app.post("/play/diag")
     def play_diag():
