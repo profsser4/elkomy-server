@@ -2769,6 +2769,48 @@ def search():
         return jsonify(error=f"مشكلة في البحث: {e}"), 500
 
 
+# ----------------- بحث Dailymotion (API عام من غير مفتاح) -----------------
+
+DM_API = "https://api.dailymotion.com/videos"
+
+
+@app.get("/dailymotion/search")
+def dm_search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify(results=[])
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    try:
+        r = requests.get(DM_API, params={
+            "search": q, "page": page, "limit": 24, "sort": "relevance",
+            "fields": "id,title,url,duration,thumbnail_240_url,owner.screenname",
+        }, timeout=15)
+        if r.status_code != 200:
+            return jsonify(error=f"Dailymotion رجّع {r.status_code}"), 502
+        d = r.json()
+        out = []
+        for x in d.get("list") or []:
+            vid = x.get("id") or ""
+            if not vid:
+                continue
+            out.append({
+                "id": vid,
+                "title": x.get("title") or "",
+                "url": x.get("url") or f"https://www.dailymotion.com/video/{vid}",
+                "duration": x.get("duration") or 0,
+                "thumb": x.get("thumbnail_240_url") or "",
+                "owner": x.get("owner.screenname") or "",
+            })
+        return jsonify(results=out, has_more=bool(d.get("has_more")), page=page)
+    except requests.Timeout:
+        return jsonify(error="Dailymotion بطيء حالياً، جرب تاني"), 504
+    except Exception as e:
+        return jsonify(error=f"مشكلة في البحث: {e}"), 500
+
+
 # ----------------- الترجمة (SubDL) -----------------
 
 ZIP_CACHE = {}
