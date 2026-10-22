@@ -23,7 +23,7 @@ CORS(app)
 
 # ==============================================================
 # Variables على Railway: TMDB_KEY, PROWLARR_URL, PROWLARR_KEY,
-# SUBDL_KEY, VK_TOKEN (لبحث VK Video), APP_USER, APP_PASS (الافتراضي admin/admin),
+# SUBDL_KEY, APP_USER, APP_PASS (الافتراضي admin/admin),
 # DATA_DIR (اختياري)
 # مفاتيح المزوّدين وحساب Stremio بيتضافوا من جوه الموقع مش من الكود
 # ==============================================================
@@ -31,7 +31,6 @@ APP_USER = os.environ.get("APP_USER", "admin")
 APP_PASS = os.environ.get("APP_PASS", "admin")
 TMDB_KEY = os.environ.get("TMDB_KEY", "")
 SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
-VK_TOKEN = os.environ.get("VK_TOKEN", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
@@ -2808,58 +2807,6 @@ def dm_search():
         return jsonify(results=out, has_more=bool(d.get("has_more")), page=page)
     except requests.Timeout:
         return jsonify(error="Dailymotion بطيء حالياً، جرب تاني"), 504
-    except Exception as e:
-        return jsonify(error=f"مشكلة في البحث: {e}"), 500
-
-
-# ----------------- بحث VK Video (API الرسمي، محتاج VK_TOKEN) -----------------
-
-VK_API = "https://api.vk.com/method/video.search"
-
-
-@app.get("/vk/search")
-def vk_search():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify(results=[])
-    if not VK_TOKEN:
-        return jsonify(error="VK_TOKEN مش متضاف في Variables"), 500
-    try:
-        page = max(1, int(request.args.get("page", "1")))
-    except ValueError:
-        page = 1
-    try:
-        r = requests.get(VK_API, params={
-            "q": q, "count": 24, "offset": (page - 1) * 24,
-            "access_token": VK_TOKEN, "v": "5.199",
-        }, headers={"Authorization": f"Bearer {VK_TOKEN}"}, timeout=15)
-        d = r.json()
-        if d.get("error"):
-            return jsonify(error="VK: " + str(d["error"].get("error_msg", "فشل"))), 502
-        resp = d.get("response") or {}
-        out = []
-        for x in resp.get("items") or []:
-            oid, vid = x.get("owner_id"), x.get("id")
-            if oid is None or vid is None:
-                continue
-            imgs = x.get("image") or x.get("first_frame") or []
-            thumb = ""
-            if isinstance(imgs, list) and imgs:
-                best = min(imgs, key=lambda i: abs((i.get("width") or 0) - 320))
-                thumb = best.get("url") or ""
-            thumb = thumb or x.get("photo_320") or x.get("photo_130") or ""
-            out.append({
-                "id": f"{oid}_{vid}",
-                "title": x.get("title") or "",
-                "url": f"https://vkvideo.ru/video{oid}_{vid}",
-                "duration": x.get("duration") or 0,
-                "thumb": thumb,
-                "views": x.get("views") or 0,
-            })
-        total = resp.get("count") or 0
-        return jsonify(results=out, has_more=page * 24 < total, page=page)
-    except requests.Timeout:
-        return jsonify(error="VK بطيء حالياً، جرب تاني"), 504
     except Exception as e:
         return jsonify(error=f"مشكلة في البحث: {e}"), 500
 
