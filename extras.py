@@ -1112,6 +1112,178 @@ def register(app, bot):
                 rows.append({"id": "int:" + k, "title": name, "items": items})
         return jsonify(rows=rows)
 
+    # ---------- "ليك أنت": صفوف لكل بروفايل على حسب اللي هو شافه (زي نتفلكس) ----------
+    # كل عضو/بروفايل ليه صفوفه من سجل مشاهدته هو بس. مفيش حاجة بتتشارك بين الأعضاء.
+    TMETA = {}
+    FYC = {}
+    TREND = {"t": 0, "items": []}
+    FY_FLAG = {"hi": "🇮🇳 ", "ar": "🎬 ", "tr": "🇹🇷 ", "ko": "🇰🇷 ", "foreign": "🌍 "}
+    FY_LABEL = {"hi": "الهندي", "ar": "العربي", "tr": "التركي", "ko": "الكوري", "foreign": "الأجنبي"}
+    FY_GEN = {  # التصنيف: (رقم تصنيف الفيلم, رقم تصنيف المسلسل, الاسم)
+        "act": ("28", "10759", "أكشن"), "com": ("35", "35", "كوميدي"), "hor": ("27", "9648", "رعب"),
+        "sci": ("878", "10765", "خيال علمي"), "doc": ("99", "99", "وثائقي"), "crime": ("80", "80", "جريمة"),
+        "romance": ("10749", "18", "رومانسي")}
+    FY_GSET = {k: {int(v[0]), int(v[1])} for k, v in FY_GEN.items()}
+    FY_VOTES = {("movie", "hi"): "300", ("movie", "ar"): "100", ("movie", "tr"): "200", ("movie", "ko"): "300",
+                ("tv", "hi"): "30", ("tv", "ar"): "30", ("tv", "tr"): "100", ("tv", "ko"): "200",
+                ("movie", "foreign"): "8000", ("tv", "foreign"): "5000"}
+
+    def fy_meta(ty, tid):
+        k = (ty, tid)
+        if k not in TMETA:
+            try:
+                a = bot.tmdb_get("/%s/%s" % (ty, tid), language="en-US")
+            except Exception:
+                return None
+            TMETA[k] = {"lang": a.get("original_language") or "", "g": {x.get("id") for x in a.get("genres", [])}}
+        return TMETA[k]
+
+    def fy_history(user, pid):
+        ud = bot.ud_load(user)
+        pr = (ud.get("profiles") or {}).get(pid)
+        if not isinstance(pr, dict) or pr.get("del"):
+            return {}
+        out = {}
+        for k, it in ((ud.get("items") or {}).get(pid) or {}).items():
+            if (not isinstance(it, dict) or it.get("del") or not str(it.get("tmdb", "")).isdigit()
+                    or it.get("type") not in ("movie", "tv")):
+                continue
+            is_list = str(k).startswith("l")
+            dur, pos = it.get("dur") or 0, it.get("pos") or 0
+            w = 1.0 if is_list else (2.0 if it.get("done") else (1.0 if dur and pos / dur > 0.15 else 0.4))
+            o = out.setdefault((it["type"], int(it["tmdb"])),
+                               {"t": 0, "w": 0.0, "title": "", "txt": "", "seen": False})
+            o["t"] = max(o["t"], bot.tnum(it))
+            o["w"] += w
+            o["title"] = o["title"] or it.get("title") or ""
+            o["seen"] = o["seen"] or not is_list
+            o["txt"] += " " + " ".join(str(it.get(f) or "") for f in ("title", "fname", "qn"))
+        return out
+
+    def fy_best(cat, ty):
+        """صف "أفضل ... في التاريخ" لتصنيف معين"""
+        noun = "الأفلام" if ty == "movie" else "المسلسلات"
+        if cat in FY_LABEL:
+            q = {} if cat == "foreign" else {"with_original_language": cat}
+            title = "%sأفضل %s %s في التاريخ" % (FY_FLAG[cat], noun, FY_LABEL[cat])
+            items = tmdb_mix([L(ty, **q)], 1, drop_ar=(cat == "foreign"), sort="vote_average.desc",
+                             votes=FY_VOTES[(ty, cat)])[0]
+        elif cat == "anime":
+            title = "🎌 أفضل الأنمي في التاريخ"
+            items = tmdb_mix([L("tv", with_genres="16", with_original_language="ja"),
+                              L("movie", with_genres="16", with_original_language="ja")], 1,
+                             sort="vote_average.desc", votes="500")[0]
+        else:
+            m, t, name = FY_GEN[cat]
+            title = "⭐ أفضل %s %s في التاريخ" % ("أفلام" if ty == "movie" else "مسلسلات", name)
+            items = tmdb_mix([L(ty, with_genres=m if ty == "movie" else t)], 1, sort="vote_average.desc",
+                             votes="3000" if ty == "movie" else "1000")[0]
+        return title, items
+
+    def fy_because(ty, tid, title):
+        try:
+            res = bot.tmdb_get("/%s/%s/recommendations" % (ty, tid), language="ar").get("results", [])
+        except Exception:
+            return None
+        items = [{"id": x["id"], "type": ty, "title": x.get("title") or x.get("name") or "",
+                  "poster": "https://image.tmdb.org/t/p/w342" + x["poster_path"],
+                  "year": (x.get("release_date") or x.get("first_air_date") or "")[:4]}
+                 for x in res if x.get("poster_path")]
+        return {"id": "fy:b:%s:%s" % (ty, tid), "title": "لأنك شاهدت " + title, "items": items}
+
+    def fy_trending():
+        if TREND["items"] and time.time() - TREND["t"] < 1800:
+            return TREND["items"]
+        try:
+            items = bot.row_items({"type": "movie", "path": "/trending/all/day", "q": {}})
+        except Exception:
+            items = []
+        if items:
+            TREND["items"], TREND["t"] = items, time.time()
+        return TREND["items"]
+
+    def fy_build(user, pid, skip, lite=False):
+        hist = fy_history(user, pid)
+        seen = set(hist)
+        rows = []
+        recent = sorted(hist.items(), key=lambda kv: kv[1]["t"], reverse=True)[:30]
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            metas = list(ex.map(lambda kv: fy_meta(*kv[0]), recent))
+        score = {}
+        for idx, ((key, info), m) in enumerate(zip(recent, metas)):
+            if not m:
+                continue
+            ty, lang, gs = key[0], m["lang"], m["g"]
+            w = info["w"] * (1.0 - idx / 60.0)
+            cats = []
+            if 16 in gs or 10751 in gs:
+                dub = bool(bot.DUB_RX.search(info["txt"]))
+                if lang == "ja" and 16 in gs and not dub:
+                    cats.append((("anime", "tv"), w))
+                else:
+                    cats.append((("cartoon", "movie"), w * (1.5 if dub else 1.0)))
+            if lang in FY_LABEL and lang != "foreign":
+                cats.append(((lang, ty), w))
+            elif lang and lang != "ja" and 16 not in gs:
+                cats.append((("foreign", ty), w))
+            for c, gset in FY_GSET.items():
+                if gs & gset:
+                    cats.append(((c, ty), w * 0.5))
+            for c, s in cats:
+                score[c] = score.get(c, 0) + s
+        # "لأنك شاهدت": آخر عملين خلّصهم أو بدأهم فعلاً
+        tops = [(k, i) for k, i in recent if i["seen"] and i["w"] >= 1][:1 if lite else 2]
+        if tops:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                for r in ex.map(lambda ki: fy_because(ki[0][0], ki[0][1], ki[1]["title"]), tops):
+                    if r:
+                        r["items"] = [x for x in r["items"] if (x["type"], x["id"]) not in seen][:20]
+                        if len(r["items"]) >= 4:
+                            rows.append(r)
+        tr = [x for x in fy_trending() if (x.get("type"), x.get("id")) not in seen]
+        if len(tr) >= 4:
+            rows.append({"id": "fy:trend", "title": "🔥 الأكثر مشاهدة النهارده", "items": tr[:20]})
+        picked, gen_n = [], 0
+        for (cat, ty), s in sorted(score.items(), key=lambda kv: kv[1], reverse=True):
+            gen = cat in FY_GEN
+            if cat in skip or (gen and gen_n >= 2):
+                continue
+            gen_n += gen
+            picked.append((cat, ty))
+            if len(picked) >= (2 if lite else 5):
+                break
+
+        def one(ct):
+            cat, ty = ct
+            if cat == "cartoon":
+                items = mix([bot.dub_items(), tmdb_mix([L("movie", with_genres="16|10751")], 1)[0]], 40)
+                title = "🇪🇬 كرتون مدبلج"
+            else:
+                title, items = fy_best(cat, ty)
+            items = [x for x in items if (x.get("type"), x.get("id")) not in seen][:20]
+            return {"id": "fy:%s:%s" % (cat, ty), "title": title, "items": items} if len(items) >= 4 else None
+
+        if picked:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                rows += [r for r in ex.map(one, picked) if r]
+        return rows
+
+    @app.get("/for-you")
+    def for_you():
+        pid = request.args.get("pid", "")[:24]
+        skip = {x for x in request.args.get("skip", "").split(",") if x}
+        lite = request.args.get("lite") == "1"
+        ck = (g.user, pid, ",".join(sorted(skip)), lite)
+        hit = FYC.get(ck)
+        if hit and time.time() - hit[0] < 300:
+            return jsonify(rows=hit[1])
+        try:
+            rows = fy_build(g.user, pid, skip, lite)
+        except Exception:
+            rows = hit[1] if hit else []
+        FYC[ck] = (time.time(), rows)
+        return jsonify(rows=rows)
+
     # ---------- آخر الإضافات (مسلسلات قائمتك + أحدث الأفلام) ----------
     LAT = {}
 
