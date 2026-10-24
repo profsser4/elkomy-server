@@ -650,20 +650,34 @@ def register(app, bot):
         b = request.get_json(silent=True) or {}
         tid, sn, cnt = _int(b.get("id")), _int(b.get("s")), _int(b.get("count"))
         sp = b.get("spec") or {}
-        h = str(sp.get("hash") or "").lower()
-        if not tid or sn is None or not cnt or not (0 < cnt <= 120) or not re.fullmatch(r"[0-9a-f]{40}", h):
+        h = str(sp.get("hash") or b.get("hash") or "").lower()
+        name = str(sp.get("name") or b.get("name") or "")[:200]
+        if not tid or not re.fullmatch(r"[0-9a-f]{40}", h):
+            return jsonify(error="بيانات الموسم ناقصة"), 400
+        pairs = []
+        lst = b.get("eps")
+        if isinstance(lst, list) and lst:                      # قايمة حلقات محددة (من ملفات الباك نفسها)
+            for x in lst[:200]:
+                if not isinstance(x, dict):
+                    continue
+                s_, e_ = _int(x.get("s")), _int(x.get("e"))
+                if s_ is not None and e_ is not None:
+                    pairs.append((s_, e_, _int(x.get("fid"))))
+        elif sn is not None and cnt and 0 < cnt <= 120:        # موسم كامل بالعدد
+            pairs = [(sn, en, None) for en in range(1, cnt + 1)]
+        if not pairs:
             return jsonify(error="بيانات الموسم ناقصة"), 400
         added = 0
         with SM_LOCK:
             m = _sm_load()
             ent = m.setdefault(str(tid), {"eps": {}})
             eps = ent.setdefault("eps", {})
-            for en in range(1, cnt + 1):
-                k = "%d:%d" % (sn, en)
-                if k in eps and not b.get("force"):
+            for s_, e_, fid in pairs:
+                k = "%d:%d" % (s_, e_)
+                if k in eps and not b.get("force"):          # اللي اتضاف قبل كده مابيتغيّرش
                     continue
-                eps[k] = {"hash": h, "name": str(sp.get("name") or "")[:200], "src": "", "ref": "",
-                          "fid": None, "by": g.user, "ts": int(time.time())}
+                eps[k] = {"hash": h, "name": name, "src": "", "ref": "",
+                          "fid": fid, "by": g.user, "ts": int(time.time())}
                 added += 1
             _sm_save(m)
         return jsonify(ok=True, added=added, eps=eps)
