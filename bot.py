@@ -293,7 +293,7 @@ def auth():
 #   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
 #   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
 # وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
-SET_DEF = {"watch": "torbox", "dl": "same", "strict": False}
+SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False}
 
 
 def settings_load():
@@ -337,6 +337,43 @@ def prov_ok(v):
     if v in ("", "auto", "same") or v in TORRENT_TYPES:
         return True
     return any(p["id"] == v for p in load())
+
+
+_PROV_WORDS = re.compile(r"(?i)(torbox|all-?debrid|real-?debrid|debrid-?link|stremio|aradeb|1fichier)")
+
+
+def _hide_accounts(o, names):
+    """الأعضاء ما يشوفوش أسماء المزوّدين ولا الحسابات: نشيل provider/stream_note ونبدّل الأسماء في رسائل الخطأ."""
+    if isinstance(o, dict):
+        for k in list(o.keys()):
+            v = o[k]
+            if k in ("provider", "stream_note", "stream_notes", "diag"):
+                o[k] = "" if isinstance(v, str) else v
+            elif k in ("error", "status", "detail", "message") and isinstance(v, str):
+                for n in names:
+                    v = v.replace(n, "السيرفر")
+                o[k] = _PROV_WORDS.sub("السيرفر", v)
+            else:
+                _hide_accounts(v, names)
+    elif isinstance(o, list):
+        for x in o:
+            _hide_accounts(x, names)
+
+
+@app.after_request
+def mask_for_members(resp):
+    try:
+        if getattr(g, "role", "admin") == "admin" or request.method == "OPTIONS":
+            return resp
+        if resp.mimetype != "application/json" or resp.direct_passthrough:
+            return resp
+        o = json.loads(resp.get_data(as_text=True))
+        names = sorted({str(p.get("name") or "") for p in load() if p.get("name")}, key=len, reverse=True)
+        _hide_accounts(o, names)
+        resp.set_data(json.dumps(o, ensure_ascii=False))
+    except Exception:
+        pass
+    return resp
 
 
 @app.get("/settings")
