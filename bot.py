@@ -293,7 +293,7 @@ def auth():
 #   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
 #   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
 # وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
-SET_DEF = {"watch": "auto", "dl": "same", "strict": False}
+SET_DEF = {"watch": "torbox", "dl": "same", "strict": False}
 
 
 def settings_load():
