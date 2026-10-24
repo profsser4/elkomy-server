@@ -233,8 +233,8 @@ def needs_admin(path, method):
 
 @app.before_request
 def guard():
-    open_paths = ("/", "/auth", "/ud/beacon", "/subx.srt")
-    if request.method == "OPTIONS" or request.path in open_paths:
+    open_paths = ("/", "/auth", "/ud/beacon")
+    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith("/subx/"):
         return None
     who = read_token(request.headers.get("X-Token", ""))
     if not who:
@@ -3070,54 +3070,59 @@ def subs():
 
 
 SUBX_TTL = 12 * 3600
-SUBX_KEYS = ("shift", "scale", "s", "e", "lang")
 
 
-def subx_sig(u, q, exp):
-    return sign("subx|" + "|".join([u] + [q[k] for k in SUBX_KEYS] + [exp]))
+def _b64e(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _b64d(t):
+    return base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))
 
 
 @app.get("/sub/link")
 def sub_link():
-    """رابط ترجمة SRT موقّع (12 ساعة) عشان VLC وأي مشغّل خارجي يحمّله من غير تسجيل دخول"""
-    from urllib.parse import urlencode
+    """رابط ترجمة SRT موقّع (12 ساعة) ينتهي بـ /sub.srt عشان VLC وأي مشغّل خارجي يتعرّف عليه ويحمّله من غير تسجيل دخول"""
     u = request.args.get("u", "")
     if not ok_sub_path(u):
         return jsonify(error="رابط ترجمة غير صالح"), 400
-    q = {k: request.args.get(k, "")[:40] for k in SUBX_KEYS}
-    q["shift"], q["scale"] = q["shift"] or "0", q["scale"] or "1"
     try:
-        float(q["shift"]), float(q["scale"])
+        shift = float(request.args.get("shift") or 0)
+        scale = float(request.args.get("scale") or 1)
     except ValueError:
         return jsonify(error="قيم غير صالحة"), 400
-    exp = str(int(time.time()) + SUBX_TTL)
+    p = {"u": u, "shift": shift, "scale": scale, "s": request.args.get("s", "")[:6],
+         "e": request.args.get("e", "")[:6], "lang": request.args.get("lang", "")[:20],
+         "exp": int(time.time()) + SUBX_TTL}
+    tok = _b64e(json.dumps(p, separators=(",", ":")).encode())
     proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
     base = (os.environ.get("PUBLIC_URL") or f"{proto}://{request.host}").rstrip("/")
-    qs = urlencode(dict(q, u=u, exp=exp, sig=subx_sig(u, q, exp)))
-    return jsonify(url=base + "/subx.srt?" + qs)
+    return jsonify(url=f"{base}/subx/{tok}.{sign('subx|' + tok)[:40]}/sub.srt")
 
 
-@app.get("/subx.srt")
-def subx_get():
-    a = request.args
-    u, exp = a.get("u", ""), a.get("exp", "")
-    q = {k: a.get(k, "")[:40] for k in SUBX_KEYS}
-    if (not ok_sub_path(u) or not exp.isdigit() or int(exp) < time.time()
-            or not hmac.compare_digest(a.get("sig", ""), subx_sig(u, q, exp))):
+@app.get("/subx/<tk>/sub.srt")
+def subx_get(tk):
+    try:
+        tok, sig = tk.rsplit(".", 1)
+        if not hmac.compare_digest(sig, sign("subx|" + tok)[:40]):
+            raise ValueError
+        p = json.loads(_b64d(tok))
+        if int(p["exp"]) < time.time() or not ok_sub_path(p["u"]):
+            raise ValueError
+    except Exception:
         return Response("forbidden", status=403, mimetype="text/plain")
     try:
-        shift = max(-600.0, min(600.0, float(q["shift"] or 0)))
-        scale = max(0.8, min(1.25, float(q["scale"] or 1)))
-        season = int(q["s"]) if q["s"].isdigit() else None
-        episode = int(q["e"]) if q["e"].isdigit() else None
-        text, _ = build_sub(u, season, episode, "ar" in q["lang"].lower(), "srt", shift, scale)
+        shift = max(-600.0, min(600.0, float(p.get("shift") or 0)))
+        scale = max(0.8, min(1.25, float(p.get("scale") or 1)))
+        se, ep = str(p.get("s", "")), str(p.get("e", ""))
+        text, _ = build_sub(p["u"], int(se) if se.isdigit() else None, int(ep) if ep.isdigit() else None,
+                            "ar" in str(p.get("lang", "")).lower(), "srt", shift, scale)
     except LookupError as ex:
         return Response(str(ex), status=404, mimetype="text/plain")
     except Exception as ex:
         return Response("subtitle error: " + str(ex)[:120], status=502, mimetype="text/plain")
     return Response(text.encode("utf-8-sig"), content_type="application/x-subrip; charset=utf-8",
-                    headers={"Content-Disposition": 'inline; filename="subtitle.srt"',
-                             "Cache-Control": "private, max-age=3600"})
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.get("/sub")
