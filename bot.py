@@ -233,7 +233,7 @@ def needs_admin(path, method):
 
 @app.before_request
 def guard():
-    open_paths = ("/", "/auth", "/ud/beacon")
+    open_paths = ("/", "/auth", "/ud/beacon", "/subx.srt")
     if request.method == "OPTIONS" or request.path in open_paths:
         return None
     who = read_token(request.headers.get("X-Token", ""))
@@ -3067,6 +3067,57 @@ def subs():
         return jsonify(error="SubDL بطيء، جرّب تاني"), 504
     except Exception as ex:
         return jsonify(error=f"الترجمة: {ex}"), 500
+
+
+SUBX_TTL = 12 * 3600
+SUBX_KEYS = ("shift", "scale", "s", "e", "lang")
+
+
+def subx_sig(u, q, exp):
+    return sign("subx|" + "|".join([u] + [q[k] for k in SUBX_KEYS] + [exp]))
+
+
+@app.get("/sub/link")
+def sub_link():
+    """رابط ترجمة SRT موقّع (12 ساعة) عشان VLC وأي مشغّل خارجي يحمّله من غير تسجيل دخول"""
+    from urllib.parse import urlencode
+    u = request.args.get("u", "")
+    if not ok_sub_path(u):
+        return jsonify(error="رابط ترجمة غير صالح"), 400
+    q = {k: request.args.get(k, "")[:40] for k in SUBX_KEYS}
+    q["shift"], q["scale"] = q["shift"] or "0", q["scale"] or "1"
+    try:
+        float(q["shift"]), float(q["scale"])
+    except ValueError:
+        return jsonify(error="قيم غير صالحة"), 400
+    exp = str(int(time.time()) + SUBX_TTL)
+    proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
+    base = (os.environ.get("PUBLIC_URL") or f"{proto}://{request.host}").rstrip("/")
+    qs = urlencode(dict(q, u=u, exp=exp, sig=subx_sig(u, q, exp)))
+    return jsonify(url=base + "/subx.srt?" + qs)
+
+
+@app.get("/subx.srt")
+def subx_get():
+    a = request.args
+    u, exp = a.get("u", ""), a.get("exp", "")
+    q = {k: a.get(k, "")[:40] for k in SUBX_KEYS}
+    if (not ok_sub_path(u) or not exp.isdigit() or int(exp) < time.time()
+            or not hmac.compare_digest(a.get("sig", ""), subx_sig(u, q, exp))):
+        return Response("forbidden", status=403, mimetype="text/plain")
+    try:
+        shift = max(-600.0, min(600.0, float(q["shift"] or 0)))
+        scale = max(0.8, min(1.25, float(q["scale"] or 1)))
+        season = int(q["s"]) if q["s"].isdigit() else None
+        episode = int(q["e"]) if q["e"].isdigit() else None
+        text, _ = build_sub(u, season, episode, "ar" in q["lang"].lower(), "srt", shift, scale)
+    except LookupError as ex:
+        return Response(str(ex), status=404, mimetype="text/plain")
+    except Exception as ex:
+        return Response("subtitle error: " + str(ex)[:120], status=502, mimetype="text/plain")
+    return Response(text.encode("utf-8-sig"), content_type="application/x-subrip; charset=utf-8",
+                    headers={"Content-Disposition": 'inline; filename="subtitle.srt"',
+                             "Cache-Control": "private, max-age=3600"})
 
 
 @app.get("/sub")
