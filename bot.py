@@ -2777,6 +2777,49 @@ def details():
         return jsonify(error=str(ex)), 500
 
 
+@app.get("/related")
+def related():
+    """أجزاء السلسلة (collection) + أعمال مشابهة من TMDB"""
+    t, i = request.args.get("type"), request.args.get("id")
+    if t not in ("movie", "tv") or not i:
+        return jsonify(error="بيانات ناقصة"), 400
+
+    def card(x, mt):
+        if not x.get("poster_path"):
+            return None
+        d_s = x.get("release_date") or x.get("first_air_date") or ""
+        return {"id": x["id"], "type": mt, "year": d_s[:4],
+                "title": x.get("title") or x.get("name") or "",
+                "poster": img(x.get("poster_path"), "w342")}
+
+    out = {"collection": [], "collection_name": "", "similar": []}
+    try:
+        if t == "movie":
+            a = tmdb_get(f"/movie/{i}", language="ar")
+            col = a.get("belongs_to_collection")
+            if col and col.get("id"):
+                c = tmdb_get(f"/collection/{col['id']}", language="ar")
+                out["collection_name"] = c.get("name") or col.get("name") or ""
+                parts = sorted(c.get("parts", []),
+                               key=lambda x: x.get("release_date") or "9999")
+                out["collection"] = [y for y in (card(p, "movie") for p in parts) if y]
+        seen = {int(i)} | {x["id"] for x in out["collection"]}
+        res = tmdb_get(f"/{t}/{i}/recommendations", language="ar", page=1).get("results", [])
+        if len(res) < 6:
+            res += tmdb_get(f"/{t}/{i}/similar", language="ar", page=1).get("results", [])
+        for x in res:
+            if x["id"] in seen:
+                continue
+            seen.add(x["id"])
+            y = card(x, t)
+            if y:
+                out["similar"].append(y)
+        out["similar"] = out["similar"][:18]
+        return jsonify(**out)
+    except Exception as ex:
+        return jsonify(error=str(ex)), 500
+
+
 @app.get("/season")
 def season():
     i, n = request.args.get("id"), request.args.get("n")
