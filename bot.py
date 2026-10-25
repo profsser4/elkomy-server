@@ -33,7 +33,25 @@ TMDB_KEY = os.environ.get("TMDB_KEY", "")
 SUBDL_KEY = os.environ.get("SUBDL_KEY", "")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "").rstrip("/")
 PROWLARR_KEY = os.environ.get("PROWLARR_KEY", "")
-DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
+def _pick_data_dir():
+    """أول مجلد قابل للكتابة: DATA_DIR ← /data ← . ← /tmp (Vercel بيسمح بالكتابة في /tmp بس)."""
+    cands = [os.environ.get("DATA_DIR", ""), "/data" if os.path.isdir("/data") else "", ".", "/tmp/elkomy"]
+    for d in cands:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            t = os.path.join(d, ".w_test")
+            with open(t, "w") as f:
+                f.write("1")
+            os.remove(t)
+            return d
+        except Exception:
+            continue
+    return "/tmp"
+
+
+DATA_DIR = _pick_data_dir()
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
@@ -111,29 +129,42 @@ NONLAT_RE = re.compile(
 
 # ----------------- المزوّدين (محفوظين في ملف) -----------------
 
+def _env_providers():
+    out = []
+    for t, env in ENV_SEED.items():
+        k = os.environ.get(env, "").strip()
+        if k:
+            out.append({
+                "id": "env_" + t, "type": t, "name": TYPES[t],
+                "key": k, "domains": DEFAULT_DOMAINS.get(t, []),
+            })
+    return out
+
+
 def load():
-    if not os.path.exists(PFILE):
-        seed = []
-        for t, env in ENV_SEED.items():
-            k = os.environ.get(env, "").strip()
-            if k:
-                seed.append({
-                    "id": uuid.uuid4().hex[:8], "type": t, "name": TYPES[t],
-                    "key": k, "domains": DEFAULT_DOMAINS.get(t, []),
-                })
-        if seed:
-            save(seed)
-        return seed
+    """المزوّدين = اللي في الملف + أي مفتاح في Environment Variables (الـ env بيتضاف دايماً لو النوع ده مش موجود).
+    كده حتى لو الملف اتمسح (Vercel/ريستارت) المزوّدين الأساسيين يفضلوا شغّالين."""
+    ps = []
     try:
-        with open(PFILE, encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(PFILE):
+            with open(PFILE, encoding="utf-8") as f:
+                d = json.load(f)
+            ps = d if isinstance(d, list) else []
     except Exception:
-        return []
+        ps = []
+    have = {p.get("type") for p in ps}
+    for e in _env_providers():
+        if e["type"] not in have:
+            ps.append(e)
+    return ps
 
 
 def save(ps):
-    with open(PFILE, "w", encoding="utf-8") as f:
-        json.dump(ps, f, ensure_ascii=False)
+    try:
+        with open(PFILE, "w", encoding="utf-8") as f:
+            json.dump(ps, f, ensure_ascii=False)
+    except Exception:
+        pass   # نظام الملفات للقراءة فقط: مفاتيح الـ env هي المصدر الأساسي
 
 
 def dom(x):
@@ -3130,15 +3161,16 @@ def sub_link():
         return jsonify(error="قيم غير صالحة"), 400
     p = {"u": u, "shift": shift, "scale": scale, "s": request.args.get("s", "")[:6],
          "e": request.args.get("e", "")[:6], "lang": request.args.get("lang", "")[:20],
-         "exp": int(time.time()) + SUBX_TTL}
+         "exp": int(time.time()) + SUBX_TTL,
+         "f": "vtt" if request.args.get("fmt") == "vtt" else "srt"}
     tok = _b64e(json.dumps(p, separators=(",", ":")).encode())
     proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
     base = (os.environ.get("PUBLIC_URL") or f"{proto}://{request.host}").rstrip("/")
-    return jsonify(url=f"{base}/subx/{tok}.{sign('subx|' + tok)[:40]}/sub.srt")
+    return jsonify(url=f"{base}/subx/{tok}.{sign('subx|' + tok)[:40]}/sub.{p['f']}")
 
 
-@app.get("/subx/<tk>/sub.srt")
-def subx_get(tk):
+@app.get("/subx/<tk>/sub.<ext>")
+def subx_get(tk, ext):
     try:
         tok, sig = tk.rsplit(".", 1)
         if not hmac.compare_digest(sig, sign("subx|" + tok)[:40]):
@@ -3153,12 +3185,13 @@ def subx_get(tk):
         scale = max(0.8, min(1.25, float(p.get("scale") or 1)))
         se, ep = str(p.get("s", "")), str(p.get("e", ""))
         text, _ = build_sub(p["u"], int(se) if se.isdigit() else None, int(ep) if ep.isdigit() else None,
-                            "ar" in str(p.get("lang", "")).lower(), "srt", shift, scale)
+                            "ar" in str(p.get("lang", "")).lower(), p.get("f", "srt"), shift, scale)
     except LookupError as ex:
         return Response(str(ex), status=404, mimetype="text/plain")
     except Exception as ex:
         return Response("subtitle error: " + str(ex)[:120], status=502, mimetype="text/plain")
-    return Response(text.encode("utf-8-sig"), content_type="application/x-subrip; charset=utf-8",
+    ctype = "text/vtt" if p.get("f") == "vtt" else "application/x-subrip"
+    return Response(text.encode("utf-8-sig"), content_type=ctype + "; charset=utf-8",
                     headers={"Cache-Control": "private, max-age=3600"})
 
 
