@@ -979,6 +979,8 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
 # AllDebrid بيرفض طلبات السيرفرات وممكن يوقف الحساب، فالسيرفر مايكلّمهوش (التشغيل بيتم من Stremio).
 # لو السيرفر بقى على جهاز في البيت: ALLDEBRID_SERVER=1
 AD_SERVER = os.environ.get("ALLDEBRID_SERVER", "0") == "1"
+# 1 (افتراضي) = روابط إضافات Stremio المربوطة بالدابريد تتشغّل مباشرة. 0 = السيرفر يسحبها على حسابه
+ADDON_DIRECT = os.environ.get("ADDON_DIRECT", "1") == "1"
 SHARE_KEYS = os.environ.get("SHARE_KEYS", "1") == "1"
 TORRENT_TYPES = ("torbox", "debridlink", "realdebrid", "alldebrid")  # الترتيب = الأولوية
 CHECKABLE = ("torbox", "debridlink", "alldebrid")         # بيدعموا فحص "فوري"
@@ -2069,7 +2071,7 @@ def st_streams():
     sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
 
     # AllDebrid بيرفض طلبات السيرفر (NO_SERVER)، فمايتحسبش مزوّد يسحب من عندنا
-    own = any(p["type"] != "alldebrid" for p in torrent_providers())
+    own = (not ADDON_DIRECT) and any(p["type"] != "alldebrid" for p in torrent_providers())
     all_keys = {p["key"] for p in load() if p.get("key")}
     for a_ in st_load()["addons"]:
         all_keys |= {m.group(2) for m in DEBRID_RX.finditer(
@@ -2119,6 +2121,8 @@ def st_streams():
                         direct = ""
                     elif own or (not is_admin and not SHARE_KEYS):
                         continue
+                if keyed and direct and ADDON_DIRECT:
+                    h = ""   # الرابط المباشر الجاهز من الإضافة أولى من سحب التورنت على حسابك (زي 1DM)
                 if not direct and not h:
                     continue
                 fl_eg, fl_dub = dub_flags(" ".join(
