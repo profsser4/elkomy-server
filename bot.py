@@ -981,7 +981,7 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
 AD_SERVER = os.environ.get("ALLDEBRID_SERVER", "0") == "1"
 # 1 (افتراضي) = روابط إضافات Stremio المربوطة بالدابريد تتشغّل مباشرة. 0 = السيرفر يسحبها على حسابه
 ADDON_DIRECT = os.environ.get("ADDON_DIRECT", "1") == "1"
-SHARE_KEYS = os.environ.get("SHARE_KEYS", "1") == "1"
+SHARE_KEYS = True   # الأعضاء دايماً يشوفوا نسخ Stremio ويشغّلوها (متجاهل متغير SHARE_KEYS في البيئة)
 TORRENT_TYPES = ("torbox", "debridlink", "realdebrid", "alldebrid")  # الترتيب = الأولوية
 CHECKABLE = ("torbox", "debridlink", "alldebrid")         # بيدعموا فحص "فوري"
 AD_API = "https://api.alldebrid.com/v4"
