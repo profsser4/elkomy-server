@@ -19,6 +19,8 @@ NAMES = {
     "providers.json", "userdata.json", "stremio.json", "users.json",
     "home.json", "activity.json", "dubbed.json", "push.json",
     "vapid_private.pem", "vapid_public.txt",
+    "clib.json",                       # قسم مكتبتي الخاص (أفلام/مسلسلات/كرتون)
+    "series_map.json", "settings.json",   # كانوا بيضيعوا مع كل ريستارت على Vercel
 }
 UD_RX = re.compile(r"ud_[a-z0-9_.-]{3,20}\.json")
 SCHEMA = (

@@ -500,6 +500,23 @@ def register(app, bot):
         except Exception as ex:
             return "", "تحويل من حسابك: " + str(ex)[:120]
 
+    # ---------- سيرفر التحويل الخاص (اختياري): بيحوّل أي رابط مالوش بث محوَّل لـHLS صوته AAC ----------
+    XC_URL = os.environ.get("TRANSCODE_URL", "").rstrip("/")
+    XC_KEY = os.environ.get("TRANSCODE_KEY", "")
+
+    def _xcode_hls(url, start=0):
+        if not XC_URL or not XC_KEY or not url:
+            return "", ""
+        try:
+            r = requests.post(XC_URL + "/hls/start", json={"url": url, "start": start},
+                              headers={"X-Api-Key": XC_KEY}, timeout=90)
+            j = r.json() if r.content else {}
+            if r.ok and j.get("hls"):
+                return j["hls"], ""
+            return "", "سيرفر التحويل: " + str(j.get("error") or r.status_code)[:140]
+        except Exception as ex:
+            return "", "سيرفر التحويل مش بيرد: " + str(ex)[:100]
+
     @app.post("/play/start")
     def play_start():
         b = request.get_json(silent=True) or {}
@@ -568,6 +585,12 @@ def register(app, bot):
                         resp["hls"], resp["stream_note"], resp["provider"] = u3, "", "TorBox (حسابك)"
                     elif n3:
                         resp["stream_note"] = ((resp["stream_note"] + " | ") if resp["stream_note"] else "") + n3
+                if not resp["hls"] and XC_URL:
+                    u5, n5 = _xcode_hls(d["url"], int(b.get("start") or 0))
+                    if u5:
+                        resp["hls"], resp["stream_note"], resp["provider"] = u5, "", "سيرفر التحويل"
+                    elif n5:
+                        resp["stream_note"] = ((resp["stream_note"] + " | ") if resp["stream_note"] else "") + n5
                 # مفيش HLS: هنفحص الملف الأصلي قبل ما نسلّمه للمتصفح.
                 # لو مش فيديو أصلاً نرجّع 409 فالواجهة تجرّب النسخة اللي بعدها لوحدها بدل ما تعرض "الصيغة مش مدعومة".
                 if not resp["hls"]:
@@ -595,7 +618,48 @@ def register(app, bot):
                 alt = hls_fallback(h, b)
                 if alt:
                     resp["hls"], resp["stream_note"] = alt, ""
+            if not resp["hls"] and XC_URL:
+                u5, n5 = _xcode_hls(d["direct_link"], int(b.get("start") or 0))
+                if u5:
+                    resp["hls"], resp["stream_note"], resp["provider"] = u5, "", "سيرفر التحويل"
+                elif n5:
+                    resp["stream_note"] = ((resp["stream_note"] + " | ") if resp["stream_note"] else "") + n5
         return jsonify(resp)
+
+    @app.post("/play/ext")
+    def play_ext():
+        """بث HLS لمشغّل خارجي (VLC / Just Player...): الصوت AAC + الترجمة العربية جوه البث نفسه."""
+        if not XC_URL or not XC_KEY:
+            return jsonify(error="سيرفر التحويل مش مفعّل"), 501
+        b = request.get_json(silent=True) or {}
+        url = str(b.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            return jsonify(error="رابط غير صالح"), 400
+        sub = b.get("sub") or {}
+        sub_url = ""
+        if isinstance(sub, dict) and str(sub.get("u") or "").startswith("/subtitle/"):
+            try:
+                p = {"u": sub["u"], "shift": float(sub.get("shift") or 0), "scale": float(sub.get("scale") or 1),
+                     "s": str(b.get("s") if b.get("s") is not None else "")[:6],
+                     "e": str(b.get("e") if b.get("e") is not None else "")[:6],
+                     "lang": str(sub.get("lang") or "")[:20], "exp": int(time.time()) + 6 * 3600, "f": "vtt"}
+                tok = bot._b64e(json.dumps(p, separators=(",", ":")).encode())
+                proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
+                base = (os.environ.get("PUBLIC_URL") or f"{proto}://{request.host}").rstrip("/")
+                sub_url = f"{base}/subx/{tok}.{bot.sign('subx|' + tok)[:40]}/sub.vtt"
+            except Exception:
+                sub_url = ""
+        try:
+            r = requests.post(XC_URL + "/hls/start", headers={"X-Api-Key": XC_KEY}, timeout=120,
+                              json={"url": url, "start": int(b.get("start") or 0), "sub": sub_url,
+                                    "sub_name": str(sub.get("name") or "العربية")[:40] if isinstance(sub, dict) else "العربية",
+                                    "sub_lang": "ar"})
+            j = r.json() if r.content else {}
+        except Exception as ex:
+            return jsonify(error="سيرفر التحويل مش بيرد: " + str(ex)[:100]), 502
+        if not r.ok or not j.get("hls"):
+            return jsonify(error="سيرفر التحويل: " + str(j.get("error") or r.status_code)[:140]), 502
+        return jsonify(hls=j["hls"], subs=bool(j.get("subs")), mode=j.get("mode"))
 
     # ---------- تسلسل المسلسل المتضاف (مشترك لكل الأعضاء): tmdb -> {"س:ح": مصدر الحلقة} ----------
     SM_FILE = os.path.join(bot.DATA_DIR, "series_map.json")
@@ -1393,3 +1457,10 @@ def register(app, bot):
     if "search" in app.view_functions:
         orig_search = app.view_functions["search"]
         app.view_functions["search"] = search2
+
+    # ---------- قسم مكتبتي الخاص (أفلام / مسلسلات / كرتون) ----------
+    try:
+        import clib
+        clib.register(app, bot)
+    except Exception as ex:
+        print("clib مش اتسجّل:", ex)
