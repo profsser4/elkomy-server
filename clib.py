@@ -26,6 +26,8 @@ EP_PREFIX = re.compile(r"^\s*[sS](\d{1,2})\s*[eE](\d{1,3})\b[\s:|\-]*")
 SEASON_ONLY = re.compile(r"^\s*[sS](\d{1,2})\s*$")
 MAX_LINKS = 20
 MAX_EPS = 400
+WARM_MAX = 8          # أقصى عدد magnet يتحمّل مسبقًا في حفظة واحدة
+WARM_BUDGET = 25      # ثواني
 BUDGET = 35          # ثواني نجرّب فيها روابط في طلب واحد قبل ما نرجّع للعميل يكمّل
 
 
@@ -148,7 +150,14 @@ def register(app, bot):
                       "year": str(b.get("year") or "").strip()[:8], "links": links, "eps": eps,
                       "t": (old or {}).get("t") or int(time.time())}
             save(d)
-        return jsonify(ok=True, id=iid)
+        # تحميل مسبق: أي magnet جديد مش متخزّن على الدابريت يتضاف لحسابك دلوقتي،
+        # فلما حد يشغّله يلاقيه جاهز (بحدّ أقصى WARM_MAX في الحفظة الواحدة)
+        old_all = set((old or {}).get("links") or [])
+        for x in (old or {}).get("eps") or []:
+            old_all.update(x["links"])
+        fresh = [l for l in links + [l for x in eps for l in x["links"]] if l not in old_all]
+        warming = warm(g.user, g.role, fresh)
+        return jsonify(ok=True, id=iid, warming=warming)
 
     @app.post("/clib/delete")
     def clib_delete():
@@ -163,23 +172,61 @@ def register(app, bot):
         return jsonify(ok=True)
 
     # ---------- تشغيل: السيرفر بيجرّب الروابط بالترتيب ----------
-    def gen(user, role, data):
-        with app.test_request_context("/generate", method="POST", json=data):
-            g.user, g.role = user, role
-            resp = make_response(bot._generate())
+    # وضع التحميل: _generate بيختار مزوّد المشاهدة دايمًا، فبنحوّله لمزوّد التحميل (الملف الأصلي) للطلب ده بس
+    TL = threading.local()
+    _orig_pref = bot.prov_pref
+
+    def _pref(user, mode):
+        return _orig_pref(user, "download" if getattr(TL, "dl", False) else mode)
+    bot.prov_pref = _pref
+
+    def gen(user, role, data, dl=False):
+        TL.dl = dl
+        try:
+            with app.test_request_context("/generate", method="POST", json=data):
+                g.user, g.role = user, role
+                resp = make_response(bot._generate())
+        finally:
+            TL.dl = False
         return resp.status_code, (resp.get_json(silent=True) or {})
+
+    def goes_torbox(l):
+        try:
+            c = bot.candidates(l)
+            return bool(c) and c[0]["type"] == "torbox"
+        except Exception:
+            return False
+
+    def warm(user, role, magnets):
+        started, t0 = 0, time.time()
+        for l in magnets:
+            if started >= WARM_MAX or time.time() - t0 > WARM_BUDGET:
+                break
+            try:
+                if l.startswith("magnet:"):
+                    h = bot.magnet_hash(l)
+                    if h and h in bot.cached_hashes([h]):
+                        continue                  # متخزّن جاهز، مفيش داعي
+                elif not goes_torbox(l):
+                    continue                      # الدابريت السريع بيفكه في ثانية، مفيش داعي
+                code, _ = gen(user, role, {"query": l})
+                if code == 202:                   # اتضاف وبيتحمّل على الدابريت
+                    started += 1
+            except Exception:
+                pass
+        return started
 
     def order_of(links, li, skip):
         idx = [i for i in range(len(links)) if i not in skip]
         slow = set()
-        for i in idx:                      # magnet مش جاهز على المزوّد بيتأجّل لآخر الطابور
+        hs = {i: bot.magnet_hash(links[i]) for i in idx if links[i].startswith("magnet:")}
+        if any(hs.values()):               # طلب واحد لكل الـmagnets، وغير المتخزّن يتأجّل لآخر الطابور
             try:
-                if links[i].startswith("magnet:"):
-                    h = bot.magnet_hash(links[i])
-                    if h and h not in bot.cached_hashes([h]):
-                        slow.add(i)
+                cached = bot.cached_hashes([h for h in hs.values() if h])
             except Exception:
-                pass
+                cached = None
+            if cached is not None:
+                slow = {i for i, h in hs.items() if h and h not in cached}
         idx.sort(key=lambda i: i in slow)
         if li is not None and li in idx:
             idx.remove(li)
@@ -193,6 +240,9 @@ def register(app, bot):
             if lk >= 2:
                 return jsonify(error=msg, nodl=True, lock=2), 403
         b = request.get_json(silent=True) or {}
+        dl = b.get("mode") == "download"
+        if dl and g.role != "admin" and lk >= 1:
+            return jsonify(error=msg, nodl=True, lock=lk), 403
         it = load().get(str(b.get("id") or ""))
         if not it:
             return jsonify(error="العنصر ده اتحذف"), 404
@@ -222,7 +272,7 @@ def register(app, bot):
             if tid and i == li:
                 data["torrent_id"] = tid
             try:
-                code, d = gen(g.user, g.role, data)
+                code, d = gen(g.user, g.role, data, dl)
             except Exception as ex:
                 code, d = 500, {"error": str(ex)[:120]}
             if code == 202:
