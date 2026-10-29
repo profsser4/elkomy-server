@@ -612,8 +612,9 @@ def register(app, bot):
                 "size": d.get("size") or 0, "provider": d.get("provider") or "",
                 "torrent_id": d.get("torrent_id"), "file_id": d.get("file_id"),
                 "stream_note": ""}
+        # لينك المشاهدة (HLS) بيتجاب في المشاهدة والتحميل: لكل ملف لينكين مختلفين (direct للتحميل و hls للمشاهدة)
+        resp["hls"], resp["stream_note"], _ = stream_for(d)
         if mode == "watch":
-            resp["hls"], resp["stream_note"], _ = stream_for(d)
             if not resp["hls"]:
                 alt = hls_fallback(h, b)
                 if alt:

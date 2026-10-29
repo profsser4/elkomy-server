@@ -837,6 +837,25 @@ def tb_link(k, tid, file_id=None, zip_=False):
     raise Exception(dl.get("detail") or dl.get("error") or "TorBox رفض إنشاء الرابط")
 
 
+def tb_hls(k, tid, file_id):
+    """لينك المشاهدة (HLS) من TorBox. بيختلف عن لينك التحميل الأصلي (direct_link)."""
+    note = ""
+    for i in range(2):
+        try:
+            r = tb(k, "GET", "/stream/createstream",
+                   params={"id": tid, "file_id": file_id, "type": "torrent"})
+            d = r.get("data") if isinstance(r, dict) else None
+            u = d.get("hls_url") or d.get("hlsUrl") if isinstance(d, dict) else ""
+            if u:
+                return u, ""
+            note = str((r or {}).get("detail") or (r or {}).get("error") or "TorBox رجّع رد من غير رابط HLS")
+        except Exception as e:
+            note = f"createstream: {str(e)[:100]}"
+        if i == 0:
+            time.sleep(1.5)
+    return "", note
+
+
 def find_existing(k, q):
     m = re.search(r"btih:([a-zA-Z0-9]+)", q, re.I)
     if not m:
@@ -951,6 +970,11 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
             name = f.get("short_name") or (f.get("name") or "").rsplit("/", 1)[-1]
             resp = {"direct_link": url, "name": name, "size": f.get("size"),
                     "provider": p["name"], "torrent_id": tid, "file_id": f["id"]}
+            hl, hn = tb_hls(k, tid, f["id"])
+            if hl:
+                resp["hls"] = hl
+            elif hn:
+                resp["stream_note"] = hn
             if len(vids) > 1:
                 resp["pack"] = True
                 resp["files"] = vids
@@ -964,6 +988,11 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
         url = tb_link(k, tid, main["id"])
         resp = {"direct_link": url, "name": main["name"], "size": main["size"],
                 "provider": p["name"], "torrent_id": tid, "file_id": main["id"]}
+        hl, hn = tb_hls(k, tid, main["id"])
+        if hl:
+            resp["hls"] = hl
+        elif hn:
+            resp["stream_note"] = hn
         if len(vids) > 1:
             resp["pack"] = True
             resp["files"] = vids
