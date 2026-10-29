@@ -68,7 +68,30 @@ LAST = {}
 CAT_CACHE = {}
 MAX_PROFILES = 10
 MAX_ITEMS = 150
-SECRET = os.environ.get("SECRET_KEY") or APP_PASS
+def _load_secret():
+    s = os.environ.get("SECRET_KEY")
+    if s:
+        return s
+    p = os.path.join(DATA_DIR, ".secret")
+    try:
+        with open(p, encoding="utf-8") as f:
+            v = f.read().strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    v = uuid.uuid4().hex + uuid.uuid4().hex
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(v)
+    except OSError:
+        return APP_PASS
+    return v
+
+
+SECRET = _load_secret()
+if APP_PASS == "admin":
+    print("WARNING: APP_PASS الافتراضي (admin). غيّره من Variables فوراً.")
 REFS = {}
 FAILS = {}
 USER_RX = re.compile(r"[a-z0-9_.-]{3,20}")
@@ -389,6 +412,21 @@ def _hide_accounts(o, names):
     elif isinstance(o, list):
         for x in o:
             _hide_accounts(x, names)
+
+
+try:
+    from flask_compress import Compress
+    Compress(app)
+except Exception:
+    pass
+
+
+@app.after_request
+def sec_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return resp
 
 
 @app.after_request
