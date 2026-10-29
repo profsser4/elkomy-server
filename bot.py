@@ -75,7 +75,6 @@ USER_RX = re.compile(r"[a-z0-9_.-]{3,20}")
 
 TYPES = {
     "torbox": "TorBox",
-    "realdebrid": "Real-Debrid",
     "alldebrid": "AllDebrid",
     "premiumize": "Premiumize",
     "1fichier": "1Fichier",
@@ -97,7 +96,7 @@ PRIORITY = {
 ENV_SEED = {
     "debridlink": "DEBRIDLINK_KEY",
     "torbox": "TORBOX_KEY", "1fichier": "ONEFICHIER_KEY",
-    "realdebrid": "REALDEBRID_KEY", "alldebrid": "ALLDEBRID_KEY",
+"alldebrid": "ALLDEBRID_KEY",
     "premiumize": "PREMIUMIZE_KEY",
 }
 
@@ -152,6 +151,7 @@ def load():
             ps = d if isinstance(d, list) else []
     except Exception:
         ps = []
+    ps = [p for p in ps if p.get("type") in TYPES]   # Real-Debrid اتشال من التطبيق: أي مزوّد قديم من نوع مش معروف بيتتجاهل
     have = {p.get("type") for p in ps}
     for e in _env_providers():
         if e["type"] not in have:
@@ -1011,7 +1011,7 @@ AD_SERVER = os.environ.get("ALLDEBRID_SERVER", "0") == "1"
 # 1 (افتراضي) = روابط إضافات Stremio المربوطة بالدابريد تتشغّل مباشرة. 0 = السيرفر يسحبها على حسابه
 ADDON_DIRECT = os.environ.get("ADDON_DIRECT", "1") == "1"
 SHARE_KEYS = True   # الأعضاء دايماً يشوفوا نسخ Stremio ويشغّلوها (متجاهل متغير SHARE_KEYS في البيئة)
-TORRENT_TYPES = ("torbox", "debridlink", "realdebrid", "alldebrid")  # الترتيب = الأولوية
+TORRENT_TYPES = ("torbox", "debridlink", "alldebrid")  # الترتيب = الأولوية
 CHECKABLE = ("torbox", "debridlink", "alldebrid")         # بيدعموا فحص "فوري"
 AD_API = "https://api.alldebrid.com/v4"
 AD_API41 = "https://api.alldebrid.com/v4.1"
@@ -1451,7 +1451,7 @@ def torrent_dispatch(q, tid, file_id=None, want_zip=False, want_all=False, prefe
         return jsonify(error="المزوّد المختار مش متاح أو مش مضاف"), 400
     if not ps:
         return jsonify(
-            error="ضيف مزوّد (TorBox أو Real-Debrid أو Debrid-Link) من الإعدادات الأول"), 400
+            error="ضيف مزوّد (TorBox أو AllDebrid) من الإعدادات الأول"), 400
     last = None
     errs = []
     for p in ps:
