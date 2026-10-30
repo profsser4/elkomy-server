@@ -1701,9 +1701,21 @@ DEBRID_RX = re.compile(
     r"([^/|,;&\s]+)", re.I)
 HASH_RX = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 TBOFF_RX = re.compile(r"stremio\.torbox\.app/([0-9a-fA-F-]{20,})", re.I)
-SEEDS_RX = re.compile(r"👤\s*(\d+)")
-SIZE_RX = re.compile(r"💾\s*([\d.]+)\s*(TB|GB|MB|KB)", re.I)
+SEEDS_RX = re.compile(r"(?:👤|🌱|seeders?|seeds?)\s*[:=]?\s*(\d+)", re.I)
+SIZE_RX = re.compile(r"(\d+(?:[.,]\d+)?)\s*(TiB|GiB|MiB|KiB|TB|GB|MB|KB)\b", re.I)
 UNITS = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def parse_size(text):
+    """أول مساحة في النص بأي شكل: 💾 4.2 GB / Size: 4.2 GiB / 📦 4,2GB ... (0 لو مفيش)."""
+    m = SIZE_RX.search(str(text or ""))
+    if not m:
+        return 0
+    unit = m.group(2).upper().replace("I", "")
+    try:
+        return int(float(m.group(1).replace(",", ".")) * UNITS[unit])
+    except Exception:
+        return 0
 
 
 def st_load():
@@ -2068,6 +2080,50 @@ def ref_get(rid):
     return None
 
 
+SIZE_PROBE = os.environ.get("SIZE_PROBE", "1") != "0"
+
+
+def _probe_one(url):
+    """مساحة الملف من الرابط نفسه (Content-Length) من غير ما نحمّله."""
+    try:
+        h = {"User-Agent": "Mozilla/5.0"}
+        r = requests.head(url, headers=h, timeout=4, allow_redirects=True)
+        n = int(r.headers.get("Content-Length") or 0)
+        if n > 1_000_000:
+            return n
+        h["Range"] = "bytes=0-0"
+        r = requests.get(url, headers=h, timeout=4, allow_redirects=True, stream=True)
+        try:
+            cr = r.headers.get("Content-Range") or ""
+            if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                return int(cr.rsplit("/", 1)[1])
+        finally:
+            r.close()
+    except Exception:
+        pass
+    return 0
+
+
+def probe_sizes(items, cap=10):
+    """النتايج اللي ليها رابط مباشر ومساحتها مجهولة: نجيب المساحة (المدبلج أولاً، بحد أقصى cap)."""
+    if not SIZE_PROBE:
+        return
+    todo = [i for i in items if i.get("ref") and not i.get("size")]
+    todo.sort(key=lambda i: (not i.get("eg"), not i.get("dub")))
+    todo = todo[:cap]
+    if not todo:
+        return
+    try:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            urls = [ref_get(i["ref"]) or "" for i in todo]
+            sizes = list(ex.map(lambda u: _probe_one(u) if u else 0, urls))
+        for i, n in zip(todo, sizes):
+            if n:
+                i["size"] = n
+    except Exception:
+        pass
+
+
 _NOISE_RX = re.compile(
     r"(\(.*?\)|\[.*?\]|\b(19|20)\d{2}\b|مدبلج\w*|دبلج\w*|مترجم\w*|مصري\w*|كلاسيك\w*|كامل\w*|"
     r"\b(4k|uhd|hd|fhd|1080p|720p|dubbed|dub|arabic)\b)", re.I)
@@ -2172,9 +2228,10 @@ def st_streams():
                 nm = (x.get("name") or "").replace("\n", " ").strip()
                 title = (txt.split("\n")[0] or nm or "stream").strip()
                 sm = SEEDS_RX.search(txt)
-                zm = SIZE_RX.search(txt)
-                size = bh.get("videoSize") or (
-                    int(float(zm.group(1)) * UNITS[zm.group(2).upper()]) if zm else 0)
+                size = bh.get("videoSize") or parse_size(
+                    " ".join([txt, nm, str(bh.get("filename") or "")]))
+                if not sm:
+                    sm = SEEDS_RX.search(nm)
                 u = x.get("url") or ""
                 direct = u if u.startswith(("http://", "https://")) else ""
                 keyed = bool(direct) and any(k in unquote(direct) for k in all_keys)
@@ -2215,6 +2272,7 @@ def st_streams():
     with ThreadPoolExecutor(max_workers=6) as ex:
         parts = list(ex.map(one, addons))
     res = [i for p, _ in parts for i in p]
+    probe_sizes(res)
     notes, skipped = [], 0
     for _, n in parts:
         if not n:
