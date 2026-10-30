@@ -275,7 +275,7 @@ def read_token(tok):
 
 
 def needs_admin(path, method):
-    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check")):
+    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check", "/websearch")):
         return True
     if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
                 "/stremio/library"):
@@ -1522,6 +1522,266 @@ def cached():
         return jsonify(cached=sorted(cached_hashes(hs)), nocheck=nocheck)
     except Exception:
         return jsonify(cached=[], nocheck=nocheck)
+
+
+
+# ----------------- بحث الويب عن روابط مدعومة (Serper + فتح الصفحات) -----------------
+# المفتاح في Railway Variables باسم SERPER_KEY. للأدمن بس. السيرفر بيدوّر، يفتح الصفحات، ويطلّع الروابط
+# اللي دومينها مدعوم عند مزوّديك (TorBox / AllDebrid / 1Fichier ...). ما بيحمّلش أي ملف.
+import ipaddress
+import socket
+import html as _html
+from concurrent.futures import as_completed
+
+SERPER_KEY = os.environ.get("SERPER_KEY", "").strip()
+WS_BUILTIN = (
+    "1fichier.com", "mega.nz", "mega.io", "mediafire.com", "rapidgator.net", "katfile.com",
+    "ddownload.com", "nitroflare.com", "turbobit.net", "filefactory.com", "send.cm",
+    "hexload.com", "wupfile.com", "uploadgig.com", "gofile.io", "pixeldrain.com",
+)
+WS_PREFER = ("1fichier.com", "mega.nz", "rapidgator.net", "mediafire.com",
+             "katfile.com", "ddownload.com", "nitroflare.com", "turbobit.net")
+WS_SKIP_PAGES = ("facebook.com", "instagram.com", "youtube.com", "youtu.be", "tiktok.com",
+                 "twitter.com", "x.com", "wikipedia.org", "watchit.com", "elcinema.com",
+                 "imdb.com", "google.com", "t.me", "reddit.com")
+WS_UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) "
+         "Chrome/124.0 Mobile Safari/537.36")
+_DOM_RX = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+_URL_RX = re.compile(r"https?://[^\s\"'<>\\)\]}]+", re.I)
+_HOSTS_CACHE = {"t": 0, "hosts": set(), "info": {}}
+
+
+def _walk_domains(o, out):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if any(x in str(k).lower() for x in ("icon", "logo", "image", "img", "regex")):
+                continue
+            _walk_domains(v, out)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            _walk_domains(v, out)
+    elif isinstance(o, str):
+        x = o.strip().lower()
+        h = (urlparse(x).netloc if "//" in x else x.split("/")[0]).replace("www.", "")
+        if _DOM_RX.match(h):
+            out.add(h)
+
+
+def _host_ok(host, hosts):
+    host = (host or "").lower().replace("www.", "")
+    return next((d for d in hosts if host == d or host.endswith("." + d)), None)
+
+
+def ws_hosts(force=False):
+    """كل الدومينات المدعومة (بتتحدّث كل 24 ساعة): مزوّدينك + قايمة TorBox + قايمة AllDebrid العامة + قايمة جاهزة."""
+    c = _HOSTS_CACHE
+    if not force and c["hosts"] and time.time() - c["t"] < 86400:
+        return c
+    hosts, info = set(WS_BUILTIN), {"جاهزة": len(WS_BUILTIN)}
+    for pv in load():
+        n = set()
+        for d in pv.get("domains", []) or []:
+            _walk_domains(str(d), n)
+        if n:
+            info[pv["name"] if pv.get("name") else pv["type"]] = len(n)
+            hosts |= n
+    tbp = tb_provider()
+    if tbp:
+        try:
+            n = set()
+            _walk_domains((tb(tbp["key"], "GET", "/webdl/hosters") or {}).get("data"), n)
+            info["TorBox"] = len(n)
+            hosts |= n
+        except Exception as ex:
+            info["TorBox"] = "فشل: " + str(ex)[:60]
+    if any(pv["type"] == "alldebrid" for pv in load()):
+        try:    # قايمة عامة من غير مفتاح الحساب، فمفيش خطر على الحساب
+            r = requests.get(AD_API + "/hosts", params={"agent": "Elkomy"}, timeout=15)
+            d = (jj(r).get("data") or {}).get("hosts") or {}
+            n = set()
+            _walk_domains(d, n)
+            info["AllDebrid"] = len(n)
+            hosts |= n
+        except Exception as ex:
+            info["AllDebrid"] = "فشل: " + str(ex)[:60]
+    c.update(t=time.time(), hosts=hosts, info=info)
+    return c
+
+
+def _public_url(u):
+    try:
+        p = urlparse(u)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        for ai in socket.getaddrinfo(p.hostname, None):
+            ip = ipaddress.ip_address(ai[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_goto(u):
+    """روابط جوجل google.com/goto → الرابط الحقيقي من هيدر Location."""
+    if not re.match(r"https?://(www\.)?google\.[a-z.]+/(goto|url)\b", u or "", re.I):
+        return u
+    try:
+        r = requests.get(u, headers={"User-Agent": WS_UA}, timeout=6, allow_redirects=False)
+        loc = r.headers.get("Location")
+        return urljoin(u, loc) if loc else ""
+    except Exception:
+        return ""
+
+
+def _fetch_html(u, limit=1_500_000):
+    """بيفتح الصفحة (حد أقصى 3 تحويلات، وبيرفض العناوين الداخلية). بيرجّع (نص, الرابط النهائي)."""
+    hd = {"User-Agent": WS_UA, "Accept-Language": "ar,en;q=0.8"}
+    for _ in range(4):
+        if not _public_url(u):
+            return None, u
+        r = requests.get(u, headers=hd, timeout=7, allow_redirects=False, stream=True)
+        loc = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            r.close()
+            u = urljoin(u, loc)
+            continue
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code != 200 or not any(x in ct for x in ("html", "text", "json")):
+            r.close()
+            return None, u
+        data = b""
+        for chunk in r.iter_content(65536):
+            data += chunk
+            if len(data) > limit:
+                break
+        r.close()
+        try:
+            return data.decode("utf-8"), u
+        except UnicodeDecodeError:
+            return data.decode("latin-1", errors="ignore"), u
+    return None, u
+
+
+def ws_extract(html_text, page_url, hosts):
+    """كل الروابط المدعومة في كود الصفحة (بما فيها اللي جوه سكريبت أو مكتوبة بـ \\/)."""
+    t = _html.unescape((html_text or "").replace("\\/", "/").replace("\\u0026", "&").replace("\\u003d", "="))
+    ph = urlparse(page_url).netloc.lower().replace("www.", "")
+    out = []
+    for m in _URL_RX.findall(t):
+        u = m.rstrip(".,;:!?'\"")
+        h = urlparse(u).netloc.lower().replace("www.", "")
+        d = _host_ok(h, hosts)
+        if d and h != ph and u not in out:
+            out.append(u)
+    return out
+
+
+def ws_title(html_text):
+    m = re.search(r"<title[^>]*>(.*?)</title>", html_text or "", re.I | re.S)
+    return _html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:120] if m else ""
+
+
+def ws_queries(title, hosts, deep):
+    pref = [h for h in WS_PREFER if _host_ok(h, hosts)][:6] or list(WS_PREFER[:4])
+    qs = [f"{title} ({' OR '.join(pref)})", f"{title} تحميل مباشر"]
+    if deep:
+        qs.append(f"{title} download")
+    return qs
+
+
+def serper(q):
+    r = requests.post("https://google.serper.dev/search",
+                      headers={"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"},
+                      json={"q": q, "num": 10}, timeout=20)
+    if r.status_code in (401, 403):
+        raise Exception("مفتاح Serper مرفوض (راجع SERPER_KEY)")
+    if r.status_code == 429 or r.status_code == 402:
+        raise Exception("رصيد Serper خلص")
+    return (r.json() or {}).get("organic") or []
+
+
+@app.get("/websearch/hosts")
+def websearch_hosts():
+    c = ws_hosts(request.args.get("refresh") == "1")
+    return jsonify(count=len(c["hosts"]), info=c["info"], hosts=sorted(c["hosts"]))
+
+
+@app.post("/websearch")
+def websearch():
+    b = request.get_json(silent=True) or {}
+    title = str(b.get("q") or "").strip()[:120]
+    if not title:
+        return jsonify(error="اكتب اسم العمل"), 400
+    if not SERPER_KEY:
+        return jsonify(error="ضيف SERPER_KEY في Variables بتاعة Railway وأعد التشغيل"), 400
+    hosts = ws_hosts()["hosts"]
+    notes, organic = [], []
+    for q in ws_queries(title, hosts, bool(b.get("deep"))):
+        try:
+            organic += serper(q)
+        except Exception as ex:
+            notes.append(str(ex)[:120])
+            if "مفتاح" in str(ex) or "رصيد" in str(ex):
+                break
+    raw = []
+    seen = set()
+    for o in organic:
+        u = o.get("link") or ""
+        if u and u not in seen:
+            seen.add(u)
+            raw.append((u, o.get("title") or ""))
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        real = list(ex.map(lambda x: _resolve_goto(x[0]), raw))
+    items, direct = [], []
+    for (u0, ttl), u in zip(raw, real):
+        if not u:
+            continue
+        h = urlparse(u).netloc.lower().replace("www.", "")
+        if _host_ok(h, hosts):
+            direct.append({"url": u, "title": ttl, "page": u})
+        elif not _host_ok(h, WS_SKIP_PAGES) and _public_url(u):
+            items.append((u, ttl))
+    items = items[:10]
+
+    pages, found = [], list(direct)
+
+    def work(it):
+        u, ttl = it
+        try:
+            txt, fu = _fetch_html(u)
+            if txt is None:
+                return {"url": u, "title": ttl, "links": [], "status": "مش بيفتح"}
+            return {"url": u, "title": ws_title(txt) or ttl, "links": ws_extract(txt, fu, hosts), "status": "تمام"}
+        except Exception as e:
+            return {"url": u, "title": ttl, "links": [], "status": "فشل: " + str(e)[:50]}
+
+    ex = ThreadPoolExecutor(max_workers=6)
+    futs = [ex.submit(work, it) for it in items]
+    try:
+        for f in as_completed(futs, timeout=28):
+            r = f.result()
+            pages.append({"url": r["url"], "title": r["title"], "found": len(r["links"]), "status": r["status"]})
+            for lk in r["links"]:
+                found.append({"url": lk, "title": r["title"], "page": r["url"]})
+    except Exception:
+        notes.append("بعض الصفحات اتأخرت وسبناها")
+    ex.shutdown(wait=False)
+
+    groups, seen_u = {}, set()
+    for f_ in found:
+        if f_["url"] in seen_u:
+            continue
+        seen_u.add(f_["url"])
+        h = urlparse(f_["url"]).netloc.lower().replace("www.", "")
+        key = _host_ok(h, hosts) or h
+        groups.setdefault(key, []).append(f_)
+    order = {h: i for i, h in enumerate(WS_PREFER)}
+    out = [{"host": h, "links": v[:30]} for h, v in
+           sorted(groups.items(), key=lambda kv: (order.get(kv[0], 99), -len(kv[1])))]
+    return jsonify(groups=out, pages=pages, total=len(seen_u), notes=notes,
+                   searched=len(raw), hosts=len(hosts))
 
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
