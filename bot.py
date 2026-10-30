@@ -1572,12 +1572,44 @@ def _host_ok(host, hosts):
     return next((d for d in hosts if host == d or host.endswith("." + d)), None)
 
 
+_BAD_VALS = ("disabled", "offline", "down", "inactive", "false", "0", "maintenance", "unavailable", "off")
+
+
+def _entry_ok(e):
+    """موقع معطّل مؤقتاً عند المزوّد؟ بنقرأ أي حقل حالة معروف في بيانات الموقع."""
+    if not isinstance(e, dict):
+        return True
+    for k in ("status", "active", "enabled", "working", "online", "available", "is_active", "is_enabled"):
+        if k in e:
+            v = e[k]
+            if v is False:
+                return False
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0:
+                return False
+            if isinstance(v, str) and v.strip().lower() in _BAD_VALS:
+                return False
+    return True
+
+
+def _split_entries(data):
+    """(دومينات شغّالة, دومينات معطّلة) من قايمة مواقع المزوّد."""
+    items = data if isinstance(data, list) else (list(data.values()) if isinstance(data, dict) else [])
+    good, bad = set(), set()
+    for e in items:
+        n = set()
+        _walk_domains(e, n)
+        (good if _entry_ok(e) else bad).update(n)
+    return good, bad
+
+
 def ws_hosts(force=False):
-    """كل الدومينات المدعومة (بتتحدّث كل 24 ساعة): مزوّدينك + قايمة TorBox + قايمة AllDebrid العامة + قايمة جاهزة."""
+    """كل الدومينات المدعومة (بتتحدّث كل 24 ساعة): مزوّدينك + قايمة TorBox + قايمة AllDebrid العامة + قايمة جاهزة.
+    المواقع اللي معطّلة مؤقتاً عند المزوّدين (ومش شغّالة عند غيرهم) بتتشال."""
     c = _HOSTS_CACHE
     if not force and c["hosts"] and time.time() - c["t"] < 86400:
         return c
     hosts, info = set(WS_BUILTIN), {"جاهزة": len(WS_BUILTIN)}
+    good, bad = set(), set()
     for pv in load():
         n = set()
         for d in pv.get("domains", []) or []:
@@ -1585,25 +1617,30 @@ def ws_hosts(force=False):
         if n:
             info[pv["name"] if pv.get("name") else pv["type"]] = len(n)
             hosts |= n
+            good |= n
     tbp = tb_provider()
     if tbp:
         try:
-            n = set()
-            _walk_domains((tb(tbp["key"], "GET", "/webdl/hosters") or {}).get("data"), n)
-            info["TorBox"] = len(n)
-            hosts |= n
+            g, b = _split_entries((tb(tbp["key"], "GET", "/webdl/hosters") or {}).get("data"))
+            info["TorBox"] = len(g) + len(b)
+            hosts |= g | b
+            good |= g
+            bad |= b
         except Exception as ex:
             info["TorBox"] = "فشل: " + str(ex)[:60]
     if any(pv["type"] == "alldebrid" for pv in load()):
         try:    # قايمة عامة من غير مفتاح الحساب، فمفيش خطر على الحساب
             r = requests.get(AD_API + "/hosts", params={"agent": "Elkomy"}, timeout=15)
-            d = (jj(r).get("data") or {}).get("hosts") or {}
-            n = set()
-            _walk_domains(d, n)
-            info["AllDebrid"] = len(n)
-            hosts |= n
+            g, b = _split_entries((jj(r).get("data") or {}).get("hosts") or {})
+            info["AllDebrid"] = len(g) + len(b)
+            hosts |= g | b
+            good |= g
+            bad |= b
         except Exception as ex:
             info["AllDebrid"] = "فشل: " + str(ex)[:60]
+    off = bad - good
+    hosts -= off
+    info["معطّل ومستبعد"] = len(off)
     c.update(t=time.time(), hosts=hosts, info=info)
     return c
 
@@ -1683,6 +1720,26 @@ def ws_title(html_text):
     return _html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:120] if m else ""
 
 
+
+_AR_MAP = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي"})
+_TASHKEEL = re.compile(r"[\u064B-\u0652\u0640]")
+
+
+def _norm(t):
+    return _TASHKEEL.sub("", str(t or "").lower()).translate(_AR_MAP)
+
+
+def ws_rel(query, text):
+    """نسبة كلمات اسم العمل اللي موجودة في النص (بتسامح في اختلاف الكتابة)."""
+    toks = [w for w in re.split(r"\W+", _norm(query)) if len(w) >= 3]
+    toks = [w for w in toks if w not in ("الحلقه", "حلقه", "مسلسل", "فيلم", "episode")]
+    if not toks:
+        return 1.0
+    tx = _norm(text)
+    hit = sum(1 for w in toks if w in tx or (len(w) >= 5 and w[:4] in tx))
+    return hit / len(toks)
+
+
 def ws_queries(title, hosts, deep):
     pref = [h for h in WS_PREFER if _host_ok(h, hosts)][:6] or list(WS_PREFER[:4])
     qs = [f"{title} ({' OR '.join(pref)})", f"{title} تحميل مباشر"]
@@ -1731,29 +1788,34 @@ def websearch():
         u = o.get("link") or ""
         if u and u not in seen:
             seen.add(u)
-            raw.append((u, o.get("title") or ""))
+            raw.append((u, o.get("title") or "", o.get("snippet") or ""))
     with ThreadPoolExecutor(max_workers=8) as ex:
         real = list(ex.map(lambda x: _resolve_goto(x[0]), raw))
-    items, direct = [], []
-    for (u0, ttl), u in zip(raw, real):
+    items, direct, dropped = [], [], 0
+    for (u0, ttl, snip), u in zip(raw, real):
         if not u:
             continue
         h = urlparse(u).netloc.lower().replace("www.", "")
+        rel = ws_rel(title, ttl + " " + snip + " " + unquote(u))
         if _host_ok(h, hosts):
-            direct.append({"url": u, "title": ttl, "page": u})
+            if rel > 0:
+                direct.append({"url": u, "title": ttl, "page": u, "rel": rel})
+            else:
+                dropped += 1       # رابط موقع مدعوم بس مالوش علاقة باسم العمل
         elif not _host_ok(h, WS_SKIP_PAGES) and _public_url(u):
-            items.append((u, ttl))
+            items.append((u, ttl, rel))
+    items.sort(key=lambda it: -it[2])
     items = items[:10]
 
     pages, found = [], list(direct)
 
     def work(it):
-        u, ttl = it
+        u, ttl, rel0 = it
         try:
             txt, fu = _fetch_html(u)
             if txt is None:
                 return {"url": u, "title": ttl, "links": [], "status": "مش بيفتح"}
-            return {"url": u, "title": ws_title(txt) or ttl, "links": ws_extract(txt, fu, hosts), "status": "تمام"}
+            return {"url": u, "title": ws_title(txt) or ttl, "links": ws_extract(txt, fu, hosts), "status": "تمام", "rel": rel0}
         except Exception as e:
             return {"url": u, "title": ttl, "links": [], "status": "فشل: " + str(e)[:50]}
 
@@ -1764,7 +1826,7 @@ def websearch():
             r = f.result()
             pages.append({"url": r["url"], "title": r["title"], "found": len(r["links"]), "status": r["status"]})
             for lk in r["links"]:
-                found.append({"url": lk, "title": r["title"], "page": r["url"]})
+                found.append({"url": lk, "title": r["title"], "page": r["url"], "rel": r.get("rel", 0)})
     except Exception:
         notes.append("بعض الصفحات اتأخرت وسبناها")
     ex.shutdown(wait=False)
@@ -1778,10 +1840,13 @@ def websearch():
         key = _host_ok(h, hosts) or h
         groups.setdefault(key, []).append(f_)
     order = {h: i for i, h in enumerate(WS_PREFER)}
+    for v in groups.values():
+        v.sort(key=lambda x: -x.get("rel", 0))
     out = [{"host": h, "links": v[:30]} for h, v in
            sorted(groups.items(), key=lambda kv: (order.get(kv[0], 99), -len(kv[1])))]
     return jsonify(groups=out, pages=pages, total=len(seen_u), notes=notes,
-                   searched=len(raw), hosts=len(hosts))
+                   searched=len(raw), hosts=len(hosts), dropped=dropped,
+                   off=ws_hosts()["info"].get("معطّل ومستبعد", 0))
 
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
