@@ -3117,7 +3117,12 @@ def home_layout_get():
         if st:
             r["stat"] = st
         out.append(r)
-    return jsonify(rows=out, dub=dub_status(), persist=KV_ON)
+    src, err = "saved", ""
+    try:
+        store_load(HOME_FILE)
+    except Exception as ex:
+        src, err = "default", short_err(ex)
+    return jsonify(rows=out, dub=dub_status(), persist=KV_ON, src=src, err=err)
 
 
 @app.post("/home/layout")
