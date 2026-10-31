@@ -52,6 +52,84 @@ def _pick_data_dir():
 
 
 DATA_DIR = _pick_data_dir()
+
+# ---------------- التخزين الدائم: Upstash Redis (REST) ----------------
+# على Vercel الملفات بتتمسح، فكل بيانات JSON بتتحفظ في Redis لو المتغيرات موجودة.
+# لو مفيش Redis (تشغيل محلي/سيرفر عادي) بيرجع يستخدم ملفات DATA_DIR زي الأول.
+def _env_first(*names):
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return ""
+
+
+KV_URL = _env_first("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL", "STORAGE_KV_REST_API_URL").rstrip("/")
+KV_TOKEN = _env_first("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN", "STORAGE_KV_REST_API_TOKEN")
+KV_ON = bool(KV_URL and KV_TOKEN)
+KV_PREFIX = os.environ.get("KV_PREFIX", "elkomy:")
+_KV_SES = requests.Session()
+
+
+def _kv_cmd(*args):
+    last = None
+    for _ in range(3):
+        try:
+            r = _KV_SES.post(KV_URL, json=list(args),
+                             headers={"Authorization": "Bearer " + KV_TOKEN}, timeout=8)
+            d = r.json()
+            if r.status_code != 200 or "error" in d:
+                raise Exception(str(d.get("error") or r.status_code))
+            return d.get("result")
+        except Exception as e:
+            last = e
+            time.sleep(0.15)
+    raise last
+
+
+def kv_get(name):
+    """بيرجع الـ object المحفوظ أو None لو مفيش. بيرمي Exception لو Redis مش متاح."""
+    v = _kv_cmd("GET", KV_PREFIX + name)
+    return None if v is None else json.loads(v)
+
+
+def kv_set(name, obj):
+    _kv_cmd("SET", KV_PREFIX + name, json.dumps(obj, ensure_ascii=False))
+
+
+def kv_del(name):
+    _kv_cmd("DEL", KV_PREFIX + name)
+
+
+def store_load(path):
+    """قراءة JSON: من Redis (الاسم = اسم الملف) أو من الملف. بيرمي Exception لو مفيش بيانات."""
+    name = os.path.basename(path)
+    if KV_ON:
+        v = kv_get(name)
+        if v is None:
+            raise FileNotFoundError(name)
+        return v
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def store_save(path, d):
+    name = os.path.basename(path)
+    if KV_ON:
+        kv_set(name, d)
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def store_del(path):
+    if KV_ON:
+        kv_del(os.path.basename(path))
+        return
+    os.remove(path)
+
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
@@ -72,6 +150,16 @@ def _load_secret():
     s = os.environ.get("SECRET_KEY")
     if s:
         return s
+    if KV_ON:
+        try:
+            v = _kv_cmd("GET", KV_PREFIX + ".secret")
+            if not v:
+                _kv_cmd("SET", KV_PREFIX + ".secret", uuid.uuid4().hex + uuid.uuid4().hex, "NX")
+                v = _kv_cmd("GET", KV_PREFIX + ".secret")
+            if v:
+                return v
+        except Exception:
+            pass
     p = os.path.join(DATA_DIR, ".secret")
     try:
         with open(p, encoding="utf-8") as f:
@@ -168,10 +256,8 @@ def load():
     كده حتى لو الملف اتمسح (Vercel/ريستارت) المزوّدين الأساسيين يفضلوا شغّالين."""
     ps = []
     try:
-        if os.path.exists(PFILE):
-            with open(PFILE, encoding="utf-8") as f:
-                d = json.load(f)
-            ps = d if isinstance(d, list) else []
+        d = store_load(PFILE)
+        ps = d if isinstance(d, list) else []
     except Exception:
         ps = []
     ps = [p for p in ps if p.get("type") in TYPES]   # Real-Debrid اتشال من التطبيق: أي مزوّد قديم من نوع مش معروف بيتتجاهل
@@ -184,8 +270,7 @@ def load():
 
 def save(ps):
     try:
-        with open(PFILE, "w", encoding="utf-8") as f:
-            json.dump(ps, f, ensure_ascii=False)
+        store_save(PFILE, ps)
     except Exception:
         pass   # نظام الملفات للقراءة فقط: مفاتيح الـ env هي المصدر الأساسي
 
@@ -226,18 +311,14 @@ def jj(r):
 
 def users_load():
     try:
-        with open(USERS_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(USERS_FILE)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
 def users_save(d):
-    tmp = USERS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, USERS_FILE)
+    store_save(USERS_FILE, d)
 
 
 def fp_of(s):
@@ -352,8 +433,7 @@ SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False}
 
 def settings_load():
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(SETTINGS_FILE)
         d = d if isinstance(d, dict) else {}
     except Exception:
         d = {}
@@ -366,10 +446,7 @@ def settings_load():
 
 
 def settings_save(d):
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, SETTINGS_FILE)
+    store_save(SETTINGS_FILE, d)
 
 
 def prov_pref(user, mode):
@@ -573,8 +650,8 @@ def users_del(name):
         us.pop(name)
         users_save(us)
     try:
-        os.remove(ud_path(name))
-    except OSError:
+        store_del(ud_path(name))
+    except Exception:
         pass
     with IPTV_LOCK:
         al = iptv_load()
@@ -592,18 +669,14 @@ IPTV_LOCK = threading.Lock()
 
 def iptv_load():
     try:
-        with open(IPTV_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(IPTV_FILE)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
 def iptv_save(d):
-    tmp = IPTV_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, IPTV_FILE)
+    store_save(IPTV_FILE, d)
 
 
 def iptv_host(h):
@@ -835,8 +908,7 @@ def ud_path(user):
 
 def ud_load(user):
     try:
-        with open(ud_path(user), encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(ud_path(user))
     except Exception:
         d = {}
     if not isinstance(d, dict):
@@ -847,11 +919,7 @@ def ud_load(user):
 
 
 def ud_save(d, user):
-    path = ud_path(user)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    store_save(ud_path(user), d)
 
 
 def ud_merge(base, inc):
@@ -2244,8 +2312,7 @@ def _generate():
 
 def act_load():
     try:
-        with open(ACT_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(ACT_FILE)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
@@ -2269,10 +2336,7 @@ def act_log(user, kind, name, size, prov):
         u["ev"].append({"t": now, "k": kind, "n": name, "s": size,
                         "p": str(prov or "")[:40]})
         del u["ev"][:-300]
-        tmp = ACT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
-        os.replace(tmp, ACT_FILE)
+        store_save(ACT_FILE, d)
 
 
 @app.post("/generate")
@@ -2318,8 +2382,7 @@ def parse_size(text):
 
 def st_load():
     try:
-        with open(SFILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(SFILE)
     except Exception:
         d = {}
     if not isinstance(d, dict):
@@ -2330,10 +2393,7 @@ def st_load():
 
 
 def st_save(d):
-    tmp = SFILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, SFILE)
+    store_save(SFILE, d)
 
 
 def st_post(method, body):
@@ -2999,8 +3059,7 @@ def home_default(d):
 
 def home_layout(d):
     try:
-        with open(HOME_FILE, encoding="utf-8") as f:
-            saved = json.load(f)
+        saved = store_load(HOME_FILE)
     except Exception:
         saved = None
     if not (isinstance(saved, dict) and isinstance(saved.get("rows"), list)):
@@ -3021,8 +3080,7 @@ def home_layout(d):
 
 def dub_load():
     try:
-        with open(DUB_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(DUB_FILE)
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
@@ -3084,10 +3142,7 @@ def home_layout_set():
     for a in d["addons"]:
         for c in a.get("catalogs") or []:
             seen.add(cat_key(a["id"], c["type"], c["id"]))
-    tmp = HOME_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"rows": out, "seen": sorted(seen)}, f, ensure_ascii=False)
-    os.replace(tmp, HOME_FILE)
+    store_save(HOME_FILE, {"rows": out, "seen": sorted(seen)})
     return jsonify(ok=True)
 
 
@@ -3178,10 +3233,7 @@ def _dub_scan():
 
         with ThreadPoolExecutor(max_workers=4) as ex:
             items = [x for x in ex.map(check, cands) if x][:24]
-    tmp = DUB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"t": time.time(), "items": items}, f, ensure_ascii=False)
-    os.replace(tmp, DUB_FILE)
+    store_save(DUB_FILE, {"t": time.time(), "items": items})
 
 
 def start_dub_scan():
@@ -4016,8 +4068,7 @@ VAPID_SUB = os.environ.get("VAPID_EMAIL", "mailto:admin@example.com")
 
 def push_load():
     try:
-        with open(PUSH_FILE, encoding="utf-8") as f:
-            d = json.load(f)
+        d = store_load(PUSH_FILE)
     except Exception:
         d = {}
     if not isinstance(d, dict):
@@ -4028,16 +4079,40 @@ def push_load():
 
 
 def push_save(d):
-    tmp = PUSH_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, PUSH_FILE)
+    store_save(PUSH_FILE, d)
 
 
 def vapid_keys():
-    """مفاتيح VAPID بتتعمل أول مرة وتتحفظ في DATA_DIR"""
-    pem = os.path.join(DATA_DIR, "vapid_private.pem")
+    """مفاتيح VAPID بتتعمل أول مرة وتتحفظ (Redis لو متاح، وإلا DATA_DIR). الـpem بيتكتب في /tmp للاستخدام."""
+    pem = os.path.join(DATA_DIR if not KV_ON else "/tmp", "vapid_private.pem")
     pubf = os.path.join(DATA_DIR, "vapid_public.txt")
+    if KV_ON:
+        try:
+            saved = kv_get("vapid.json")
+        except Exception:
+            saved = None
+        if not (isinstance(saved, dict) and saved.get("pem") and saved.get("pub")):
+            from py_vapid import Vapid
+            from cryptography.hazmat.primitives import serialization
+            v = Vapid()
+            v.generate_keys()
+            v.save_key(pem)
+            raw = v.public_key.public_bytes(
+                serialization.Encoding.X962,
+                serialization.PublicFormat.UncompressedPoint)
+            with open(pem, encoding="utf-8") as f:
+                pem_txt = f.read()
+            saved = {"pem": pem_txt,
+                     "pub": base64.urlsafe_b64encode(raw).rstrip(b"=").decode()}
+            try:
+                _kv_cmd("SET", KV_PREFIX + "vapid.json", json.dumps(saved), "NX")
+                saved = kv_get("vapid.json") or saved
+            except Exception:
+                pass
+        if not os.path.exists(pem) or open(pem, encoding="utf-8").read() != saved["pem"]:
+            with open(pem, "w", encoding="utf-8") as f:
+                f.write(saved["pem"])
+        return pem, saved["pub"]
     if not (os.path.exists(pem) and os.path.exists(pubf)):
         from py_vapid import Vapid
         from cryptography.hazmat.primitives import serialization
