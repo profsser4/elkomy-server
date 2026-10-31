@@ -3163,6 +3163,15 @@ def home_layout_set():
     return jsonify(ok=True, n=len(out), kv=KV_ON)
 
 
+@app.get("/home/ping")
+def home_ping():
+    return jsonify(v="layout-v6", kv=KV_ON, dir=DATA_DIR)
+
+
+app.add_url_rule("/home/layout2", "layout2_get", home_layout_get, methods=["GET"])
+app.add_url_rule("/home/layout2", "layout2_set", home_layout_set, methods=["POST"])
+
+
 def cat_items(a, e):
     key = (a["id"], e["ty"], e["c"], e.get("g", ""))
     hit = CAT_CACHE.get(key)
