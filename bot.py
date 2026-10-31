@@ -4328,3 +4328,283 @@ def st_sync_loop():
 
 if os.environ.get("ST_AUTOSYNC", "1") != "0":
     threading.Thread(target=st_sync_loop, daemon=True).start()
+
+
+# =====================================================================
+# ===== مضاف: تخصيص الرئيسية حسب المشاهدة + browse/hero/interest ======
+# ===== كل راوت بيتسجّل فقط لو مش موجود (مفيش تعارض مع القديم) ========
+# =====================================================================
+_LANG_NAMES = {"ko": "الكوري", "hi": "الهندي", "tr": "التركي", "ar": "العربي", "en": "الإنجليزي",
+               "ja": "الياباني", "es": "الإسباني", "fr": "الفرنسي", "zh": "الصيني", "ta": "التاميل",
+               "te": "التيلجو", "ml": "المالايالام", "th": "التايلاندي", "ru": "الروسي", "de": "الألماني",
+               "it": "الإيطالي", "pt": "البرتغالي", "fa": "الفارسي", "ur": "الأردو"}
+_GENRE_KEYS = {  # key: (اسم, movie id, tv id)
+    "action": ("أكشن", 28, 10759), "drama": ("دراما", 18, 18), "comedy": ("كوميديا", 35, 35),
+    "crime": ("جريمة", 80, 80), "scifi": ("خيال علمي", 878, 10765), "horror": ("رعب", 27, 9648),
+    "romance": ("رومانسي", 10749, 10749), "cartoon": ("كرتون", 16, 16), "family": ("عائلي", 10751, 10751),
+    "doc": ("وثائقي", 99, 99)}
+_META_CACHE = {}
+_FY_CACHE = {}
+
+
+def _ext_has(path):
+    return any(r.rule == path for r in app.url_map.iter_rules())
+
+
+def _add_get(path):
+    def deco(fn):
+        if not _ext_has(path):
+            app.add_url_rule(path, "x_" + fn.__name__, fn, methods=["GET"])
+        return fn
+    return deco
+
+
+def _norm_ty(t):
+    return "tv" if t in ("tv", "series", "show") else "movie"
+
+
+def _meta(ty, tid):
+    k = (ty, tid)
+    if k in _META_CACHE:
+        return _META_CACHE[k]
+    try:
+        d = tmdb_get(f"/{ty}/{tid}", language="en-US")
+        m = {"lang": d.get("original_language") or "", "genres": [g["id"] for g in d.get("genres", [])]}
+    except Exception:
+        m = None
+    if m is not None:
+        _META_CACHE[k] = m
+    return m
+
+
+def _cards(res, default_ty, limit=20, skip_ids=()):
+    out = []
+    for x in res:
+        mt = x.get("media_type") or default_ty
+        if mt not in ("movie", "tv") or not x.get("poster_path") or x.get("id") in skip_ids:
+            continue
+        d_s = x.get("release_date") or x.get("first_air_date") or ""
+        out.append({"id": x["id"], "type": mt, "year": d_s[:4],
+                    "title": x.get("title") or x.get("name") or "",
+                    "poster": img(x.get("poster_path"), "w342")})
+    return out[:limit]
+
+
+def _watch_profile(user, pid):
+    """يجمّع المشاهدات في فئات (نوع + لغة + كرتون/مدبلج) بوزن الأحدث أعلى"""
+    with UD_LOCK:
+        d = ud_load(user)
+    its = [x for x in (d.get("items", {}).get(pid) or {}).values()
+           if isinstance(x, dict) and not x.get("del") and x.get("tmdb")]
+    its.sort(key=lambda x: tnum(x), reverse=True)
+    its = its[:40]
+    try:
+        dub_ids = {x.get("id") for x in dub_items()}
+    except Exception:
+        dub_ids = set()
+    buckets, seen, recent = {}, set(), []
+    for n, x in enumerate(its):
+        ty = _norm_ty(x.get("type"))
+        tid = x.get("tmdb")
+        seen.add(tid)
+        m = _meta(ty, tid)
+        if not m:
+            continue
+        w = 1.0 / (1 + n * 0.15)
+        if str(x.get("key", ""))[:1] == "l":
+            w *= 0.5
+        anim = 16 in m["genres"]
+        if tid in dub_ids:
+            bk = ("dub", "", True)
+        else:
+            bk = (ty, m["lang"], anim)
+        buckets[bk] = buckets.get(bk, 0) + w
+        recent.append((x, ty, m))
+    return recent, buckets, seen
+
+
+@_add_get("/for-you")
+def x_for_you_impl():
+    pid = request.args.get("pid", "")
+    lite = bool(request.args.get("lite"))
+    if not pid or not TMDB_KEY:
+        return jsonify(rows=[])
+    try:
+        recent, buckets, seen = _watch_profile(g.user, pid)
+    except Exception:
+        return jsonify(rows=[])
+    if not buckets:
+        return jsonify(rows=[])
+    ck = (g.user, pid, lite, tuple(sorted((str(k), round(v, 1)) for k, v in buckets.items())))
+    c = _FY_CACHE.get(ck)
+    if c and time.time() - c[0] < 900:
+        return jsonify(rows=c[1])
+    tot = sum(buckets.values()) or 1
+    rows = []
+    for (ty, lg, anim), w in sorted(buckets.items(), key=lambda kv: -kv[1])[:(3 if lite else 5)]:
+        share = w / tot
+        if share < 0.1 and rows:
+            continue
+        if ty == "dub":
+            items = [x for x in dub_items() if x.get("id") not in seen]
+            if len(items) >= 3:
+                rows.append({"title": "🇪🇬 كرتون مدبلج بالمصري ليك", "items": items[:20]})
+            jobs = [("🧸 كرتون وأنيميشن عائلي", "movie", {"with_genres": "16|10751", "with_original_language": "en"})]
+        else:
+            nm = _LANG_NAMES.get(lg, lg)
+            kind = "أفلام" if ty == "movie" else "مسلسلات"
+            if anim:
+                jobs = [(f"🧸 كرتون {nm} ليك" if lg != "en" else "🧸 أفلام كرتون ليك", ty,
+                         {"with_original_language": lg, "with_genres": 16}),
+                        ("🇪🇬 كرتون مدبلج بالمصري", None, None)]
+            else:
+                jobs = [(f"{'🎬' if ty == 'movie' else '📺'} {kind} {nm} ليك", ty,
+                         {"with_original_language": lg, "without_genres": 16}),
+                        (f"⭐ الأعلى تقييماً — {kind} {nm}", ty,
+                         {"with_original_language": lg, "without_genres": 16,
+                          "sort_by": "vote_average.desc", "vote_count.gte": "150"})]
+                if lite:
+                    jobs = jobs[:1]
+        for title, t2, extra in jobs:
+            if t2 is None:   # صف المدبلج لمحبي الكرتون
+                items = [x for x in dub_items() if x.get("id") not in seen]
+                if len(items) >= 3 and not any(r["title"].startswith("🇪🇬") for r in rows):
+                    rows.append({"title": title, "items": items[:20]})
+                continue
+            q = {"language": "ar", "include_adult": "false", "sort_by": "popularity.desc"}
+            q.update(extra)
+            try:
+                items = _cards(tmdb_get("/discover/" + t2, **q).get("results", []), t2, 20, seen)
+            except Exception:
+                continue
+            if len(items) >= 3:
+                rows.append({"title": title, "items": items})
+    for x, ty, m in recent[:2]:
+        try:
+            res = tmdb_get(f"/{ty}/{x['tmdb']}/recommendations", language="ar").get("results", [])
+            items = _cards(res, ty, 20, seen)
+        except Exception:
+            continue
+        if len(items) >= 3:
+            rows.insert(0, {"title": "🎯 علشان شفت " + (x.get("title") or ""), "items": items})
+    _FY_CACHE[ck] = (time.time(), rows)
+    return jsonify(rows=rows)
+
+
+def _discover_page(ty, extra, skip):
+    page = skip // 20 + 1
+    q = {"language": "ar", "include_adult": "false", "sort_by": "popularity.desc", "page": page}
+    q.update(extra)
+    res = tmdb_get("/discover/" + ty, **q)
+    return _cards(res.get("results", []), ty, 40), page < min(res.get("total_pages", 1), 25)
+
+
+@_add_get("/browse")
+def x_browse_impl():
+    a = request.args
+    ty = a.get("type", "")
+    try:
+        skip = int(a.get("skip", "0") or 0)
+    except ValueError:
+        skip = 0
+    gk, lang, k, fresh = a.get("genre", ""), a.get("int", ""), a.get("k", ""), a.get("fresh", "")
+    if k:
+        if k in _GENRE_KEYS:
+            gk = k
+        else:
+            lang = k
+    if fresh:
+        lang = fresh
+    types = [ty] if ty in ("movie", "tv") else ["movie", "tv"]
+    if ty in ("series",):
+        types = ["tv"]
+    items, more = [], False
+    try:
+        for t in types:
+            extra = {}
+            if gk in _GENRE_KEYS:
+                gid = _GENRE_KEYS[gk][1 if t == "movie" else 2]
+                extra["with_genres"] = gid
+            if lang:
+                extra["with_original_language"] = lang
+            if fresh:
+                d0 = date.today()
+                extra["primary_release_date.gte" if t == "movie" else "first_air_date.gte"] = (d0 - timedelta(days=120)).isoformat()
+                extra["primary_release_date.lte" if t == "movie" else "first_air_date.lte"] = d0.isoformat()
+            if gk == "cartoon" and t == "tv":
+                extra["with_genres"] = 16
+            it, mo = _discover_page(t, extra, skip)
+            items += it
+            more = more or mo
+    except Exception as ex:
+        return jsonify(error=str(ex))
+    # دمج الفيلم/المسلسل بالتبادل
+    if len(types) == 2:
+        m_ = [x for x in items if x["type"] == "movie"]
+        t_ = [x for x in items if x["type"] == "tv"]
+        items = [y for pr in zip(m_, t_) for y in pr] + m_[len(t_):] + t_[len(m_):]
+    return jsonify(items=items, skip=skip + 20, more=more)
+
+
+@_add_get("/hero")
+def x_hero_impl():
+    if not TMDB_KEY:
+        return jsonify(items=[])
+    out = []
+    try:
+        for x in tmdb_get("/trending/all/week", language="ar").get("results", []):
+            mt = x.get("media_type")
+            if mt not in ("movie", "tv") or not x.get("backdrop_path"):
+                continue
+            d_s = x.get("release_date") or x.get("first_air_date") or ""
+            out.append({"id": x["id"], "type": mt, "year": d_s[:4],
+                        "title": x.get("title") or x.get("name") or "",
+                        "overview": (x.get("overview") or "")[:220],
+                        "rating": round(x.get("vote_average") or 0, 1),
+                        "backdrop": img(x["backdrop_path"], "w1280"),
+                        "poster": img(x.get("poster_path"), "w342")})
+    except Exception:
+        pass
+    return jsonify(items=out[:8])
+
+
+@_add_get("/interest/list")
+def x_interest_list_impl():
+    items = [{"k": lg, "name": "🌐 " + nm} for lg, nm in _LANG_NAMES.items()]
+    items += [{"k": gk, "name": v[0]} for gk, v in _GENRE_KEYS.items()]
+    return jsonify(items=items)
+
+
+@_add_get("/interest")
+def x_interest_impl():
+    ks = [k for k in request.args.get("k", "").split(",") if k][:6]
+    rows = []
+    for k in ks:
+        try:
+            if k in _GENRE_KEYS:
+                it, _ = _discover_page("movie", {"with_genres": _GENRE_KEYS[k][1]}, 0)
+                title = "⭐ " + _GENRE_KEYS[k][0]
+                rid = k
+            else:
+                it, _ = _discover_page("movie", {"with_original_language": k}, 0)
+                title = "⭐ أفلام " + _LANG_NAMES.get(k, k)
+                rid = "int:" + k
+        except Exception:
+            continue
+        if len(it) >= 3:
+            rows.append({"id": rid, "title": title, "items": it[:20]})
+    return jsonify(rows=rows)
+
+
+@_add_get("/trailer")
+def x_trailer_impl():
+    t, i = request.args.get("type", "movie"), request.args.get("id", "")
+    try:
+        for lng in ("ar", "en-US"):
+            res = tmdb_get(f"/{_norm_ty(t)}/{i}/videos", language=lng).get("results", [])
+            for v in res:
+                if v.get("site") == "YouTube" and v.get("type") in ("Trailer", "Teaser"):
+                    return jsonify(key=v["key"])
+    except Exception:
+        pass
+    return jsonify(key="")
