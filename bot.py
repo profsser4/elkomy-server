@@ -3122,7 +3122,7 @@ def home_layout_get():
 
 @app.post("/home/layout")
 def home_layout_set():
-    d = st_load()
+    d = ensure_catalogs()
     ids = {a["id"] for a in d["addons"]} | {"_dub"}
     rows_in = (request.get_json(silent=True) or {}).get("rows")
     if not isinstance(rows_in, list):
