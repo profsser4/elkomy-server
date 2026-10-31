@@ -275,7 +275,7 @@ def read_token(tok):
 
 
 def needs_admin(path, method):
-    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check", "/websearch")):
+    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check", "/websearch", "/sitesearch")):
         return True
     if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
                 "/stremio/library"):
@@ -1847,6 +1847,130 @@ def websearch():
     return jsonify(groups=out, pages=pages, total=len(seen_u), notes=notes,
                    searched=len(raw), hosts=len(hosts), dropped=dropped,
                    off=ws_hosts()["info"].get("معطّل ومستبعد", 0))
+
+
+
+# ----------------- بحث مباشر في موقع MovizLand (من غير جوجل ومن غير رصيد) -----------------
+MOVIZ = "https://www.moviz.land"
+_MZ_SKIP = ("/ar/", "/free/", "/series/", "/movies/", "/sports/", "/browse/", "/live/", "/kids/",
+            "/login/", "/register/", "/category/", "/tag/", "/page/", "/feed", "/privacy", "/anime/", "/wp-")
+_AR_DIG = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def _mz_clean(t):
+    return _html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t or ""))).strip()
+
+
+def moviz_links(page_html, hosts):
+    """روابط التحميل من صفحة /watch/ (عناصر download-item متقسمة حسب الجودة)."""
+    out = []
+    for grp in re.split(r'class="download-group"', page_html or "")[1:]:
+        qm = re.search(r"download-group-heading.*?<strong>(.*?)</strong>", grp, re.S)
+        q = _mz_clean(qm.group(1)) if qm else ""
+        for tag in re.findall(r"<a\b[^>]*download-item[^>]*>", grp):
+            hm = re.search(r'href="([^"]+)"', tag)
+            if not hm:
+                continue
+            u = _html.unescape(hm.group(1)).strip()
+            h = urlparse(u).netloc.lower().replace("www.", "")
+            d = _host_ok(h, hosts)
+            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
+    return out
+
+
+def _mz_get(u):
+    try:
+        t, _ = _fetch_html(u)
+        return t
+    except Exception:
+        return None
+
+
+def _mz_title(page_html):
+    m = re.search(r'class="watch-title"[^>]*>(.*?)</h1>', page_html or "", re.S)
+    return _mz_clean(m.group(1)) if m else ws_title(page_html)
+
+
+def _mz_expand(post_url, want_nums):
+    """رابط عمل → قايمة (عنوان، رابط /watch/). المسلسل بيتفتح على حلقاته، والفيلم على صفحته."""
+    page = _mz_get(post_url)
+    if page is None:
+        return []
+    eps = []
+    for m in re.finditer(r"<a\b([^>]*episode-card[^>]*)>(.*?)</a>", page, re.S):
+        hm = re.search(r'href="([^"]+)"', m.group(1))
+        if not hm:
+            continue
+        href = _html.unescape(hm.group(1))
+        nm = re.search(r"episode-number[^>]*>\s*([\d٠-٩]+)", m.group(2))
+        no = int(nm.group(1).translate(_AR_DIG)) if nm else None
+        eps.append((no, href, _mz_clean(m.group(2))))
+    if eps:
+        if want_nums:
+            sel = [e for e in eps if e[0] in want_nums] or eps
+        else:
+            sel = eps
+        return [(t, h.rstrip("/") + "/watch/" if not h.rstrip("/").endswith("/watch") else h) for _, h, t in sel[:15]]
+    return [(_mz_title(page) or ws_title(page), post_url.rstrip("/") + "/watch/")]
+
+
+@app.post("/sitesearch")
+def sitesearch():
+    b = request.get_json(silent=True) or {}
+    q = str(b.get("q") or "").strip()[:120]
+    if not q:
+        return jsonify(error="اكتب اسم العمل"), 400
+    hosts = ws_hosts()["hosts"]
+    notes = []
+    sres = _mz_get(MOVIZ + "/?s=" + quote(q))
+    if not sres:
+        return jsonify(error="موقع MovizLand ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
+    cands, seen = [], set()
+    for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", sres, re.S | re.I):
+        hm = re.search(r'href="([^"]+)"', m.group(1))
+        if not hm:
+            continue
+        u = _html.unescape(hm.group(1)).split("#")[0]
+        if not u.startswith(MOVIZ + "/") or u.rstrip("/") == MOVIZ or any(x in u for x in _MZ_SKIP):
+            continue
+        txt = _mz_clean(m.group(2)) + " " + " ".join(re.findall(r'(?:alt|title)="([^"]*)"', m.group(0))) + " " + unquote(u)
+        rel = ws_rel(q, txt)
+        if rel > 0 and u not in seen:
+            seen.add(u)
+            cands.append((rel, u))
+    cands.sort(key=lambda x: -x[0])
+    cands = cands[:5]
+    if not cands:
+        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في الموقع"], found=0)
+
+    nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
+    targets = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for lst in ex.map(lambda c: _mz_expand(c[1], nums), cands):
+            targets += lst
+    targets = targets[:20]
+
+    def work(t):
+        title, wurl = t
+        page = _mz_get(wurl)
+        if not page:
+            return None
+        lks = moviz_links(page, hosts)
+        return {"title": _mz_title(page) or title, "page": wurl, "links": lks}
+
+    items, skipped = [], 0
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for r in ex.map(work, targets):
+            if not r:
+                continue
+            good = [l for l in r["links"] if l["ok"]]
+            skipped += len(r["links"]) - len(good)
+            if good:
+                r["links"] = good
+                items.append(r)
+    if skipped:
+        notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
+    return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
 
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
