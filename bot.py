@@ -4386,6 +4386,7 @@ def _cards(res, default_ty, limit=20, skip_ids=()):
         d_s = x.get("release_date") or x.get("first_air_date") or ""
         out.append({"id": x["id"], "type": mt, "year": d_s[:4],
                     "title": x.get("title") or x.get("name") or "",
+                    "rating": round(x.get("vote_average") or 0, 1),
                     "poster": img(x.get("poster_path"), "w342")})
     return out[:limit]
 
