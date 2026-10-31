@@ -3117,7 +3117,7 @@ def home_layout_get():
         if st:
             r["stat"] = st
         out.append(r)
-    return jsonify(rows=out, dub=dub_status())
+    return jsonify(rows=out, dub=dub_status(), persist=KV_ON)
 
 
 @app.post("/home/layout")
@@ -3138,6 +3138,12 @@ def home_layout_set():
         out.append({"k": k, "a": r["a"], "ty": r["ty"], "c": str(r.get("c", ""))[:80],
                     "g": str(r.get("g", ""))[:40], "t": str(r.get("t", ""))[:60] or "صف",
                     "on": bool(r.get("on"))})
+        subs = []
+        for m in (r.get("m") or [])[:8]:
+            if isinstance(m, dict) and m.get("a") in ids and m.get("ty") in ("movie", "series"):
+                subs.append({"a": m["a"], "ty": m["ty"], "c": str(m.get("c", ""))[:80], "g": str(m.get("g", ""))[:40]})
+        if subs:
+            out[-1]["m"] = subs
     seen = {"dubeg"}
     for a in d["addons"]:
         for c in a.get("catalogs") or []:
@@ -3278,11 +3284,24 @@ def rows():
         if e["a"] == "_dub":
             items = dub_items()
             return {"id": e["k"], "title": e["t"], "items": items} if items else None
-        try:
-            items = cat_items(amap[e["a"]], e)
-        except Exception as ex:
-            CAT_STATS[(e["a"], e["ty"], e["c"], e.get("g", ""))] = {"err": short_err(ex)}
-            return None
+        items, seen_k = [], set()
+        for s_ in [e] + [dict(e, a=m["a"], ty=m["ty"], c=m["c"], g=m.get("g", "")) for m in (e.get("m") or [])]:
+            try:
+                if s_["a"] == "_dub":
+                    part = dub_items()
+                elif s_["a"] in amap:
+                    part = cat_items(amap[s_["a"]], s_)
+                else:
+                    continue
+            except Exception as ex:
+                CAT_STATS[(s_["a"], s_["ty"], s_["c"], s_.get("g", ""))] = {"err": short_err(ex)}
+                continue
+            for x in part:
+                kk = x.get("imdb") or x.get("id") or x.get("title")
+                if kk in seen_k:
+                    continue
+                seen_k.add(kk)
+                items.append(x)
         return {"id": e["k"], "title": e["t"], "items": items} if items else None
 
     with ThreadPoolExecutor(max_workers=6) as ex:
