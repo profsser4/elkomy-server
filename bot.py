@@ -3148,8 +3148,14 @@ def home_layout_set():
     for a in d["addons"]:
         for c in a.get("catalogs") or []:
             seen.add(cat_key(a["id"], c["type"], c["id"]))
-    store_save(HOME_FILE, {"rows": out, "seen": sorted(seen)})
-    return jsonify(ok=True)
+    try:
+        store_save(HOME_FILE, {"rows": out, "seen": sorted(seen)})
+        back = store_load(HOME_FILE)
+        if not isinstance(back, dict) or len(back.get("rows") or []) != len(out):
+            return jsonify(error="التخزين رجّع بيانات مختلفة بعد الحفظ"), 500
+    except Exception as ex:
+        return jsonify(error="فشل الحفظ في التخزين: " + short_err(ex)), 500
+    return jsonify(ok=True, n=len(out), kv=KV_ON)
 
 
 def cat_items(a, e):
