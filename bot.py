@@ -275,7 +275,7 @@ def read_token(tok):
 
 
 def needs_admin(path, method):
-    if path.startswith(("/providers", "/users", "/settings", "/home/", "/activity", "/push/check", "/websearch", "/sitesearch")):
+    if path.startswith(("/providers", "/users", "/iptv/admin", "/settings", "/home/", "/activity", "/push/check", "/websearch", "/sitesearch")):
         return True
     if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
                 "/stremio/library"):
@@ -576,7 +576,156 @@ def users_del(name):
         os.remove(ud_path(name))
     except OSError:
         pass
+    with IPTV_LOCK:
+        al = iptv_load()
+        if al.pop(name, None) is not None:
+            iptv_save(al)
     return jsonify(ok=True)
+
+
+# ----------------- IPTV: حساب خاص لكل عضو (الأدمن بس هو اللي بيضيفه) -----------------
+# السيرفر بيحفظ الهوست/اليوزر/الباس وتاريخ الانتهاء والتثبيتات بس.
+# مفيش أي اتصال بالـIPTV من السيرفر: الـIPTV عايز آيبي مصري، فالجهاز نفسه (التطبيق/المتصفح) هو اللي بيكلمه.
+IPTV_FILE = os.path.join(DATA_DIR, "iptv.json")
+IPTV_LOCK = threading.Lock()
+
+
+def iptv_load():
+    try:
+        with open(IPTV_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def iptv_save(d):
+    tmp = IPTV_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, IPTV_FILE)
+
+
+def iptv_host(h):
+    """بيشيل أي /c/ أو player_api.php أو مسارات زيادة ويسيب http(s)://host:port بس"""
+    h = str(h or "").strip()
+    if not h:
+        return ""
+    if not re.match(r"^https?://", h, re.I):
+        h = "http://" + h
+    try:
+        u = urlparse(h)
+        if not u.hostname:
+            return ""
+        return f"{u.scheme.lower()}://{u.netloc}"[:200]
+    except Exception:
+        return ""
+
+
+def iptv_pub(rec, with_pass=True):
+    if not rec or not rec.get("host"):
+        return {"set": False}
+    o = {"set": True, "host": rec["host"], "user": rec.get("user", ""),
+         "stat": rec.get("stat") or {}}
+    if with_pass:
+        o["pass"] = rec.get("pass", "")
+    return o
+
+
+@app.get("/iptv/cfg")
+def iptv_cfg():
+    rec = iptv_load().get(g.user) or {}
+    return jsonify(iptv_pub(rec))
+
+
+@app.post("/iptv/stat")
+def iptv_stat():
+    """الجهاز بيبلّغ بحالة الاشتراك (تاريخ الانتهاء/عدد الاتصالات) عشان تظهر للأدمن وللعضو"""
+    d = request.get_json(silent=True) or {}
+
+    def num(k):
+        try:
+            return max(0, int(float(d.get(k) or 0)))
+        except (TypeError, ValueError):
+            return 0
+    with IPTV_LOCK:
+        al = iptv_load()
+        rec = al.get(g.user)
+        if not rec or not rec.get("host"):
+            return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
+        rec["stat"] = {"exp": num("exp"), "maxc": num("maxc"), "active": num("active"),
+                       "status": str(d.get("status") or "")[:30],
+                       "trial": bool(d.get("trial")), "t": int(time.time())}
+        iptv_save(al)
+    return jsonify(ok=True)
+
+
+@app.get("/iptv/pins")
+def iptv_pins_get():
+    pid = str(request.args.get("pid", ""))[:40]
+    rec = iptv_load().get(g.user) or {}
+    return jsonify(pins=(rec.get("pins") or {}).get(pid) or {})
+
+
+@app.post("/iptv/pins")
+def iptv_pins_set():
+    """تثبيتات كل بروفايل: {live:[stream_id...], cats:[{k:'live|vod|series', id:'..', n:'اسم'}]}"""
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("pid", ""))[:40]
+    p = d.get("pins") if isinstance(d.get("pins"), dict) else {}
+    live = [str(x)[:20] for x in (p.get("live") or [])][:200]
+    cats = []
+    for c in (p.get("cats") or [])[:60]:
+        if isinstance(c, dict) and c.get("k") in ("live", "vod", "series"):
+            cats.append({"k": c["k"], "id": str(c.get("id", ""))[:20], "n": str(c.get("n", ""))[:80]})
+    if not pid:
+        return jsonify(error="بروفايل ناقص"), 400
+    with IPTV_LOCK:
+        al = iptv_load()
+        rec = al.get(g.user)
+        if not rec or not rec.get("host"):
+            return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
+        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats}
+        iptv_save(al)
+    return jsonify(ok=True)
+
+
+@app.get("/iptv/admin")
+def iptv_admin_list():
+    al = iptv_load()
+    names = sorted(set(users_load().keys()) | {APP_USER.lower()})
+    out = []
+    for n in names:
+        o = iptv_pub(al.get(n))
+        o["name"] = n
+        out.append(o)
+    return jsonify(items=out)
+
+
+@app.post("/iptv/admin/<name>")
+def iptv_admin_set(name):
+    name = name.strip().lower()
+    if name != APP_USER.lower() and name not in users_load():
+        return jsonify(error="المستخدم مش موجود"), 404
+    d = request.get_json(silent=True) or {}
+    with IPTV_LOCK:
+        al = iptv_load()
+        if d.get("clear"):
+            al.pop(name, None)
+            iptv_save(al)
+            return jsonify(ok=True)
+        host = iptv_host(d.get("host"))
+        user = str(d.get("user", "")).strip()[:80]
+        pw = str(d.get("pass", "")).strip()[:80]
+        if not host or not user or not pw:
+            return jsonify(error="الهوست واليوزر والباس كلهم مطلوبين"), 400
+        old = al.get(name) or {}
+        same = old.get("host") == host and old.get("user") == user
+        al[name] = {"host": host, "user": user, "pass": pw,
+                    "stat": old.get("stat") if same else {},
+                    "pins": old.get("pins") or {}}
+        iptv_save(al)
+    return jsonify(ok=True, host=host)
 
 
 @app.get("/providers")
