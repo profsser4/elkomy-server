@@ -545,8 +545,32 @@ def settings_set():
     return jsonify(ok=True, settings=cur)
 
 
+FREE_MSG = "حسابك مجاني: المشاهدة والتحميل متاحين للأعضاء المميزين بس. كلّمني للاشتراك."
+EXPIRED_MSG = "انتهى اشتراكك المميز. كلّمني للتجديد."
+
+
+def plan_of(rec, now=None):
+    """باقة العضو: free (مجاني) / premium (مميز، بمدة أو دائم) / expired (انتهت مدته).
+    الأعضاء القدام (من غير حقل plan) بيتعاملوا كمميز دائم، فمفيش حاجة بتتغيّر عندهم."""
+    now = now or time.time()
+    p = rec.get("plan")
+    try:
+        until = float(rec.get("until") or 0)
+    except (TypeError, ValueError):
+        until = 0.0
+    if p is None:
+        return {"state": "premium", "until": 0, "left": None, "legacy": True}
+    if p == "free":
+        return {"state": "free", "until": 0, "left": None, "legacy": False}
+    if until and until < now:
+        return {"state": "expired", "until": int(until), "left": 0, "legacy": False}
+    left = int((until - now + 86399) // 86400) if until else None
+    return {"state": "premium", "until": int(until), "left": left, "legacy": False}
+
+
 def lock_of(user):
-    """مستوى الصلاحية: 0 عادي، 1 ممنوع التحميل، 2 تصفح فقط (ممنوع المشاهدة والتحميل) + رسالة الأدمن"""
+    """مستوى الصلاحية: 0 عادي، 1 ممنوع التحميل، 2 تصفح فقط (ممنوع المشاهدة والتحميل) + رسالة الأدمن.
+    العضو المجاني أو اللي انتهت مدته المميزة = تصفح فقط تلقائيًا."""
     rec = users_load().get(user) or {}
     lk = rec.get("lock")
     if lk is None:
@@ -556,12 +580,22 @@ def lock_of(user):
     except (TypeError, ValueError):
         lk = 0
     msg = rec.get("nodl_msg") or ("المشاهدة والتحميل مش متاحين لحسابك." if lk >= 2 else "التحميل مش متاح لحسابك.")
+    st = plan_of(rec)["state"]
+    if st in ("free", "expired"):
+        lk = 2
+        if not rec.get("nodl_msg"):
+            msg = FREE_MSG if st == "free" else EXPIRED_MSG
     return lk, msg
 
 
 @app.get("/me")
 def me():
     out = {"user": g.user, "role": g.role}
+    if g.role == "admin":
+        out["plan"] = {"state": "admin", "until": 0, "left": None}
+    else:
+        pl = plan_of(users_load().get(g.user) or {})
+        out["plan"] = {"state": pl["state"], "until": pl["until"], "left": pl["left"]}
     if g.role != "admin":
         lk, msg = lock_of(g.user)
         out["lock"] = lk
@@ -574,10 +608,15 @@ def me():
 @app.get("/users")
 def users_list():
     us = users_load()
-    return jsonify(items=[{"name": n, "c": v.get("c", 0), "lock": lock_of(n)[0],
-                           "msg": v.get("nodl_msg", ""),
-                           "wp": v.get("wp", ""), "dp": v.get("dp", "")}
-                          for n, v in sorted(us.items())])
+    items = []
+    for n, v in sorted(us.items()):
+        pl = plan_of(v)
+        items.append({"name": n, "c": v.get("c", 0), "lock": lock_of(n)[0],
+                      "msg": v.get("nodl_msg", ""),
+                      "wp": v.get("wp", ""), "dp": v.get("dp", ""),
+                      "plan": pl["state"], "until": pl["until"], "left": pl["left"],
+                      "legacy": pl["legacy"]})
+    return jsonify(items=items)
 
 
 @app.post("/users")
@@ -639,6 +678,56 @@ def users_perms(name):
                     us[name][k] = v
         users_save(us)
     return jsonify(ok=True)
+
+
+@app.post("/users/<name>/plan")
+def users_plan(name):
+    """تحديد باقة العضو: plan = free | premium. للمميز: days/months (0 و0 = دائم). extend=true بيزوّد على المدة الحالية."""
+    d = request.get_json(silent=True) or {}
+    plan = str(d.get("plan") or "").strip().lower()
+    if plan not in ("free", "premium"):
+        return jsonify(error="الباقة لازم تكون free أو premium"), 400
+    try:
+        days = max(0, min(36500, int(d.get("days") or 0)))
+        months = max(0, min(1200, int(d.get("months") or 0)))
+    except (TypeError, ValueError):
+        return jsonify(error="المدة لازم تكون أرقام"), 400
+    with USERS_LOCK:
+        us = users_load()
+        if name not in us:
+            return jsonify(error="المستخدم مش موجود"), 404
+        rec = us[name]
+        now = time.time()
+        if plan == "free":
+            rec["plan"] = "free"
+            rec.pop("until", None)
+        else:
+            span = (days + months * 30) * 86400
+            if span <= 0:
+                rec["plan"] = "premium"
+                rec["until"] = 0                     # دائم
+            else:
+                base = now
+                if d.get("extend"):
+                    cur = plan_of(rec, now)
+                    if cur["state"] == "premium" and cur["until"]:
+                        base = cur["until"]
+                rec["plan"] = "premium"
+                rec["until"] = int(base + span)
+        rec["plan_at"] = int(now)
+        users_save(us)
+        pl = plan_of(rec)
+    return jsonify(ok=True, plan=pl["state"], until=pl["until"], left=pl["left"])
+
+
+@app.get("/users/export")
+def users_export():
+    """نسخة احتياطية للأدمن: كل المستخدمين (بالباقات) + سجل النشاط. بتتنزّل كملف JSON."""
+    data = {"users": users_load(), "activity": act_load(), "at": int(time.time())}
+    resp = make_response(json.dumps(data, ensure_ascii=False))
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=elkomy-members-backup.json"
+    return resp
 
 
 @app.delete("/users/<name>")
@@ -753,12 +842,22 @@ def iptv_pins_set():
             cats.append({"k": c["k"], "id": str(c.get("id", ""))[:20], "n": str(c.get("n", ""))[:80]})
     if not pid:
         return jsonify(error="بروفايل ناقص"), 400
+
+    def idmap(x):                      # ترتيب الأقسام وإخفاؤها لكل تبويب (live / vod / series)
+        out = {}
+        if isinstance(x, dict):
+            for k in ("live", "vod", "series"):
+                v = x.get(k)
+                if isinstance(v, list):
+                    out[k] = [str(i)[:20] for i in v][:800]
+        return out
+    order, hidden = idmap(p.get("order")), idmap(p.get("hidden"))
     with IPTV_LOCK:
         al = iptv_load()
         rec = al.get(g.user)
         if not rec or not rec.get("host"):
             return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
-        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats}
+        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats, "order": order, "hidden": hidden}
         iptv_save(al)
     return jsonify(ok=True)
 
@@ -3355,10 +3454,48 @@ def watch_stats(user):
     return secs, titles, last, rows_
 
 
+@app.post("/usage")
+def usage_report():
+    """الصفحة بتبعت كل دقيقة تقريبًا كام ثانية العضو شاهد فيها (بتتجمّع يوميًا). حد أقصى 10 دقايق في المرة."""
+    d = request.get_json(silent=True) or {}
+    try:
+        w = int(float(d.get("w") or 0))
+    except (TypeError, ValueError):
+        return jsonify(error="w لازم رقم"), 400
+    w = max(0, min(w, 600))
+    try:
+        db = int(float(d.get("d") or 0))          # بايتات اتحمّلت فعليًا على الجهاز (من تطبيق الأندرويد)
+    except (TypeError, ValueError):
+        db = 0
+    db = max(0, min(db, 1 << 40))
+    if not w and not db:
+        return jsonify(ok=True)
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 2 * 3600))   # بتوقيت مصر تقريبًا
+    with ACT_LOCK:
+        a = act_load()
+        u = a.setdefault(g.user, {"bytes": 0, "count": 0, "ev": []})
+        u["w"] = int(u.get("w", 0)) + w
+        days = u.setdefault("days", {})
+        days[day] = int(days.get(day, 0)) + w
+        if len(days) > 90:
+            for k in sorted(days)[:-90]:
+                days.pop(k, None)
+        if db:
+            u["dl"] = int(u.get("dl", 0)) + db
+            dd = u.setdefault("ddl", {})
+            dd[day] = int(dd.get(day, 0)) + db
+            if len(dd) > 90:
+                for k in sorted(dd)[:-90]:
+                    dd.pop(k, None)
+        store_save(ACT_FILE, a)
+    return jsonify(ok=True)
+
+
 @app.get("/activity")
 def activity_list():
     admin = APP_USER.lower()
-    names = [(admin, "admin")] + [(n, "user") for n in sorted(users_load())]
+    us = users_load()
+    names = [(admin, "admin")] + [(n, "user") for n in sorted(us)]
     act = act_load()
     out = []
     for n, role in names:
@@ -3366,9 +3503,13 @@ def activity_list():
         secs, titles, last_w, _ = watch_stats(n)
         ev = a.get("ev") or []
         last = max(last_w, ev[-1]["t"] if ev else 0, int(LAST.get(n, 0) * 1000))
+        rec = us.get(n) or {}
+        pl = plan_of(rec) if role == "user" else {"state": "admin", "until": 0, "left": None}
         out.append({"name": n, "role": role, "bytes": a.get("bytes", 0),
                     "count": a.get("count", 0), "watch": secs, "titles": titles,
-                    "last": last})
+                    "last": last, "tw": int(a.get("w", 0)), "dl": int(a.get("dl", 0)),
+                    "plan": pl["state"], "until": pl["until"], "left": pl["left"],
+                    "c": rec.get("c", 0)})
     return jsonify(items=out)
 
 
@@ -3379,8 +3520,24 @@ def activity_user(name):
         return jsonify(error="المستخدم مش موجود"), 404
     a = act_load().get(name, {})
     _, _, _, watched = watch_stats(name)
+    # آخر 14 يوم: وقت المشاهدة المسجَّل + حجم السحب
+    days = {}
+    for i in range(13, -1, -1):
+        k = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 2 * 3600 - i * 86400))
+        days[k] = {"w": int((a.get("days") or {}).get(k, 0)), "b": 0, "n": 0,
+                   "dl": int((a.get("ddl") or {}).get(k, 0))}
+    for e in (a.get("ev") or []):
+        k = time.strftime("%Y-%m-%d", time.gmtime(e.get("t", 0) / 1000 + 2 * 3600))
+        if k in days:
+            days[k]["b"] += int(e.get("s") or 0)
+            days[k]["n"] += 1
+    rec = users_load().get(name) or {}
+    pl = plan_of(rec) if name != APP_USER.lower() else {"state": "admin", "until": 0, "left": None}
     return jsonify(pulls=list(reversed(a.get("ev") or []))[:100], watched=watched[:100],
-                   bytes=a.get("bytes", 0), count=a.get("count", 0))
+                   bytes=a.get("bytes", 0), count=a.get("count", 0),
+                   tw=int(a.get("w", 0)), dl=int(a.get("dl", 0)),
+                   days=[{"d": k, **v} for k, v in days.items()],
+                   plan=pl["state"], until=pl["until"], left=pl["left"], c=rec.get("c", 0))
 
 
 # ----------------- TMDB -----------------
