@@ -4696,6 +4696,73 @@ def _discover_page(ty, extra, skip):
     return _cards(res.get("results", []), ty, 40), page < min(res.get("total_pages", 1), 25)
 
 
+def _metas_to_items(metas, ty):
+    items = []
+    for m in (metas or []):
+        iid = str(m.get("id", ""))
+        if not m.get("poster"):
+            continue
+        it = {"type": "tv" if (m.get("type") or ty) == "series" else "movie",
+              "title": m.get("name") or "", "poster": m["poster"],
+              "year": str(m.get("year") or m.get("releaseInfo") or "")[:4]}
+        if re.fullmatch(r"tt\d+", iid):
+            it["imdb"] = iid
+        elif iid.startswith("tmdb:") and iid[5:].isdigit():
+            it["id"] = int(iid[5:])
+        elif it["title"]:
+            it["lk"] = True
+        else:
+            continue
+        items.append(it)
+    return items
+
+
+def cat_items_page(a, e, skip):
+    """صفحة كاملة من كتالوج إضافة (للمزيد). بترجع (items, raw_count)"""
+    path = f"/catalog/{e['ty']}/{quote(e['c'], safe='')}"
+    extra = []
+    if e.get("g"):
+        extra.append(f"genre={quote(e['g'], safe='')}")
+    if skip:
+        extra.append(f"skip={int(skip)}")
+    if extra:
+        path += "/" + "&".join(extra)
+    r = requests.get(a["base"] + path + ".json", timeout=20,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    metas = r.json().get("metas") or []
+    return _metas_to_items(metas, e["ty"]), len(metas)
+
+
+def browse_row(k, skip):
+    """المزيد بتاع صف من الصفحة الرئيسية (الـ id بتاعه هاش مش لغة). None لو مش صف."""
+    d = ensure_catalogs()
+    ent = next((e for e in home_layout(d) if e.get("k") == k), None)
+    if ent is None:
+        return None
+    if ent.get("a") == "_dub":
+        return jsonify(items=dub_items(), skip=skip, more=False)
+    amap = {a["id"]: a for a in d["addons"]}
+    items, seen, raw_max = [], set(), 0
+    for s_ in [ent] + [dict(ent, a=m["a"], ty=m["ty"], c=m["c"], g=m.get("g", "")) for m in (ent.get("m") or [])]:
+        if s_["a"] == "_dub":
+            part, raw = dub_items(), 0
+        elif s_["a"] in amap:
+            try:
+                part, raw = cat_items_page(amap[s_["a"]], s_, skip)
+            except Exception:
+                continue
+        else:
+            continue
+        raw_max = max(raw_max, raw)
+        for x in part:
+            kk = x.get("imdb") or x.get("id") or x.get("title")
+            if kk not in seen:
+                seen.add(kk)
+                items.append(x)
+    return jsonify(items=items, skip=skip + raw_max, more=raw_max > 0 and skip < 400)
+
+
+
 @_add_get("/browse")
 def x_browse_impl():
     a = request.args
@@ -4705,6 +4772,13 @@ def x_browse_impl():
     except ValueError:
         skip = 0
     gk, lang, k, fresh = a.get("genre", ""), a.get("int", ""), a.get("k", ""), a.get("fresh", "")
+    if k and k not in _GENRE_KEYS and k not in _LANG_NAMES:
+        try:
+            got = browse_row(k, skip)
+        except Exception as ex:
+            return jsonify(error=str(ex))
+        if got is not None:
+            return got
     if k:
         if k in _GENRE_KEYS:
             gk = k
