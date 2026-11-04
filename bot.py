@@ -3542,6 +3542,37 @@ def activity_user(name):
 
 # ----------------- TMDB -----------------
 
+_AR_RE = re.compile(r"[\u0600-\u06FF]")
+
+
+def _ar_variants(q):
+    """صيغ مختلفة للاسم العربي (همزة / ة-ه / ي-ى) عشان البحث ما يفرقش"""
+    q = (q or "").strip()
+    out = [q]
+    if not _AR_RE.search(q):
+        return out
+
+    def add(x):
+        x = re.sub(r"\s+", " ", x).strip()
+        if x and x not in out:
+            out.append(x)
+    f = _norm(q)
+    ws = f.split(" ")
+    add(f)
+    add(" ".join(("\u0623" + w[1:]) if w[:1] == "\u0627" and len(w) > 2 else w for w in ws))
+    add(" ".join(("\u0625" + w[1:]) if w[:1] == "\u0627" and len(w) > 2 else w for w in ws))
+    add(f.replace("\u0627", "\u0623"))
+    add(re.sub(r"\u0647(?=\s|$)", "\u0629", f))
+    add(re.sub(r"\u064a(?=\s|$)", "\u0649", f))
+    return out[:7]
+
+
+def _tmdb_multi(q, lang):
+    return [x for x in tmdb_get("/search/multi", query=q, language=lang,
+                                include_adult="false").get("results", [])
+            if x.get("media_type") in ("movie", "tv")]
+
+
 def tmdb_get(path, **params):
     if not TMDB_KEY:
         raise RuntimeError("TMDB_KEY مش متضاف في Variables على Railway")
@@ -3584,9 +3615,13 @@ def tmdb():
     if not q:
         return jsonify(results=[])
     try:
-        ar = tmdb_get("/search/multi", query=q, language="ar",
-                      include_adult="false").get("results", [])
-        en_list = tmdb_get("/search/multi", query=q, language="en-US",
+        used, ar = q, []
+        for qq in _ar_variants(q):
+            ar = _tmdb_multi(qq, "ar")
+            if ar:
+                used = qq
+                break
+        en_list = tmdb_get("/search/multi", query=used, language="en-US",
                            include_adult="false").get("results", [])
         en = {(i.get("media_type"), i["id"]): i for i in en_list}
         out = []
@@ -3847,7 +3882,28 @@ def search():
     if not q:
         return jsonify(results=[])
     try:
-        out = prowlarr_search(q, CATS.get(request.args.get("cat", "")))
+        cat = CATS.get(request.args.get("cat", ""))
+        out = prowlarr_search(q, cat)
+        if not out and _AR_RE.search(q):
+            # اسم عربي ومفيش نتايج: هات الاسم الإنجليزي من TMDB وابحث بيه
+            tried = set()
+            for qq in _ar_variants(q)[:5]:
+                try:
+                    res = _tmdb_multi(qq, "en-US")
+                except Exception:
+                    break
+                if not res:
+                    continue
+                for x in res[:2]:
+                    nm = x.get("title") or x.get("name") or ""
+                    if not is_latin(nm):
+                        nm = x.get("original_title") or x.get("original_name") or ""
+                    if is_latin(nm) and nm.lower() not in tried:
+                        tried.add(nm.lower())
+                        out = prowlarr_search(nm, cat)
+                        if out:
+                            break
+                break
         return jsonify(results=out[:60])
     except requests.Timeout:
         return jsonify(error="البحث أخد وقت طويل، جرب تاني"), 504
