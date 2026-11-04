@@ -2263,12 +2263,159 @@ def _mz_expand(post_url, want_nums):
     return [(_mz_title(page) or ws_title(page), post_url.rstrip("/") + "/watch/")]
 
 
+
+# ----------------- بحث مباشر في موقع Shoffree (روابط التحميل المدعومة بس) -----------------
+SHOF = "https://shoffree.cc"
+_SF_SKIP1 = {"assets", "ajax", "short", "search", "person", "persons", "plans", "signin", "signup",
+             "explore", "recent", "live", "fullseries", "ramadan", "episodes", "wrestling", "theater",
+             "playlist", "history", "dmca", "manifest.json", "sw.js", "page", "category", "genre"}
+
+
+def _sf_decode(raw):
+    try:
+        raw = unquote(raw).strip()
+        u = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore").strip()
+        return u if u.startswith("http") else None
+    except Exception:
+        return None
+
+
+def shoffree_links(page_html, hosts):
+    """روابط صفحة /download/ : كل قسم 'جودة XXXp' فيه روابط /short?v=base64(الرابط الحقيقي).
+    قسم 'تحميل مباشر' الخاص (VIP) بيتفتح بجافاسكريبت وبحساب مدفوع فبنتخطاه."""
+    out, seen = [], set()
+    for sec in re.split(r'class="quality-section', page_html or "")[1:]:
+        if "private-section" in sec[:40]:
+            continue
+        qm = re.search(r"section-label-d[^>]*>(.*?)</h4>", sec, re.S)
+        q = _mz_clean(qm.group(1)) if qm else ""
+        for m in re.finditer(r'<a\b[^>]*href="([^"]*?/short\?v=([^"&]+))"[^>]*>(.*?)</a>', sec, re.S):
+            u = _sf_decode(m.group(2))
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            h = urlparse(u).netloc.lower().replace("www.", "")
+            d = _host_ok(h, hosts)
+            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
+    return out
+
+
+def _sf_title(page_html):
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", page_html or "", re.S)
+    t = _mz_clean(m.group(1)) if m else ws_title(page_html)
+    return re.sub(r"^تحميل\s+", "", t or "").strip()
+
+
+def _sf_anchors(page, base):
+    """(رابط كامل، نص) لكل لينك داخل شوف فري."""
+    res = []
+    for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", page or "", re.S | re.I):
+        hm = re.search(r'href="([^"]+)"', m.group(1))
+        if not hm:
+            continue
+        u = urljoin(base, _html.unescape(hm.group(1))).split("#")[0]
+        if not u.startswith(SHOF + "/"):
+            continue
+        txt = _mz_clean(m.group(2)) + " " + " ".join(re.findall(r'(?:alt|title)=\"([^\"]*)\"', m.group(0)))
+        res.append((u, txt))
+    return res
+
+
+def _sf_download_pages(post_url, want_nums):
+    """رابط عمل → صفحات /download/ بتاعته (الفيلم مباشرة، والمسلسل حلقة حلقة)."""
+    if "/download/" in post_url:
+        return [post_url]
+    page = _mz_get(post_url)
+    if not page:
+        return []
+    anc = _sf_anchors(page, post_url)
+    dls = []
+    for u, t in anc:
+        if "/download/" in u and u not in dls:
+            dls.append(u)
+    if dls:
+        return dls[:15]
+    # مسلسل: صفحات الحلقات الأول وبعدين زرار التحميل جواها
+    eps = []
+    for u, t in anc:
+        if u == post_url or u in [e[0] for e in eps]:
+            continue
+        low = (u + " " + t).lower()
+        if any(k in low for k in ("episode", "ep-", "حلقة", "حلقه", "الحلقة")):
+            ns = {int(x) for x in re.findall(r"\d+", (t + " " + u).translate(_AR_DIG)) if len(x) <= 4}
+            eps.append((u, ns))
+    if want_nums:
+        eps = [e for e in eps if e[1] & want_nums] or eps
+    out = []
+    for u, _ in eps[:8]:
+        pg = _mz_get(u)
+        if not pg:
+            continue
+        for u2, _t in _sf_anchors(pg, u):
+            if "/download/" in u2 and u2 not in out:
+                out.append(u2)
+                break
+    return out
+
+
+def _shoffree_search(q):
+    hosts = ws_hosts()["hosts"]
+    notes = []
+    sres = _mz_get(SHOF + "/search?query=" + quote(q))
+    if not sres:
+        return jsonify(error="موقع Shoffree ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
+    cands, seen = [], set()
+    for u, txt in _sf_anchors(sres, SHOF + "/search"):
+        segs = [s for s in urlparse(u).path.split("/") if s]
+        if len(segs) < 2 or segs[0] in _SF_SKIP1 or u in seen:
+            continue
+        rel = ws_rel(q, txt + " " + unquote(u))
+        if rel > 0:
+            seen.add(u)
+            cands.append((rel, u))
+    cands.sort(key=lambda x: -x[0])
+    cands = cands[:5]
+    if not cands:
+        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في Shoffree"], found=0)
+
+    nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
+    targets = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for lst in ex.map(lambda c: _sf_download_pages(c[1], nums), cands):
+            for u in lst:
+                if u not in targets:
+                    targets.append(u)
+    targets = targets[:20]
+
+    def work(u):
+        page = _mz_get(u)
+        if not page:
+            return None
+        return {"title": _sf_title(page), "page": u, "links": shoffree_links(page, hosts)}
+
+    items, skipped = [], 0
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for r in ex.map(work, targets):
+            if not r:
+                continue
+            good = [l for l in r["links"] if l["ok"]]
+            skipped += len(r["links"]) - len(good)
+            if good:
+                r["links"] = good
+                items.append(r)
+    if skipped:
+        notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
+    return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
+
+
 @app.post("/sitesearch")
 def sitesearch():
     b = request.get_json(silent=True) or {}
     q = str(b.get("q") or "").strip()[:120]
     if not q:
         return jsonify(error="اكتب اسم العمل"), 400
+    if str(b.get("site") or "") == "shoffree":
+        return _shoffree_search(q)
     hosts = ws_hosts()["hosts"]
     notes = []
     sres = _mz_get(MOVIZ + "/?s=" + quote(q))
