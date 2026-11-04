@@ -4772,6 +4772,15 @@ def x_browse_impl():
     except ValueError:
         skip = 0
     gk, lang, k, fresh = a.get("genre", ""), a.get("int", ""), a.get("k", ""), a.get("fresh", "")
+    if k.startswith("fav:"):
+        try:
+            fk, fty = k[4:].rsplit(":", 1)
+            q = fav_query(fk, fty)
+            if q is not None and fty in ("movie", "tv"):
+                its, mr = _discover_page(fty, q, skip)
+                return jsonify(items=its, skip=skip + 20, more=mr)
+        except Exception as ex:
+            return jsonify(error=str(ex))
     if k and k not in _GENRE_KEYS and k not in _LANG_NAMES:
         try:
             got = browse_row(k, skip)
@@ -4988,8 +4997,10 @@ def build_new():
         ("tv", "all", NEW_MIN_POP_TV, "/discover/tv", {"first_air_date.gte": gt, "first_air_date.lte": tdy}),
         ("tv", "kr", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "KR", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
         ("tv", "in", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "IN", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
+        ("movie", "ar", 1.5, "/discover/movie", {"with_original_language": "ar", "primary_release_date.gte": gm, "primary_release_date.lte": tdy}),
+        ("tv", "ar", 1.5, "/discover/tv", {"with_original_language": "ar", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
     ]
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(lambda j: _new_discover(j[3], j[4]), jobs))
     cand = {}
     for j, res in zip(jobs, results):
@@ -5002,11 +5013,12 @@ def build_new():
     keys = list(cand.keys())
     with ThreadPoolExecutor(max_workers=8) as ex:
         certs = dict(zip(keys, ex.map(lambda k: cert_of(k[0], k[1]), keys)))
-    movies, tvs, toons, hero = [], [], [], []
+    foreign, arabic, toons, hero = [], [], [], []
     for (ty, tid), (x, src) in cand.items():
         c = certs[(ty, tid)]
         d_s = x.get("release_date") or x.get("first_air_date") or ""
-        badge = _FLAGS.get(x.get("original_language") or "", "")
+        lg = x.get("original_language") or ""
+        badge = _FLAGS.get(lg, "")
         if src != "us" and d_s:
             try:
                 badge = (badge + " " + _age_txt((today - date.fromisoformat(d_s)).days)).strip()
@@ -5014,22 +5026,22 @@ def build_new():
                 pass
         it = {"id": tid, "type": ty, "year": d_s[:4], "title": x.get("title") or x.get("name") or "",
               "rating": round(x.get("vote_average") or 0, 1), "poster": img(x.get("poster_path"), "w342"),
-              "badge": badge, "cl": c["label"], "lv": c["lvl"], "pop": x.get("popularity") or 0}
+              "badge": badge, "cl": c["label"], "lv": c["lvl"], "lg": lg, "pop": x.get("popularity") or 0}
         if 16 in (x.get("genre_ids") or []):
             toons.append(it)
-        elif ty == "movie":
-            movies.append(it)
+        elif lg == "ar":
+            arabic.append(it)
         else:
-            tvs.append(it)
+            foreign.append(it)
         if c["ok"] and x.get("backdrop_path") and (x.get("overview") or "").strip():
             hero.append(dict(it, overview=(x.get("overview") or "")[:220], backdrop=img(x["backdrop_path"], "w1280")))
-    for lst in (movies, tvs, toons, hero):
+    for lst in (foreign, arabic, toons, hero):
         lst.sort(key=lambda i: -i["pop"])
     rows = []
-    for rid, title, lst in (("new-movie", "🎬 أفلام جديدة", movies), ("new-tv", "📺 مسلسلات جديدة", tvs), ("new-toon", "🧸 كرتون وأنمي جديد", toons)):
+    for rid, title, lst in (("new-for", "🌍 جديد أجنبي", foreign), ("new-ar", "🇪🇬 جديد عربي", arabic), ("new-toon", "🧸 كرتون وأنمي جديد", toons)):
         if lst:
             rows.append({"id": rid, "title": title, "items": lst[:NEW_ROW_MAX]})
-    return {"rows": rows, "hero": hero[:8]}
+    return {"rows": rows, "hero": hero[:10]}
 
 
 @_add_get("/new")
@@ -5047,6 +5059,120 @@ def x_new_impl():
         return jsonify(rows=[], hero=[], error=str(ex))
     _NEW_CACHE.update(t=now, d=d)
     return jsonify(d)
+
+
+# ================= المفضلة: منصات / لغات / أنواع / أنمي (كل واحد بيطلع له صفين: أفلام + مسلسلات) =================
+_LANG_FEM = {"ar": "عربية", "ko": "كورية", "hi": "هندية", "tr": "تركية", "ja": "يابانية", "zh": "صينية", "en": "إنجليزية",
+             "es": "إسبانية", "fr": "فرنسية", "th": "تايلاندية", "ta": "تاميلية", "te": "تيلجو", "ml": "مالايالام",
+             "ru": "روسية", "de": "ألمانية", "it": "إيطالية", "pt": "برتغالية", "fa": "فارسية", "ur": "أردو"}
+_PROV_RE = [(r"^netflix$", "Netflix"), (r"^shahid", "شاهد VIP"), (r"watch\s?it", "Watch IT"), (r"yango", "Yango Play"),
+            (r"^disney( plus|\+)$", "Disney+"), (r"^amazon prime video$", "Prime Video"), (r"^(hbo )?max$", "Max"),
+            (r"^apple tv( plus|\+)$", "Apple TV+"), (r"^paramount( plus|\+)$", "Paramount+"), (r"^crunchyroll$", "Crunchyroll"),
+            (r"^osn", "OSN+"), (r"^starz", "STARZPLAY"), (r"^viki", "Viki"), (r"^tod$", "TOD"), (r"^hulu$", "Hulu")]
+_PROV_FALLBACK = [(8, "Netflix"), (9, "Prime Video"), (337, "Disney+"), (350, "Apple TV+"), (1899, "Max"), (531, "Paramount+"), (283, "Crunchyroll")]
+_FAV_REGION = "EG"
+_PROV_CACHE = {"t": 0, "d": None}
+_FAV_CACHE = {}
+_FAV_SEEN = {}
+
+
+def fav_providers():
+    if _PROV_CACHE["d"] is not None and time.time() - _PROV_CACHE["t"] < 12 * 3600:
+        return _PROV_CACHE["d"]
+    found, byid = {}, {}
+    try:
+        for ty in ("movie", "tv"):
+            for pr in tmdb_get(f"/watch/providers/{ty}", watch_region=_FAV_REGION, language="en-US").get("results", []):
+                byid.setdefault(pr["provider_id"], pr)
+        for pid, pr in sorted(byid.items()):
+            nm = (pr.get("provider_name") or "").strip().lower()
+            for rx, label in _PROV_RE:
+                if label not in found and re.search(rx, nm):
+                    found[label] = {"k": f"p:{pid}", "name": label, "logo": img(pr.get("logo_path"), "w92")}
+                    break
+    except Exception:
+        found = {}
+    if not found:
+        found = {n: {"k": f"p:{i}", "name": n, "logo": None} for i, n in _PROV_FALLBACK}
+    order = [l for _, l in _PROV_RE]
+    plats = sorted(found.values(), key=lambda x: order.index(x["name"]) if x["name"] in order else 99)
+    missing = [l for l in ("Watch IT", "Yango Play") if l not in found]
+    d = {"platforms": plats, "missing": missing}
+    _PROV_CACHE.update(t=time.time(), d=d)
+    return d
+
+
+@_add_get("/fav/list")
+def x_fav_list_impl():
+    pv = fav_providers()
+    langs = [{"k": "l:" + c, "name": _LANG_FEM[c]} for c in ("ar", "ko", "hi", "tr", "ja", "zh", "en", "es", "fr", "th", "ta", "te", "ml", "ru", "de", "it", "pt", "fa", "ur")]
+    genres = [{"k": "g:" + k, "name": v[0]} for k, v in _GENRE_KEYS.items()]
+    return jsonify(platforms=pv["platforms"], missing=pv["missing"], langs=langs, genres=genres, special=[{"k": "anime", "name": "أنمي"}])
+
+
+def fav_query(key, ty):
+    if key.startswith("l:"):
+        return {"with_original_language": key[2:]}
+    if key.startswith("g:"):
+        g = _GENRE_KEYS.get(key[2:])
+        return {"with_genres": str(g[1] if ty == "movie" else g[2])} if g else None
+    if key == "anime":
+        return {"with_genres": "16", "with_original_language": "ja"}
+    if key.startswith("p:"):
+        return {"with_watch_providers": key[2:], "watch_region": _FAV_REGION, "with_watch_monetization_types": "flatrate"}
+    return None
+
+
+def fav_label(key):
+    if key.startswith("l:"):
+        return _LANG_FEM.get(key[2:], key[2:]), "lang"
+    if key.startswith("g:"):
+        return (_GENRE_KEYS.get(key[2:]) or (key,))[0], "genre"
+    if key == "anime":
+        return "أنمي", "anime"
+    if key.startswith("p:"):
+        for pr in fav_providers()["platforms"]:
+            if pr["k"] == key:
+                return pr["name"], "plat"
+        return key, "plat"
+    return key, ""
+
+
+def _fav_fetch(key, ty):
+    q = fav_query(key, ty)
+    if q is None:
+        return []
+    res = tmdb_get("/discover/" + ty, language="ar", include_adult="false", sort_by="popularity.desc", page=1, **q).get("results", [])
+    lgm = {x["id"]: x.get("original_language") or "" for x in res}
+    items = _cards(res, ty, 20)
+    for it in items:
+        it["lg"] = lgm.get(it["id"], "")
+    return items
+
+
+@_add_get("/fav/rows")
+def x_fav_rows_impl():
+    key = request.args.get("k", "")
+    if not key:
+        return jsonify(rows=[])
+    h = _FAV_CACHE.get(key)
+    if h and time.time() - h[0] < 1800:
+        return jsonify(rows=h[1])
+    name, kind = fav_label(key)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        try:
+            got = list(ex.map(lambda t: _fav_fetch(key, t), ("movie", "tv")))
+        except Exception as e:
+            return jsonify(rows=[], error=str(e))
+    rows = []
+    for ty, items in zip(("movie", "tv"), got):
+        if not items:
+            continue
+        noun = "أفلام" if ty == "movie" else "مسلسلات"
+        title = f"{noun} {name}" if kind in ("lang", "genre") else f"{name} · {noun}"
+        rows.append({"id": f"fav:{key}:{ty}", "title": title, "items": items})
+    _FAV_CACHE[key] = (time.time(), rows)
+    return jsonify(rows=rows)
 
 
 @_add_get("/trailer")
