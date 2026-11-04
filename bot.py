@@ -2405,8 +2405,20 @@ def _shoffree_search(q):
                 items.append(r)
     if skipped:
         notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
+    items = _title_guard(q, items, notes)
     return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
 
+
+
+def _title_guard(q, items, notes):
+    """يستبعد الصفحات اللي اسمها مالوش علاقة بكلمة البحث (الموقع ساعات بيرجّع نتايج مقترحة مش مطابقة)."""
+    toks = [w for w in re.split(r"\W+", _norm(q)) if len(w) >= 3]
+    if not toks:
+        return items
+    keep = [i for i in items if ws_rel(q, (i.get("title") or "") + " " + unquote(i.get("page") or "")) >= 0.5]
+    if len(keep) < len(items):
+        notes.append("استبعدت %d صفحة اسمها مش مطابق لـ «%s»" % (len(items) - len(keep), q))
+    return keep
 
 @app.post("/sitesearch")
 def sitesearch():
