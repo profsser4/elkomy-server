@@ -4867,9 +4867,193 @@ def x_interest_impl():
     return jsonify(rows=rows)
 
 
+# ================= الجديد فقط + التصنيف العمري =================
+NEW_DAYS_MOVIE = 21        # الفيلم يفضل «جديد» كام يوم من نزوله (غيّر الرقم لو عاوز مدة أقل/أكتر)
+NEW_DAYS_TV = 21           # المسلسل/الكرتون: كام يوم من أول عرض
+NEW_MIN_POP_MOVIE = 6      # حد أدنى للشعبية عشان مايظهرش أفلام مجهولة
+NEW_MIN_POP_TV = 4
+NEW_ROW_MAX = 20           # أقصى عدد أعمال في الصف
+_CERT_CACHE = {}
+_NEW_CACHE = {"t": 0, "d": None}
+_LV0 = {"G", "TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "U", "ALL", "AL", "L", "TP"}
+_LV1 = {"PG", "TV-PG", "UA"}
+_LV2 = {"PG-13", "TV-14", "12A"}
+_LV3 = {"R", "TV-MA", "A", "NC-17", "X", "XXX", "R18", "R18+", "R15+", "18+"}
+_FLAGS = {"ko": "🇰🇷", "hi": "🇮🇳", "ta": "🇮🇳", "te": "🇮🇳", "ml": "🇮🇳", "ja": "🇯🇵", "tr": "🇹🇷", "zh": "🇨🇳", "th": "🇹🇭"}
+
+
+def _cert_info(raw, adult=False):
+    c = (raw or "").strip().upper().replace(" ", "")
+    if adult or c in ("NC-17", "X", "XXX", "R18", "R18+"):
+        return "+18", 3
+    if c in _LV0:
+        return "عائلي", 0
+    if c in _LV1:
+        return "بإشراف", 1
+    if c in _LV2:
+        return "+13", 2
+    if c in _LV3:
+        return ("+17" if c in ("R", "TV-MA") else "+18"), 3
+    if c.isdigit():
+        n = int(c)
+        if n <= 7:
+            return "عائلي", 0
+        if n <= 10:
+            return "بإشراف", 1
+        if n <= 14:
+            return "+13", 2
+        return "+" + str(n), 3
+    return "غير مصنّف", -1
+
+
+def cert_of(ty, tid):
+    ty = _norm_ty(ty)
+    k = (ty, str(tid))
+    h = _CERT_CACHE.get(k)
+    if h and time.time() - h[0] < 7 * 86400:
+        return h[1]
+    raw, adult = "", False
+    try:
+        if ty == "movie":
+            d = tmdb_get(f"/movie/{tid}", language="en-US", append_to_response="release_dates")
+            adult = bool(d.get("adult"))
+            res = (d.get("release_dates") or {}).get("results", [])
+            for cc in ("US", "GB", "KR", "IN", "EG", None):
+                for r in res:
+                    if cc and r.get("iso_3166_1") != cc:
+                        continue
+                    for x in r.get("release_dates", []):
+                        if (x.get("certification") or "").strip():
+                            raw = x["certification"]
+                            break
+                    if raw:
+                        break
+                if raw:
+                    break
+        else:
+            d = tmdb_get(f"/tv/{tid}", language="en-US", append_to_response="content_ratings")
+            res = (d.get("content_ratings") or {}).get("results", [])
+            for cc in ("US", "GB", "KR", "IN", "EG", None):
+                for r in res:
+                    if cc and r.get("iso_3166_1") != cc:
+                        continue
+                    if (r.get("rating") or "").strip():
+                        raw = r["rating"]
+                        break
+                if raw:
+                    break
+    except Exception:
+        return {"cert": "", "label": "غير مصنّف", "lvl": -1, "ok": False}
+    label, lvl = _cert_info(raw, adult)
+    info = {"cert": raw, "label": label, "lvl": lvl, "ok": 0 <= lvl <= 2}
+    _CERT_CACHE[k] = (time.time(), info)
+    return info
+
+
+@_add_get("/cert")
+def x_cert_impl():
+    return jsonify(cert_of(request.args.get("type", "movie"), request.args.get("id", "")))
+
+
+def _new_discover(path, q):
+    out = []
+    for pg in (1, 2):
+        try:
+            res = tmdb_get(path, language="ar", include_adult="false", sort_by="popularity.desc", page=pg, **q).get("results", [])
+        except Exception:
+            break
+        out += res
+        if len(res) < 20:
+            break
+    return out
+
+
+def _age_txt(n):
+    if n <= 0:
+        return "النهاردة"
+    if n == 1:
+        return "امبارح"
+    return f"من {n} أيام" if n <= 10 else f"من {n} يوم"
+
+
+def build_new():
+    today = date.today()
+    tdy = today.isoformat()
+    gm = (today - timedelta(days=NEW_DAYS_MOVIE)).isoformat()
+    gt = (today - timedelta(days=NEW_DAYS_TV)).isoformat()
+    jobs = [
+        ("movie", "us", NEW_MIN_POP_MOVIE, "/discover/movie", {"with_release_type": "4|5", "region": "US", "release_date.gte": gm, "release_date.lte": tdy}),
+        ("movie", "kr", NEW_MIN_POP_MOVIE, "/discover/movie", {"with_origin_country": "KR", "primary_release_date.gte": gm, "primary_release_date.lte": tdy}),
+        ("movie", "in", NEW_MIN_POP_MOVIE, "/discover/movie", {"with_origin_country": "IN", "primary_release_date.gte": gm, "primary_release_date.lte": tdy}),
+        ("tv", "all", NEW_MIN_POP_TV, "/discover/tv", {"first_air_date.gte": gt, "first_air_date.lte": tdy}),
+        ("tv", "kr", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "KR", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
+        ("tv", "in", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "IN", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
+    ]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(lambda j: _new_discover(j[3], j[4]), jobs))
+    cand = {}
+    for j, res in zip(jobs, results):
+        for x in res:
+            if not x.get("poster_path") or (x.get("popularity") or 0) < j[2]:
+                continue
+            key = (j[0], x["id"])
+            if key not in cand:
+                cand[key] = (x, j[1])
+    keys = list(cand.keys())
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        certs = dict(zip(keys, ex.map(lambda k: cert_of(k[0], k[1]), keys)))
+    movies, tvs, toons, hero = [], [], [], []
+    for (ty, tid), (x, src) in cand.items():
+        c = certs[(ty, tid)]
+        d_s = x.get("release_date") or x.get("first_air_date") or ""
+        badge = _FLAGS.get(x.get("original_language") or "", "")
+        if src != "us" and d_s:
+            try:
+                badge = (badge + " " + _age_txt((today - date.fromisoformat(d_s)).days)).strip()
+            except Exception:
+                pass
+        it = {"id": tid, "type": ty, "year": d_s[:4], "title": x.get("title") or x.get("name") or "",
+              "rating": round(x.get("vote_average") or 0, 1), "poster": img(x.get("poster_path"), "w342"),
+              "badge": badge, "cl": c["label"], "lv": c["lvl"], "pop": x.get("popularity") or 0}
+        if 16 in (x.get("genre_ids") or []):
+            toons.append(it)
+        elif ty == "movie":
+            movies.append(it)
+        else:
+            tvs.append(it)
+        if c["ok"] and x.get("backdrop_path") and (x.get("overview") or "").strip():
+            hero.append(dict(it, overview=(x.get("overview") or "")[:220], backdrop=img(x["backdrop_path"], "w1280")))
+    for lst in (movies, tvs, toons, hero):
+        lst.sort(key=lambda i: -i["pop"])
+    rows = []
+    for rid, title, lst in (("new-movie", "🎬 أفلام جديدة", movies), ("new-tv", "📺 مسلسلات جديدة", tvs), ("new-toon", "🧸 كرتون وأنمي جديد", toons)):
+        if lst:
+            rows.append({"id": rid, "title": title, "items": lst[:NEW_ROW_MAX]})
+    return {"rows": rows, "hero": hero[:8]}
+
+
+@_add_get("/new")
+def x_new_impl():
+    if not TMDB_KEY:
+        return jsonify(rows=[], hero=[])
+    now = time.time()
+    if _NEW_CACHE["d"] is not None and now - _NEW_CACHE["t"] < 1800:
+        return jsonify(_NEW_CACHE["d"])
+    try:
+        d = build_new()
+    except Exception as ex:
+        if _NEW_CACHE["d"] is not None:
+            return jsonify(_NEW_CACHE["d"])
+        return jsonify(rows=[], hero=[], error=str(ex))
+    _NEW_CACHE.update(t=now, d=d)
+    return jsonify(d)
+
+
 @_add_get("/trailer")
 def x_trailer_impl():
     t, i = request.args.get("type", "movie"), request.args.get("id", "")
+    if request.args.get("auto") == "1" and not cert_of(t, i)["ok"]:
+        return jsonify(key="", blocked=True)      # التشغيل التلقائي: بس للأعمال المصنّفة عائلي/13+
     try:
         for lng in ("ar", "en-US"):
             res = tmdb_get(f"/{_norm_ty(t)}/{i}/videos", language=lng).get("results", [])
