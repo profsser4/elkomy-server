@@ -522,6 +522,39 @@ def mask_for_members(resp):
     return resp
 
 
+IMDBFIX_FILE = os.path.join(DATA_DIR, "imdbfix.json")
+IMDBFIX_LOCK = threading.Lock()
+
+
+@app.get("/imdbfix")
+def imdbfix_get():
+    """أرقام IMDb اللي اتلقت لأعمال مالهاش رقم على TMDB (مشتركة لكل الأعضاء)"""
+    try:
+        return jsonify(map=store_load(IMDBFIX_FILE))
+    except Exception:
+        return jsonify(map={})
+
+
+@app.post("/imdbfix")
+def imdbfix_set():
+    d = request.get_json(silent=True) or {}
+    ty = "tv" if d.get("type") == "tv" else "movie"
+    tid = str(d.get("id") or "").strip()
+    im = str(d.get("imdb") or "").strip()
+    if not tid.isdigit() or not re.fullmatch(r"tt\d{5,10}", im):
+        return jsonify(error="بيانات غلط"), 400
+    with IMDBFIX_LOCK:
+        try:
+            m = store_load(IMDBFIX_FILE)
+        except Exception:
+            m = {}
+        m[ty + ":" + tid] = im
+        if len(m) > 5000:
+            m = dict(list(m.items())[-5000:])
+        store_save(IMDBFIX_FILE, m)
+    return jsonify(ok=True)
+
+
 @app.get("/settings")
 def settings_get():
     ps = [{"id": p["id"], "name": p["name"], "type": p["type"]}
