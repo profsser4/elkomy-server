@@ -2264,135 +2264,107 @@ def _mz_expand(post_url, want_nums):
 
 
 
-# ----------------- بحث مباشر في موقع Shoffree (روابط التحميل المدعومة بس) -----------------
-SHOF = "https://shoffree.cc"
-_SF_SKIP1 = {"assets", "ajax", "short", "search", "person", "persons", "plans", "signin", "signup",
-             "explore", "recent", "live", "fullseries", "ramadan", "episodes", "wrestling", "theater",
-             "playlist", "history", "dmca", "manifest.json", "sw.js", "page", "category", "genre"}
+# ----------------- بحث مباشر في موقع Cimalight (روابط التحميل المدعومة بس) -----------------
+CIMA = "https://e.cimalight.co"
+_CL_STOP = re.compile(r"(الحلقة|الحلقه|حلقة|حلقه|episode|ep)\s*", re.I)
 
 
-def _sf_decode(raw):
-    try:
-        raw = unquote(raw).strip()
-        u = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore").strip()
-        return u if u.startswith("http") else None
-    except Exception:
-        return None
+def _cl_ep(t):
+    m = re.search(r"(?:الحلقة|الحلقه|حلقة|حلقه|episode)\s*(\d+)", (t or "").translate(_AR_DIG), re.I)
+    return int(m.group(1)) if m else None
 
 
-def shoffree_links(page_html, hosts):
-    """روابط صفحة /download/ : كل قسم 'جودة XXXp' فيه روابط /short?v=base64(الرابط الحقيقي).
-    قسم 'تحميل مباشر' الخاص (VIP) بيتفتح بجافاسكريبت وبحساب مدفوع فبنتخطاه."""
-    out, seen = [], set()
-    for sec in re.split(r'class="quality-section', page_html or "")[1:]:
-        if "private-section" in sec[:40]:
-            continue
-        qm = re.search(r"section-label-d[^>]*>(.*?)</h4>", sec, re.S)
-        q = _mz_clean(qm.group(1)) if qm else ""
-        for m in re.finditer(r'<a\b[^>]*href="([^"]*?/short\?v=([^"&]+))"[^>]*>(.*?)</a>', sec, re.S):
-            u = _sf_decode(m.group(2))
-            if not u or u in seen:
-                continue
-            seen.add(u)
-            h = urlparse(u).netloc.lower().replace("www.", "")
-            d = _host_ok(h, hosts)
-            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
-    return out
+def _cl_vid(u):
+    m = re.search(r"watch\.php\?vid=([0-9a-zA-Z]+)", u or "")
+    return m.group(1) if m else None
 
 
-def _sf_title(page_html):
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", page_html or "", re.S)
-    t = _mz_clean(m.group(1)) if m else ws_title(page_html)
-    return re.sub(r"^تحميل\s+", "", t or "").strip()
-
-
-def _sf_anchors(page, base):
-    """(رابط كامل، نص) لكل لينك داخل شوف فري."""
+def _cl_anchors(page, base):
+    """(رابط كامل، نص) لكل لينك داخل سيما لايت."""
     res = []
     for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", page or "", re.S | re.I):
         hm = re.search(r'href="([^"]+)"', m.group(1))
         if not hm:
             continue
         u = urljoin(base, _html.unescape(hm.group(1))).split("#")[0]
-        if not u.startswith(SHOF + "/"):
+        if not u.startswith(CIMA + "/"):
             continue
-        txt = _mz_clean(m.group(2)) + " " + " ".join(re.findall(r'(?:alt|title)=\"([^\"]*)\"', m.group(0)))
+        txt = _mz_clean(m.group(2)) + " " + " ".join(re.findall(r'(?:alt|title)="([^"]*)"', m.group(0)))
         res.append((u, txt))
     return res
 
 
-def _sf_download_pages(post_url, want_nums):
-    """رابط عمل → صفحات /download/ بتاعته.
-    الفيلم: /movie/<slug> ؛ المسلسل: /serie/<slug> وحلقاته /watch/<slug>-episode-N
-    (بنقبل بس روابط الحلقات اللي اسمها بيبدأ باسم المسلسل نفسه، عشان قايمة «أحدث الحلقات» الجانبية ماتدخلش)."""
-    if "/download/" in post_url:
-        return [post_url]
-    path = urlparse(post_url).path.strip("/").split("/")
-    kind, slug = (path[0], path[1]) if len(path) >= 2 else ("", "")
-    page = _mz_get(post_url)
+def _cl_title(page_html):
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", page_html or "", re.S)
+    return _mz_clean(m.group(1)) if m else ws_title(page_html)
+
+
+def cima_links(page_html, hosts):
+    """أقسام 'سيرفرات التحميل 1080P/720P/480P' (download-sec) وفيها روابط downloadlist."""
+    out, seen = [], set()
+    for sec in re.split(r'class="[^"]*download-sec', page_html or "")[1:]:
+        qm = re.search(r"<h4[^>]*>(.*?)</h4>", sec, re.S)
+        q = re.sub(r"^\s*سيرفرات\s+التحميل\s*", "", _mz_clean(qm.group(1))) if qm else ""
+        for m in re.finditer(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', sec, re.S):
+            u = _html.unescape(m.group(1)).strip()
+            if not u.startswith("http") or u.startswith(CIMA) or (u, q) in seen:
+                continue
+            seen.add((u, q))
+            h = urlparse(u).netloc.lower().replace("www.", "")
+            d = _host_ok(h, hosts)
+            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
+    return out
+
+
+def _cl_expand(url, want_nums):
+    """رابط watch.php → قايمة صفحات الحلقات المطلوبة (من قايمة حلقات الموسم) أو الصفحة نفسها."""
+    page = _mz_get(url)
     if not page:
         return []
-    anc = _sf_anchors(page, post_url)
-
-    def first_dl(pg, base):
-        for u2, _t in _sf_anchors(pg, base):
-            if "/download/" in u2:
-                return u2
-        return None
-
-    if kind in ("serie", "series"):
-        pref = SHOF + "/watch/" + slug + "-episode-"
-        eps = {}
-        for u, t in anc:
-            if u.startswith(pref):
-                m = re.match(r"(\d+)", u[len(pref):])
-                if m:
-                    eps[int(m.group(1))] = u
-        for n in want_nums:                       # لو الحلقة مش ظاهرة في الصفحة نجرّب الرابط المتوقع
-            if n not in eps and n < 1000:
-                eps[n] = pref + str(n)
-        if want_nums:
-            eps = {n: u for n, u in eps.items() if n in want_nums}
-        urls = [eps[n] for n in sorted(eps)][:8]
-        out = []
-        for u in urls:
-            pg = _mz_get(u)
-            d = first_dl(pg, u) if pg else None
-            if d and d not in out:
-                out.append(d)
-        return out
-    if kind == "watch":
-        d = first_dl(page, post_url)
-        return [d] if d else []
-    # فيلم (أو أي صفحة تانية): أول زرار تحميل في الصفحة
-    d = first_dl(page, post_url)
-    return [d] if d else []
+    eps = {}
+    for u, t in _cl_anchors(page, url):
+        if _cl_vid(u):
+            n = _cl_ep(t)
+            if n is not None:
+                eps.setdefault(n, u)
+    here = _cl_ep(_cl_title(page))
+    if want_nums and eps:
+        sel = [eps[n] for n in sorted(want_nums) if n in eps]
+        if sel:
+            return sel[:8]
+        if here in want_nums:
+            return [url]
+        return []
+    return [url]
 
 
-def _shoffree_search(q):
+def _cima_search(q):
     hosts = ws_hosts()["hosts"]
     notes = []
-    sres = _mz_get(SHOF + "/search?query=" + quote(q))
+    nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
+    sq = re.sub(r"\d+", " ", _CL_STOP.sub(" ", q.translate(_AR_DIG))).strip() or q
+    sres = _mz_get(CIMA + "/search.php?keywords=" + quote(sq))
     if not sres:
-        return jsonify(error="موقع Shoffree ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
+        return jsonify(error="موقع Cimalight ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
     cands, seen = [], set()
-    for u, txt in _sf_anchors(sres, SHOF + "/search"):
-        segs = [s for s in urlparse(u).path.split("/") if s]
-        if len(segs) < 2 or segs[0] not in ("movie", "serie", "series", "watch", "download") or u in seen or len(txt) > 200:
+    for u, txt in _cl_anchors(sres, CIMA + "/search.php"):
+        vid = _cl_vid(u)
+        if not vid or vid in seen or len(txt) > 300:
             continue
-        rel = ws_rel(q, txt + " " + unquote(u))
+        rel = ws_rel(sq, txt)
         if rel > 0:
-            seen.add(u)
-            cands.append((rel, u))
+            seen.add(vid)
+            ep = _cl_ep(txt)
+            bonus = 0.5 if (nums and ep in nums) else 0
+            cands.append((rel + bonus, CIMA + "/watch.php?vid=" + vid))
     cands.sort(key=lambda x: -x[0])
     cands = cands[:5]
     if not cands:
-        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في Shoffree"], found=0)
+        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في Cimalight"], found=0)
 
-    nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
     targets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
-        for lst in ex.map(lambda c: _sf_download_pages(c[1], nums), cands):
+        for lst in ex.map(lambda c: _cl_expand(c[1], nums), cands):
             for u in lst:
                 if u not in targets:
                     targets.append(u)
@@ -2402,16 +2374,22 @@ def _shoffree_search(q):
         page = _mz_get(u)
         if not page:
             return None
-        return {"title": _sf_title(page), "page": u, "links": shoffree_links(page, hosts),
-                "private": "private-section" in page}
+        lks = cima_links(page, hosts)
+        if not lks:   # لو الروابط في صفحة تانية (زرار تحميل)
+            for u2, t2 in _cl_anchors(page, u):
+                if u2 != u and "download" in u2.lower():
+                    pg2 = _mz_get(u2)
+                    if pg2:
+                        lks = cima_links(pg2, hosts)
+                        if lks:
+                            break
+        return {"title": _cl_title(page), "page": u, "links": lks}
 
-    items, skipped, only_private = [], 0, 0
+    items, skipped = [], 0
     with ThreadPoolExecutor(max_workers=6) as ex:
         for r in ex.map(work, targets):
             if not r:
                 continue
-            if r.get("private") and not r["links"]:
-                only_private += 1
             good = [l for l in r["links"] if l["ok"]]
             skipped += len(r["links"]) - len(good)
             if good:
@@ -2419,11 +2397,8 @@ def _shoffree_search(q):
                 items.append(r)
     if skipped:
         notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
-    if only_private and not items:
-        notes.append("صفحة التحميل لقيتها (%d) بس فيها سيرفر Shoffree المباشر بس، ومفيش روابط مواقع خارجية" % only_private)
-    items = _title_guard(q, items, notes)
+    items = _title_guard(sq, items, notes)
     return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
-
 
 
 def _title_guard(q, items, notes):
@@ -2442,8 +2417,8 @@ def sitesearch():
     q = str(b.get("q") or "").strip()[:120]
     if not q:
         return jsonify(error="اكتب اسم العمل"), 400
-    if str(b.get("site") or "") == "shoffree":
-        return _shoffree_search(q)
+    if str(b.get("site") or "") in ("cimalight", "cima"):
+        return _cima_search(q)
     hosts = ws_hosts()["hosts"]
     notes = []
     sres = _mz_get(MOVIZ + "/?s=" + quote(q))
