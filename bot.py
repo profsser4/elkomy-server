@@ -2214,20 +2214,54 @@ def _mz_clean(t):
     return _html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", t or ""))).strip()
 
 
+_SZ_RX = re.compile(r"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB|ترابايت|جيجا(?:بايت)?|ميجا(?:بايت)?|ج\.?\s?ب|م\.?\s?ب)(?![A-Za-z])", re.I)
+_SZ_UNIT = {"TB": "TB", "ترابايت": "TB", "GB": "GB", "MB": "MB", "KB": "KB"}
+
+
+def _size_txt(t):
+    """أول مساحة مكتوبة في النص (مثلاً 1.4 GB أو 700 ميجا) بصيغة موحّدة، أو فاضي."""
+    m = _SZ_RX.search((t or "").translate(_AR_DIG))
+    if not m:
+        return ""
+    u = m.group(2).upper().replace(" ", "")
+    if u.startswith("جيجا") or u.startswith("ج"):
+        u = "GB"
+    elif u.startswith("ميجا") or u.startswith("م"):
+        u = "MB"
+    else:
+        u = _SZ_UNIT.get(u, u)
+    return m.group(1).replace(",", ".") + " " + u
+
+
+def _q_guess(*texts):
+    """جودة من النص أو الرابط لو الصفحة ماكتبتهاش (2160/1080/720/480/360 أو 4K/HD/CAM)."""
+    t = " ".join(x or "" for x in texts)
+    m = re.search(r"(2160|1440|1080|720|576|480|360)\s*[pP]?(?!\d)", t)
+    if m:
+        return m.group(1) + "P"
+    for k, v in (("4k", "4K"), ("uhd", "4K"), ("bluray", "BluRay"), ("web-dl", "WEB-DL"), ("webrip", "WEBRip"),
+                 ("hdrip", "HDRip"), ("hdcam", "CAM"), ("cam", "CAM")):
+        if re.search(r"(?<![a-z])" + k + r"(?![a-z])", t, re.I):
+            return v
+    return ""
+
+
 def moviz_links(page_html, hosts):
     """روابط التحميل من صفحة /watch/ (عناصر download-item متقسمة حسب الجودة)."""
     out = []
     for grp in re.split(r'class="download-group"', page_html or "")[1:]:
         qm = re.search(r"download-group-heading.*?<strong>(.*?)</strong>", grp, re.S)
         q = _mz_clean(qm.group(1)) if qm else ""
-        for tag in re.findall(r"<a\b[^>]*download-item[^>]*>", grp):
-            hm = re.search(r'href="([^"]+)"', tag)
+        for am in re.finditer(r"<a\b([^>]*download-item[^>]*)>(.*?)</a>", grp, re.S):
+            hm = re.search(r'href="([^"]+)"', am.group(1))
             if not hm:
                 continue
             u = _html.unescape(hm.group(1)).strip()
             h = urlparse(u).netloc.lower().replace("www.", "")
             d = _host_ok(h, hosts)
-            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
+            inner = _mz_clean(am.group(2))
+            out.append({"url": u, "host": d or h, "quality": q or _q_guess(inner, u),
+                        "size": _size_txt(inner) or _size_txt(q), "ok": bool(d)})
     return out
 
 
@@ -2349,7 +2383,9 @@ def cima_links(page_html, hosts):
             seen.add((u, q))
             h = urlparse(u).netloc.lower().replace("www.", "")
             d = _host_ok(h, hosts)
-            out.append({"url": u, "host": d or h, "quality": q, "ok": bool(d)})
+            inner = _mz_clean(m.group(2))
+            out.append({"url": u, "host": d or h, "quality": q or _q_guess(inner, u),
+                        "size": _size_txt(inner) or _size_txt(q), "ok": bool(d)})
     return out
 
 
@@ -2366,7 +2402,9 @@ def _cl_loose_links(page, base, hosts):
             continue
         seen.add(u)
         qm = re.findall(r"(\d{3,4})\s*[pP]\b", t[max(0, m.start() - 800):m.start()])
-        out.append({"url": u, "host": d, "quality": (qm[-1] + "P") if qm else "", "ok": True})
+        near = re.sub(r"<[^>]+>", " ", t[max(0, m.start() - 300):m.end() + 300])
+        out.append({"url": u, "host": d, "quality": (qm[-1] + "P") if qm else _q_guess(u),
+                    "size": _size_txt(near), "ok": True})
     return out
 
 
