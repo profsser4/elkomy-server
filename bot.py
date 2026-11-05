@@ -4184,6 +4184,7 @@ def prowlarr_search(q, cat=None, timeout=45):
             "title": x.get("title", ""), "size": x.get("size") or 0,
             "seeders": x.get("seeders") or 0,
             "indexer": x.get("indexer", ""), "magnet": mag, "hash": h,
+            "date": x.get("publishDate") or "",   # تاريخ نشر التورنت (ISO) من Prowlarr
         })
     out.sort(key=lambda i: i["seeders"], reverse=True)
     return out
