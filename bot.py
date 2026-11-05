@@ -1989,6 +1989,10 @@ def ws_hosts(force=False):
             info["AllDebrid"] = "فشل: " + str(ex)[:60]
     off = bad - good
     hosts -= off
+    # سوشيال ميديا ومواقع مش مواقع ملفات: بتظهر في قوايم المزوّدين (تحميل فيديوهات) بس مش روابط تحميل للأعمال
+    _soc = set(WS_SKIP_PAGES) | {"fb.com", "fb.watch", "fb.me", "t.co", "x.com", "linkedin.com", "pinterest.com",
+                                  "snapchat.com", "whatsapp.com", "wa.me", "telegram.org", "telegram.me", "twimg.com"}
+    hosts = {h for h in hosts if not any(h == d or h.endswith("." + d) for d in _soc)}
     info["معطّل ومستبعد"] = len(off)
     c.update(t=time.time(), hosts=hosts, info=info)
     return c
@@ -2264,8 +2268,8 @@ def _mz_expand(post_url, want_nums):
 
 
 
-# ----------------- بحث مباشر في موقع Cimalight (روابط التحميل المدعومة بس) -----------------
-CIMA = "https://e.cimalight.co"
+# ----------------- بحث مباشر في موقع Ahwak (ahwaktv) (روابط التحميل المدعومة بس) -----------------
+CIMA = "https://yam.ahwaktv.net"
 _CL_STOP = re.compile(r"(الحلقة|الحلقه|حلقة|حلقه|episode|ep)\s*", re.I)
 
 
@@ -2283,7 +2287,9 @@ _CL_ERR = {"last": ""}
 def _cl_get(u):
     """زي _mz_get بس بهيدرز متصفح كاملة وكوكيز، وبيسجّل سبب الفشل."""
     try:
-        r = _CL_SESS.get(u, headers=_CL_HD, timeout=15, allow_redirects=True)
+        px = os.environ.get("CIMA_PROXY", "").strip()   # مثال: http://user:pass@host:port أو socks5://host:port
+        r = _CL_SESS.get(u, headers=_CL_HD, timeout=20, allow_redirects=True,
+                         proxies=({"http": px, "https": px} if px else None))
         if r.status_code != 200:
             _CL_ERR["last"] = "كود %d" % r.status_code
             return None
@@ -2347,6 +2353,23 @@ def cima_links(page_html, hosts):
     return out
 
 
+def _cl_loose_links(page, base, hosts):
+    """احتياطي: أي رابط لموقع مدعوم في كود الصفحة (حتى جوه سكريبت)، والجودة من أقرب 720p/1080p قبله."""
+    out, seen = [], set()
+    t = _html.unescape((page or "").replace("\\/", "/"))
+    bh = urlparse(base).netloc.lower().replace("www.", "")
+    for m in _URL_RX.finditer(t):
+        u = m.group(0).rstrip(".,;:!?'\"")
+        h = urlparse(u).netloc.lower().replace("www.", "")
+        d = _host_ok(h, hosts)
+        if not d or h == bh or u in seen:
+            continue
+        seen.add(u)
+        qm = re.findall(r"(\d{3,4})\s*[pP]\b", t[max(0, m.start() - 800):m.start()])
+        out.append({"url": u, "host": d, "quality": (qm[-1] + "P") if qm else "", "ok": True})
+    return out
+
+
 def _cl_expand(url, want_nums):
     """رابط watch.php → قايمة صفحات الحلقات المطلوبة (من قايمة حلقات الموسم) أو الصفحة نفسها."""
     page = _cl_get(url)
@@ -2376,7 +2399,7 @@ def _cima_search(q):
     sq = re.sub(r"\d+", " ", _CL_STOP.sub(" ", q.translate(_AR_DIG))).strip() or q
     sres = _cl_get(CIMA + "/search.php?keywords=" + quote(sq))
     if not sres:
-        return jsonify(error="موقع Cimalight رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي." % (_CL_ERR["last"] or "مجهول")), 502
+        return jsonify(error="موقع Ahwak رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي." % (_CL_ERR["last"] or "مجهول")), 502
     cands, seen = [], set()
     for u, txt in _cl_anchors(sres, CIMA + "/search.php"):
         vid = _cl_vid(u)
@@ -2391,7 +2414,7 @@ def _cima_search(q):
     cands.sort(key=lambda x: -x[0])
     cands = cands[:5]
     if not cands:
-        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في Cimalight"], found=0)
+        return jsonify(items=[], notes=["مفيش نتايج ليها علاقة بالاسم في Ahwak"], found=0)
 
     targets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -2405,13 +2428,13 @@ def _cima_search(q):
         page = _cl_get(u)
         if not page:
             return None
-        lks = cima_links(page, hosts)
+        lks = cima_links(page, hosts) or _cl_loose_links(page, u, hosts)
         if not lks:   # لو الروابط في صفحة تانية (زرار تحميل)
             for u2, t2 in _cl_anchors(page, u):
                 if u2 != u and "download" in u2.lower():
                     pg2 = _cl_get(u2)
                     if pg2:
-                        lks = cima_links(pg2, hosts)
+                        lks = cima_links(pg2, hosts) or _cl_loose_links(pg2, u2, hosts)
                         if lks:
                             break
         return {"title": _cl_title(page), "page": u, "links": lks}
@@ -2448,7 +2471,7 @@ def sitesearch():
     q = str(b.get("q") or "").strip()[:120]
     if not q:
         return jsonify(error="اكتب اسم العمل"), 400
-    if str(b.get("site") or "") in ("cimalight", "cima"):
+    if str(b.get("site") or "") in ("ahwak", "cimalight", "cima"):
         return _cima_search(q)
     hosts = ws_hosts()["hosts"]
     notes = []
