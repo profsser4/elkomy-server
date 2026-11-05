@@ -2322,40 +2322,51 @@ def _sf_anchors(page, base):
 
 
 def _sf_download_pages(post_url, want_nums):
-    """رابط عمل → صفحات /download/ بتاعته (الفيلم مباشرة، والمسلسل حلقة حلقة)."""
+    """رابط عمل → صفحات /download/ بتاعته.
+    الفيلم: /movie/<slug> ؛ المسلسل: /serie/<slug> وحلقاته /watch/<slug>-episode-N
+    (بنقبل بس روابط الحلقات اللي اسمها بيبدأ باسم المسلسل نفسه، عشان قايمة «أحدث الحلقات» الجانبية ماتدخلش)."""
     if "/download/" in post_url:
         return [post_url]
+    path = urlparse(post_url).path.strip("/").split("/")
+    kind, slug = (path[0], path[1]) if len(path) >= 2 else ("", "")
     page = _mz_get(post_url)
     if not page:
         return []
     anc = _sf_anchors(page, post_url)
-    dls = []
-    for u, t in anc:
-        if "/download/" in u and u not in dls:
-            dls.append(u)
-    if dls:
-        return dls[:15]
-    # مسلسل: صفحات الحلقات الأول وبعدين زرار التحميل جواها
-    eps = []
-    for u, t in anc:
-        if u == post_url or u in [e[0] for e in eps]:
-            continue
-        low = (u + " " + t).lower()
-        if any(k in low for k in ("episode", "ep-", "حلقة", "حلقه", "الحلقة")):
-            ns = {int(x) for x in re.findall(r"\d+", (t + " " + u).translate(_AR_DIG)) if len(x) <= 4}
-            eps.append((u, ns))
-    if want_nums:
-        eps = [e for e in eps if e[1] & want_nums] or eps
-    out = []
-    for u, _ in eps[:8]:
-        pg = _mz_get(u)
-        if not pg:
-            continue
-        for u2, _t in _sf_anchors(pg, u):
-            if "/download/" in u2 and u2 not in out:
-                out.append(u2)
-                break
-    return out
+
+    def first_dl(pg, base):
+        for u2, _t in _sf_anchors(pg, base):
+            if "/download/" in u2:
+                return u2
+        return None
+
+    if kind in ("serie", "series"):
+        pref = SHOF + "/watch/" + slug + "-episode-"
+        eps = {}
+        for u, t in anc:
+            if u.startswith(pref):
+                m = re.match(r"(\d+)", u[len(pref):])
+                if m:
+                    eps[int(m.group(1))] = u
+        for n in want_nums:                       # لو الحلقة مش ظاهرة في الصفحة نجرّب الرابط المتوقع
+            if n not in eps and n < 1000:
+                eps[n] = pref + str(n)
+        if want_nums:
+            eps = {n: u for n, u in eps.items() if n in want_nums}
+        urls = [eps[n] for n in sorted(eps)][:8]
+        out = []
+        for u in urls:
+            pg = _mz_get(u)
+            d = first_dl(pg, u) if pg else None
+            if d and d not in out:
+                out.append(d)
+        return out
+    if kind == "watch":
+        d = first_dl(page, post_url)
+        return [d] if d else []
+    # فيلم (أو أي صفحة تانية): أول زرار تحميل في الصفحة
+    d = first_dl(page, post_url)
+    return [d] if d else []
 
 
 def _shoffree_search(q):
@@ -2367,7 +2378,7 @@ def _shoffree_search(q):
     cands, seen = [], set()
     for u, txt in _sf_anchors(sres, SHOF + "/search"):
         segs = [s for s in urlparse(u).path.split("/") if s]
-        if len(segs) < 2 or segs[0] in _SF_SKIP1 or u in seen:
+        if len(segs) < 2 or segs[0] not in ("movie", "serie", "series", "watch", "download") or u in seen or len(txt) > 200:
             continue
         rel = ws_rel(q, txt + " " + unquote(u))
         if rel > 0:
@@ -2391,13 +2402,16 @@ def _shoffree_search(q):
         page = _mz_get(u)
         if not page:
             return None
-        return {"title": _sf_title(page), "page": u, "links": shoffree_links(page, hosts)}
+        return {"title": _sf_title(page), "page": u, "links": shoffree_links(page, hosts),
+                "private": "private-section" in page}
 
-    items, skipped = [], 0
+    items, skipped, only_private = [], 0, 0
     with ThreadPoolExecutor(max_workers=6) as ex:
         for r in ex.map(work, targets):
             if not r:
                 continue
+            if r.get("private") and not r["links"]:
+                only_private += 1
             good = [l for l in r["links"] if l["ok"]]
             skipped += len(r["links"]) - len(good)
             if good:
@@ -2405,6 +2419,8 @@ def _shoffree_search(q):
                 items.append(r)
     if skipped:
         notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
+    if only_private and not items:
+        notes.append("صفحة التحميل لقيتها (%d) بس فيها سيرفر Shoffree المباشر بس، ومفيش روابط مواقع خارجية" % only_private)
     items = _title_guard(q, items, notes)
     return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
 
