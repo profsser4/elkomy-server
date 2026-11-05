@@ -2269,6 +2269,37 @@ CIMA = "https://e.cimalight.co"
 _CL_STOP = re.compile(r"(الحلقة|الحلقه|حلقة|حلقه|episode|ep)\s*", re.I)
 
 
+_CL_SESS = requests.Session()
+_CL_HD = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Referer": CIMA + "/",
+    "Upgrade-Insecure-Requests": "1",
+}
+_CL_ERR = {"last": ""}
+
+
+def _cl_get(u):
+    """زي _mz_get بس بهيدرز متصفح كاملة وكوكيز، وبيسجّل سبب الفشل."""
+    try:
+        r = _CL_SESS.get(u, headers=_CL_HD, timeout=15, allow_redirects=True)
+        if r.status_code != 200:
+            _CL_ERR["last"] = "كود %d" % r.status_code
+            return None
+        r.encoding = r.encoding or "utf-8"
+        t = r.content.decode("utf-8", "ignore")
+        if len(t) < 500 or "cf-browser-verification" in t or "Just a moment" in t[:3000]:
+            _CL_ERR["last"] = "صفحة تحقق (Cloudflare)"
+            return None
+        return t
+    except requests.Timeout:
+        _CL_ERR["last"] = "انتهى الوقت (Timeout)"
+    except Exception as e:
+        _CL_ERR["last"] = str(e)[:80]
+    return None
+
+
 def _cl_ep(t):
     m = re.search(r"(?:الحلقة|الحلقه|حلقة|حلقه|episode)\s*(\d+)", (t or "").translate(_AR_DIG), re.I)
     return int(m.group(1)) if m else None
@@ -2318,7 +2349,7 @@ def cima_links(page_html, hosts):
 
 def _cl_expand(url, want_nums):
     """رابط watch.php → قايمة صفحات الحلقات المطلوبة (من قايمة حلقات الموسم) أو الصفحة نفسها."""
-    page = _mz_get(url)
+    page = _cl_get(url)
     if not page:
         return []
     eps = {}
@@ -2343,9 +2374,9 @@ def _cima_search(q):
     notes = []
     nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
     sq = re.sub(r"\d+", " ", _CL_STOP.sub(" ", q.translate(_AR_DIG))).strip() or q
-    sres = _mz_get(CIMA + "/search.php?keywords=" + quote(sq))
+    sres = _cl_get(CIMA + "/search.php?keywords=" + quote(sq))
     if not sres:
-        return jsonify(error="موقع Cimalight ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
+        return jsonify(error="موقع Cimalight رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي." % (_CL_ERR["last"] or "مجهول")), 502
     cands, seen = [], set()
     for u, txt in _cl_anchors(sres, CIMA + "/search.php"):
         vid = _cl_vid(u)
@@ -2371,14 +2402,14 @@ def _cima_search(q):
     targets = targets[:20]
 
     def work(u):
-        page = _mz_get(u)
+        page = _cl_get(u)
         if not page:
             return None
         lks = cima_links(page, hosts)
         if not lks:   # لو الروابط في صفحة تانية (زرار تحميل)
             for u2, t2 in _cl_anchors(page, u):
                 if u2 != u and "download" in u2.lower():
-                    pg2 = _mz_get(u2)
+                    pg2 = _cl_get(u2)
                     if pg2:
                         lks = cima_links(pg2, hosts)
                         if lks:
