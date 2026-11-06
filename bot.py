@@ -1427,6 +1427,60 @@ def torrent_flow(q, tid, file_id=None, want_zip=False, want_all=False):
         return jsonify(error=f"TorBox: {e}"), 400
 
 
+# ===== إضافة: بث TorBox باختيار مسار الصوت / الجودة / الترجمة (إضافة فقط، ما بتغيّر أي كود قديم) =====
+def tb_hls_opts(k, tid, file_id, audio=None, resolution=None, subtitle=None, typ="torrent"):
+    """نفس createstream بس مع chosen_audio_index / chosen_resolution_index / chosen_subtitle_index."""
+    params = {"id": tid, "file_id": file_id, "type": typ}
+    if audio is not None:
+        params["chosen_audio_index"] = int(audio)
+    if resolution is not None:
+        params["chosen_resolution_index"] = int(resolution)
+    if subtitle is not None:
+        params["chosen_subtitle_index"] = int(subtitle)
+    r = tb(k, "GET", "/stream/createstream", params=params)
+    d = r.get("data") if isinstance(r, dict) else None
+    d = d if isinstance(d, dict) else {}
+    url = d.get("hls_url") or d.get("hlsUrl") or ""
+    note = "" if url else str((r or {}).get("detail") or (r or {}).get("error") or "TorBox رجّع رد من غير رابط HLS")
+    return url, d, note
+
+
+def tb_stream_info(k, d):
+    """محاولة (best effort) نجيب قايمة المسارات (صوت/ترجمة/جودة). لو فشلت بترجع None من غير ما توقّف حاجة."""
+    try:
+        pt, tk = d.get("presigned_token"), d.get("token")
+        if not (pt and tk):
+            return None
+        r = tb(k, "GET", "/stream/getstreamdata", params={"presigned_token": pt, "token": tk})
+        return r.get("data") if isinstance(r, dict) else None
+    except Exception:
+        return None
+
+
+@app.post("/tb/stream")
+def tb_stream_route():
+    b = request.get_json(silent=True) or {}
+    p = tb_provider()
+    if not p:
+        return jsonify(error="ضيف TorBox من إعدادات المزوّدين الأول"), 400
+    tid, fid = b.get("torrent_id"), b.get("file_id")
+    if tid in (None, "") or fid in (None, ""):
+        return jsonify(error="torrent_id و file_id مطلوبين"), 400
+    k = p["key"]
+    try:
+        url, d, note = tb_hls_opts(k, tid, fid, b.get("audio"), b.get("resolution"), b.get("subtitle"))
+        if not url:
+            time.sleep(1.5)
+            url, d, note = tb_hls_opts(k, tid, fid, b.get("audio"), b.get("resolution"), b.get("subtitle"))
+        out = {"hls": url, "note": note}
+        if b.get("info"):
+            out["info"] = tb_stream_info(k, d)
+        return jsonify(out), (200 if url else 502)
+    except Exception as e:
+        return jsonify(error=f"TorBox: {str(e)[:120]}"), 400
+# ===== نهاية الإضافة =====
+
+
 # ----------------- تورنت على TorBox / Real-Debrid / Debrid-Link -----------------
 
 # 1 = الأعضاء العاديين يقدروا يشغّلوا الروابط اللي فيها مفتاح الدابريد (للعيلة بس). 0 = للأدمن بس
