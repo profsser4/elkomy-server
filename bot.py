@@ -19,6 +19,7 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024   # حد أقصى لحجم أي طلب
 CORS(app)
 
 # ==============================================================
@@ -344,7 +345,7 @@ def read_token(tok):
         if int(exp) < time.time():
             return None
         if role == "admin":
-            if user != APP_USER.lower() or fp != fp_of(APP_PASS):
+            if user != APP_USER.lower() or not hmac.compare_digest(fp.encode(), fp_of(APP_PASS).encode()):
                 return None
         else:
             rec = users_load().get(user)
@@ -378,7 +379,7 @@ def guard():
     LAST[g.user] = time.time()
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
-    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/generate", "/stremio/resolve"):
+    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
         lk, msg = lock_of(g.user)
         if lk >= 2:                                   # تصفح فقط: مفيش مشاهدة ولا تحميل
             return jsonify(error=msg, nodl=True, lock=2), 403
@@ -395,11 +396,11 @@ def home():
     return "Elkomy Server is Active! 🚀"
 
 
-def too_many(ip):
+def too_many(ip, limit=10):
     now = time.time()
     lst = [t for t in FAILS.get(ip, []) if now - t < 600]
     FAILS[ip] = lst
-    return len(lst) >= 10
+    return len(lst) >= limit
 
 
 @app.post("/auth")
@@ -411,6 +412,10 @@ def auth():
     d = request.get_json(silent=True) or {}
     u = str(d.get("u", "")).strip().lower()
     p = str(d.get("p", "")).strip()
+    if len(u) > 64 or len(p) > 200:
+        return jsonify(ok=False), 400
+    if too_many("u:" + u, 20):
+        return jsonify(ok=False, error="محاولات كتير"), 429
     if u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
         return jsonify(ok=True, role="admin", user=u,
                        token=make_token(u, "admin", fp_of(APP_PASS)))
@@ -419,6 +424,8 @@ def auth():
         return jsonify(ok=True, role="user", user=u,
                        token=make_token(u, "user", fp_of(rec["h"])))
     FAILS.setdefault(ip, []).append(time.time())
+    FAILS.setdefault("u:" + u, []).append(time.time())
+    time.sleep(0.5)
     return jsonify(ok=False), 401
 
 
@@ -503,6 +510,13 @@ def sec_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    try:
+        if request.path.startswith(("/me", "/users", "/iptv", "/auth", "/settings", "/providers", "/activity")):
+            resp.headers["Cache-Control"] = "no-store"
+    except Exception:
+        pass
     return resp
 
 
@@ -661,13 +675,14 @@ def users_add():
         return jsonify(error="الاسم 3-20 حرف إنجليزي أو أرقام أو _ . -"), 400
     if n == APP_USER.lower():
         return jsonify(error="الاسم ده محجوز للأدمن"), 400
-    if len(p) < 4:
-        return jsonify(error="الباسورد لازم 4 حروف على الأقل"), 400
+    if len(p) < 6:
+        return jsonify(error="الباسورد لازم 6 حروف على الأقل"), 400
     with USERS_LOCK:
         us = users_load()
         if n in us:
             return jsonify(error="المستخدم موجود بالفعل"), 400
-        us[n] = {"h": generate_password_hash(p), "c": int(time.time())}
+        # العضو الجديد مجاني: يتصفح بس (مفيش مشاهدة ولا تحميل ولا IPTV) لحد ما الأدمن يفعّل له باقة مميزة
+        us[n] = {"h": generate_password_hash(p), "c": int(time.time()), "plan": "free", "plan_at": int(time.time())}
         users_save(us)
     return jsonify(ok=True)
 
@@ -675,8 +690,8 @@ def users_add():
 @app.post("/users/<name>/password")
 def users_pass(name):
     p = str((request.get_json(silent=True) or {}).get("password", "")).strip()
-    if len(p) < 4:
-        return jsonify(error="الباسورد لازم 4 حروف على الأقل"), 400
+    if len(p) < 6:
+        return jsonify(error="الباسورد لازم 6 حروف على الأقل"), 400
     with USERS_LOCK:
         us = users_load()
         if name not in us:
@@ -756,7 +771,8 @@ def users_plan(name):
 @app.get("/users/export")
 def users_export():
     """نسخة احتياطية للأدمن: كل المستخدمين (بالباقات) + سجل النشاط. بتتنزّل كملف JSON."""
-    data = {"users": users_load(), "activity": act_load(), "at": int(time.time())}
+    us = {n: {k: v for k, v in (r or {}).items() if k != "h"} for n, r in users_load().items()}   # من غير هاشات الباسورد
+    data = {"users": us, "activity": act_load(), "at": int(time.time())}
     resp = make_response(json.dumps(data, ensure_ascii=False))
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
     resp.headers["Content-Disposition"] = "attachment; filename=elkomy-members-backup.json"
@@ -831,8 +847,18 @@ IPTV_ALL = "__all__"      # حساب IPTV مشترك لأي عضو ملوش حس
 IPTV_PINS = "__pins__"    # تثبيتات الصفحة الرئيسية اللي الأدمن بيعملها للكل
 
 
+def member_locked(user=None):
+    """مجاني أو انتهى اشتراكه (والأدمن مستثنى)."""
+    if getattr(g, "role", "") == "admin":
+        return False
+    rec = users_load().get(user or g.user) or {}
+    return plan_of(rec)["state"] in ("free", "expired")
+
+
 @app.get("/iptv/cfg")
 def iptv_cfg():
+    if member_locked():
+        return jsonify(set=False, locked=True, error="الـIPTV للأعضاء المميزين بس")
     al = iptv_load()
     rec = al.get(g.user) or {}
     shared = False
@@ -847,6 +873,8 @@ def iptv_cfg():
 
 @app.post("/iptv/stat")
 def iptv_stat():
+    if member_locked():
+        return jsonify(error="الـIPTV للأعضاء المميزين بس", locked=True), 403
     """الجهاز بيبلّغ بحالة الاشتراك (تاريخ الانتهاء/عدد الاتصالات) عشان تظهر للأدمن وللعضو"""
     d = request.get_json(silent=True) or {}
 
