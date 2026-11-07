@@ -5072,7 +5072,9 @@ def sub_auto_poll():
 # وبعدها بتعدّي على الضبط التلقائي بالصوت زي أي ترجمة. محتاج متغيّر AI_KEY (مفتاح Anthropic) على السيرفر.
 # اختياري: AI_MODEL (الافتراضي claude-sonnet-5-5).
 AI_KEY = os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or ""
-AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
+# لو المفتاح بتاع Gemini (بيبدأ بـ AIza) أو AI_PROVIDER=gemini بيشتغل بـ Gemini، غير كده Claude
+AI_GEMINI = os.environ.get("AI_PROVIDER", "").lower() == "gemini" or AI_KEY.startswith("AIza")
+AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-2.5-flash" if AI_GEMINI else "claude-sonnet-5-5")
 AI_BATCH = 50
 AI_RUN = {}
 AI_SEM = threading.BoundedSemaphore(2)
@@ -5118,7 +5120,24 @@ def _ai_apply(vtt, key, rtl):
     return "".join(parts) + "\n"
 
 
+def _ai_call_gemini(user):
+    r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % AI_MODEL,
+                      timeout=150, headers={"x-goog-api-key": AI_KEY, "content-type": "application/json"},
+                      json={"systemInstruction": {"parts": [{"text": AI_SYS}]},
+                            "contents": [{"role": "user", "parts": [{"text": user}]}],
+                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000,
+                                                 "responseMimeType": "application/json",
+                                                 "thinkingConfig": {"thinkingBudget": 0}}})
+    d = r.json()
+    if r.status_code != 200:
+        raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
+    cs = d.get("candidates") or [{}]
+    return "".join(x.get("text", "") for x in ((cs[0].get("content") or {}).get("parts") or []))
+
+
 def _ai_call(user):
+    if AI_GEMINI:
+        return _ai_call_gemini(user)
     r = requests.post("https://api.anthropic.com/v1/messages", timeout=150,
                       headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
                                "content-type": "application/json"},
