@@ -4480,7 +4480,7 @@ def pick_sub(z, season, episode):
     return names[0]
 
 
-def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0):
+def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0, ai=None):
     data = get_zip(u)
     if data[:2] == b"PK":
         z = zipfile.ZipFile(io.BytesIO(data))
@@ -4498,6 +4498,8 @@ def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0):
         vtt = ass_to_vtt(text, shift, scale, rtl)
     else:
         vtt = to_vtt(text, shift, scale, rtl)
+    if ai:                                           # ترجمة الذكاء الاصطناعي: نفس التوقيت ونص عربي
+        vtt = _ai_apply(vtt, ai, fmt != "srt")
     if fmt == "srt":
         return vtt_to_srt(vtt), "application/x-subrip"
     return vtt, "text/vtt"
@@ -4603,6 +4605,7 @@ def sub_link():
         return jsonify(error="قيم غير صالحة"), 400
     p = {"u": u, "shift": shift, "scale": scale, "s": request.args.get("s", "")[:6],
          "e": request.args.get("e", "")[:6], "lang": request.args.get("lang", "")[:20],
+         "ai": re.sub(r"[^a-f0-9]", "", request.args.get("ai", ""))[:40],
          "exp": int(time.time()) + SUBX_TTL,
          "f": "vtt" if request.args.get("fmt") == "vtt" else "srt"}
     tok = _b64e(json.dumps(p, separators=(",", ":")).encode())
@@ -4627,7 +4630,8 @@ def subx_get(tk, ext):
         scale = max(0.8, min(1.25, float(p.get("scale") or 1)))
         se, ep = str(p.get("s", "")), str(p.get("e", ""))
         text, _ = build_sub(p["u"], int(se) if se.isdigit() else None, int(ep) if ep.isdigit() else None,
-                            "ar" in str(p.get("lang", "")).lower(), p.get("f", "srt"), shift, scale)
+                            "ar" in str(p.get("lang", "")).lower(), p.get("f", "srt"), shift, scale,
+                            p.get("ai") or None)
     except LookupError as ex:
         return Response(str(ex), status=404, mimetype="text/plain")
     except Exception as ex:
@@ -4657,8 +4661,9 @@ def sub_get():
     season = int(se) if se.isdigit() else None
     episode = int(ep) if ep.isdigit() else None
     ar = "ar" in request.args.get("lang", "").lower()
+    ai = re.sub(r"[^a-f0-9]", "", request.args.get("ai", ""))[:40] or None
     try:
-        text, mt = build_sub(u, season, episode, ar, fmt, shift, scale)
+        text, mt = build_sub(u, season, episode, ar, fmt, shift, scale, ai)
         return Response(text, mimetype=mt)
     except LookupError as ex:
         return jsonify(error=str(ex)), 404
@@ -4668,6 +4673,558 @@ def sub_get():
         return jsonify(error="تحميل الترجمة أخد وقت طويل"), 504
     except Exception as ex:
         return jsonify(error=f"الترجمة: {ex}"), 500
+
+
+# ===================== ضبط الترجمة تلقائياً بالصوت (على السيرفر) =====================
+# بيسمع عينات من صوت الفيديو الفعلي ويطابقها مع أوقات الجُمل في ملف الترجمة، ويطلّع (shift, scale).
+# النتيجة بتتطبّق على ملف الترجمة نفسه، فبتشتغل مع أي مشغّل: متصفح / أندرويد / تلفزيون / VLC.
+# محتاج ffmpeg على السيرفر (على Railway: nixpacks.toml فيه aptPkgs = ["ffmpeg"]).
+# لو مش موجود بيرجع reason="noffmpeg" والموقع يكمّل بالضبط القديم من غير ما يتأثر.
+import shutil
+import subprocess
+import socket
+import ipaddress
+import bisect
+import math
+import array
+import sys
+
+AS_FF = shutil.which("ffmpeg")
+AS_FP = shutil.which("ffprobe")
+AS_HYP = (1.0, 0.95904, 1.04271, 1.04167, 0.96, 0.999, 1.001)   # نسب الفريمات المعروفة 23.976/24/25
+AS_RATIOS = AS_HYP[1:]
+AS_WIN_SEC = 80                    # طول كل عينة صوت
+AS_FRACS = (0.12, 0.38, 0.63, 0.88, 0.25, 0.75)
+AS_SEM = threading.BoundedSemaphore(2)
+AS_RUN = {}
+AS_LOCK = threading.Lock()
+AS_NET = "http,https,tcp,tls,crypto"
+
+
+def _as_safe_url(u):
+    """بنقبل http/https لعناوين عامة بس (حماية من SSRF)."""
+    try:
+        p = urlparse(u)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        port = p.port or (443 if p.scheme == "https" else 80)
+        for i in socket.getaddrinfo(p.hostname, port, proto=socket.IPPROTO_TCP):
+            if not ipaddress.ip_address(i[4][0]).is_global:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _as_duration(url):
+    if not AS_FP:
+        return None
+    try:
+        out = subprocess.run(
+            [AS_FP, "-v", "error", "-protocol_whitelist", AS_NET, "-show_entries",
+             "format=duration", "-of", "csv=p=0", url],
+            capture_output=True, timeout=25).stdout.decode("utf-8", "replace").strip()
+        d = float(out.split()[0])
+        return d if 120 < d < 86400 else None
+    except Exception:
+        return None
+
+
+def _as_pcm(url, t0, dur):
+    cmd = [AS_FF, "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-protocol_whitelist", AS_NET,
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "4",
+           "-ss", "%.2f" % t0, "-t", "%d" % dur, "-i", url,
+           "-map", "0:a:0?", "-vn", "-sn", "-dn",
+           "-af", "highpass=f=250,lowpass=f=3400",
+           "-ac", "1", "-ar", "8000", "-f", "s16le", "-"]
+    return subprocess.run(cmd, capture_output=True, timeout=150).stdout
+
+
+def _as_energy(raw):
+    """طاقة الصوت بالـ dB لكل 0.1 ثانية."""
+    a = array.array("h")
+    a.frombytes(raw[: len(raw) // 2 * 2])
+    if sys.byteorder == "big":
+        a.byteswap()
+    out = []
+    for i in range(len(a) // 800):
+        seg = a[i * 800:(i + 1) * 800]
+        out.append(20.0 * math.log10(sum(map(abs, seg)) / 800.0 + 1.0))
+    return out
+
+
+def _as_norm(x):
+    """بيحوّل dB لاحتمال كلام 0..1. بيرجع None لو الصوت ساكت/مفيش إشارة."""
+    if len(x) < 600:
+        return None
+    v = sorted(x)
+    lo, hi = v[int(0.2 * (len(v) - 1))], v[int(0.9 * (len(v) - 1))]
+    if hi - lo < 3.0:
+        return None
+    return [min(1.0, max(0.0, (y - lo) / (hi - lo))) for y in x]
+
+
+def _as_cues(srt):
+    raw = []
+    for line in srt.split("\n"):
+        if "-->" in line:
+            m = list(TS_RE.finditer(line))
+            if len(m) >= 2:
+                s, e = ts_secs(m[0]), ts_secs(m[1])
+                if e - s >= 0.15:
+                    raw.append((s, e))
+    raw.sort()
+    out = []
+    for s, e in raw:
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+class _AsWin:
+    def __init__(self, t0, A):
+        self.t0, self.n = t0, len(A)
+        P, acc = [0.0], 0.0
+        for x in A:
+            acc += x
+            P.append(acc)
+        self.P, self.ma = P, acc / self.n
+        var = sum(x * x for x in A) / self.n - self.ma * self.ma
+        self.sda = math.sqrt(var) if var > 1e-4 else 0.0
+
+
+def _as_r(w, cs, ce, h, b):
+    """ارتباط بين نشاط الكلام في الصوت ونشاط الترجمة لو أوقاتها = h*وقت + b."""
+    if not w.sda:
+        return 0.0
+    n, t0 = w.n, w.t0
+    lo, hi = (t0 - b) / h, (t0 + n / 10.0 - b) / h
+    i, j = bisect.bisect_left(ce, lo), bisect.bisect_right(cs, hi)
+    if j - i < 4:
+        return 0.0
+    cover, sas, P = 0, 0.0, w.P
+    for k in range(i, j):
+        a = int(round((h * cs[k] + b - t0) * 10))
+        z = int(round((h * ce[k] + b - t0) * 10))
+        if a < 0:
+            a = 0
+        if z > n:
+            z = n
+        if z > a:
+            cover += z - a
+            sas += P[z] - P[a]
+    ms = cover / n
+    vs = ms - ms * ms
+    if vs < 1e-4:
+        return 0.0
+    return (sas / n - w.ma * ms) / (w.sda * math.sqrt(vs))
+
+
+def _as_joint(wins, cs, ce, h, b):
+    return sum(_as_r(w, cs, ce, h, b) for w in wins) / len(wins)
+
+
+def _as_search(wins, cs, ce, maxoff=180.0):
+    """بيدوّر على أحسن (h, b) لكل العينات مع بعض (لازم نفس الإزاحة تنفع في كل الفيلم)."""
+    M = int(maxoff / 0.5)
+    cands = []
+    for h in AS_HYP:
+        sc = [_as_joint(wins, cs, ce, h, k * 0.5) for k in range(-M, M + 1)]
+        for i, v in enumerate(sc):
+            if (i == 0 or v >= sc[i - 1]) and (i == len(sc) - 1 or v >= sc[i + 1]):
+                cands.append((v, h, (i - M) * 0.5))
+    cands.sort(reverse=True)
+    top = []
+    for v, h, b in cands:
+        if all(not (abs(h - x[1]) < 1e-9 and abs(b - x[2]) < 3) for x in top):
+            top.append((v, h, b))
+        if len(top) >= 8:
+            break
+    ref = []
+    for v, h, b in top:
+        bv, bb = v, b
+        for k in range(-5, 6):
+            vx = _as_joint(wins, cs, ce, h, b + k * 0.1)
+            if vx > bv:
+                bv, bb = vx, b + k * 0.1
+        ref.append((bv, h, round(bb, 2)))
+    ref.sort(reverse=True)
+    return ref
+
+
+def _as_refine(wins, cs, ce, h, b):
+    """بعد ما اخترنا (h,b): بنقيس الانحراف المتبقي عند كل عينة ونصحّح السرعة والإزاحة بدقة."""
+    pts = []
+    for w in wins:
+        best, bd, r_at0 = -9, 0.0, 0.0
+        for k in range(-60, 61):
+            d = k * 0.1
+            r = _as_r(w, cs, ce, h, b + d)
+            if k == 0:
+                r_at0 = r
+            if r > best:
+                best, bd = r, d
+        if best >= 0.08:
+            tm = w.t0 + w.n / 20.0
+            pts.append(((tm - b) / h, bd, best * best, best))
+    return pts
+
+
+def _as_slope(pts):
+    """انحراف خطي δ = k*c + m بوزن الثقة، مع شيل القياسات الشاذة."""
+    pts = list(pts)
+    while True:
+        sw = sum(p[2] for p in pts)
+        mc = sum(p[2] * p[0] for p in pts) / sw
+        md = sum(p[2] * p[1] for p in pts) / sw
+        if len(pts) < 3 or max(p[0] for p in pts) - min(p[0] for p in pts) < 900:
+            return 0.0, md, pts
+        sxx = sum(p[2] * (p[0] - mc) ** 2 for p in pts)
+        if sxx < 1:
+            return 0.0, md, pts
+        k = sum(p[2] * (p[0] - mc) * (p[1] - md) for p in pts) / sxx
+        m = md - k * mc
+        res = [(abs(p[1] - (k * p[0] + m)), p) for p in pts]
+        worst = max(res, key=lambda x: x[0])
+        if worst[0] <= 1.0:
+            return k, m, pts
+        if len(pts) <= 3:
+            return 0.0, md, pts
+        pts.remove(worst[1])
+
+
+def _as_equiv(h, b, tms, h0, b0):
+    """هل (h,b) بيدّي تقريباً نفس النتيجة بتاعة (h0,b0) عند أوقات العينات؟"""
+    for tm in tms:
+        cc = (tm - b0) / h0
+        if abs(h * cc + b - tm) > 1.5:
+            return False
+    return True
+
+
+def _as_solve(cues, wins):
+    cs, ce = [c[0] for c in cues], [c[1] for c in cues]
+    ref = _as_search(wins, cs, ce)
+    if not ref:
+        return {"ok": False, "reason": "nosig"}
+    J, h, b = ref[0]
+    tms = [w.t0 + w.n / 20.0 for w in wins]
+    J2 = -1.0
+    for v, h2, b2 in ref[1:]:
+        if not _as_equiv(h2, b2, tms, h, b):
+            J2 = max(J2, v)
+    J0 = _as_joint(wins, cs, ce, 1.0, 0.0)
+    rs = [_as_r(w, cs, ce, h, b) for w in wins]
+    good = sum(1 for r in rs if r >= 0.1)
+    # مطابقة دقيقة (انحراف خطي متبقي)
+    pts = _as_refine(wins, cs, ce, h, b)
+    s_fin, b_fin = h, b
+    if pts:
+        k, m, kept = _as_slope(pts)
+        s2, b2 = h + k, b + m
+        near = [r for r in (0.95904, 0.96, 1.04271, 1.04167, 1.0) if abs(s2 - r) < 0.0006]
+        if len(near) == 1:
+            b2 += (s2 - near[0]) * (sum(p[0] for p in kept) / len(kept))   # نثبّت الخط عند متوسط العينات
+            s2 = near[0]
+        if 0.9 < s2 < 1.2 and _as_joint(wins, cs, ce, s2, b2) >= J - 0.01:
+            s_fin, b_fin = s2, b2
+        elif pts:
+            sw = sum(p[2] for p in pts)
+            b_fin = b + sum(p[2] * p[1] for p in pts) / sw
+    Jf = max(_as_joint(wins, cs, ce, s_fin, b_fin), J)
+    # لو عينة بعيدة عن الخط النهائي أكتر من ثانية: الترجمة من نسخة تانية (إزاحة بتتغيّر في نص الفيلم)
+    # فمنطبّقش حل وسط غلط
+    for w in wins:
+        br, bd = -9.0, 0.0
+        for k in range(-80, 81):
+            r = _as_r(w, cs, ce, s_fin, b_fin + k * 0.1)
+            if r > br:
+                br, bd = r, k * 0.1
+        if br >= 0.1 and abs(bd) > 1.0:
+            return {"ok": False, "reason": "split", "r": round(Jf, 3)}
+    margin = Jf - J2
+    if Jf >= 0.15 and margin >= 0.05 and good >= 3:
+        conf = "high"
+    elif Jf >= 0.10 and margin >= 0.03 and good >= 2:
+        conf = "medium"
+    else:
+        return {"ok": False, "reason": "low", "r": round(Jf, 3), "margin": round(margin, 3)}
+    if Jf - J0 < 0.02 and abs(b_fin) < 1.0 and abs(s_fin - 1) < 0.0005:
+        return {"ok": True, "synced": True, "shift": 0.0, "scale": 1.0, "conf": conf, "r": round(Jf, 3), "n": good}
+    return {"ok": True, "synced": False, "shift": round(b_fin, 2), "scale": round(s_fin, 6),
+            "conf": conf, "r": round(Jf, 3), "n": good}
+
+
+def _as_job(u, src, season, episode, lang, dur_hint):
+    ar = "ar" in (lang or "").lower()
+    srt, _ = build_sub(u, season, episode, ar, "srt", 0.0, 1.0)
+    cues = _as_cues(srt)
+    if len(cues) < 40:
+        return {"ok": False, "reason": "fewcues"}
+    dur = dur_hint if (dur_hint and 120 < dur_hint < 86400) else _as_duration(src)
+    if not dur:
+        dur = cues[-1][1] * 1.04 + 60
+    wins, tried = [], 0
+
+    def grab(f):
+        t0 = max(0.0, min(dur * f - AS_WIN_SEC / 2, dur - AS_WIN_SEC - 20))
+        raw = _as_pcm(src, t0, AS_WIN_SEC)
+        A = _as_norm(_as_energy(raw))
+        return _AsWin(t0, A) if A else None
+
+    for fr in (AS_FRACS[:4], AS_FRACS[4:]):
+        if len(wins) >= 3:
+            break
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for r in ex.map(lambda f: _safe(grab, f), fr):
+                if r:
+                    wins.append(r)
+    if len(wins) < 2:
+        return {"ok": False, "reason": "noaudio"}
+    return _as_solve(cues, wins)
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return None
+
+
+def _as_cpath(key):
+    return os.path.join(DATA_DIR, "autosync_%s.json" % key)
+
+
+def _as_worker(key, u, src, se, ep, lang, dur):
+    res = None
+    try:
+        with AS_SEM:
+            res = _as_job(u, src, int(se) if str(se).isdigit() else None,
+                          int(ep) if str(ep).isdigit() else None, lang, dur)
+        if res.get("reason") not in ("noaudio",):      # النتيجة النهائية بس هي اللي بتتحفظ
+            try:
+                store_save(_as_cpath(key), res)
+            except Exception:
+                pass
+    except Exception as ex:
+        res = {"ok": False, "reason": "error", "msg": str(ex)[:120]}
+    finally:
+        with AS_LOCK:
+            AS_RUN[key] = {"t": time.time(), "res": res}
+
+
+@app.post("/sub/auto")
+def sub_auto_start():
+    b = request.get_json(silent=True) or {}
+    u, src = str(b.get("u", "")), str(b.get("src", ""))
+    if not ok_sub_path(u):
+        return jsonify(error="رابط ترجمة غير صالح"), 400
+    if not AS_FF:
+        return jsonify(done=True, ok=False, reason="noffmpeg")
+    if not _as_safe_url(src):
+        return jsonify(done=True, ok=False, reason="badsrc")
+    se, ep = str(b.get("s", ""))[:6], str(b.get("e", ""))[:6]
+    ident = str(b.get("key") or re.sub(r"[?#].*$", "", src))[:300]
+    key = hashlib.sha1("|".join((u, se, ep, ident)).encode()).hexdigest()[:32]
+    if not b.get("force"):
+        try:
+            return jsonify(done=True, **store_load(_as_cpath(key)))
+        except Exception:
+            pass
+    try:
+        dur = float(b.get("dur") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    with AS_LOCK:
+        for k in [k for k, v in AS_RUN.items() if v.get("res") and time.time() - v["t"] > 600]:
+            AS_RUN.pop(k, None)
+        st = AS_RUN.get(key)
+        if not st or st.get("res") is not None:          # مفيش شغل شغّال (النتايج النهائية اتحفظت في الكاش فوق)
+            AS_RUN[key] = {"t": time.time(), "res": None}
+            threading.Thread(target=_as_worker, daemon=True,
+                             args=(key, u, src, se, ep, str(b.get("lang", ""))[:20], dur)).start()
+    return jsonify(done=False, job=key)
+
+
+@app.get("/sub/auto")
+def sub_auto_poll():
+    key = re.sub(r"[^a-f0-9]", "", request.args.get("job", ""))[:40]
+    with AS_LOCK:
+        st = AS_RUN.get(key)
+    if st and st.get("res") is not None:
+        return jsonify(done=True, **st["res"])
+    if st:
+        return jsonify(done=False, job=key)
+    try:
+        return jsonify(done=True, **store_load(_as_cpath(key)))
+    except Exception:
+        return jsonify(done=True, ok=False, reason="lost")
+
+
+# ===================== نهاية ضبط الترجمة بالصوت =====================
+
+
+# ===================== ترجمة بالذكاء الاصطناعي (لما مفيش ترجمة عربي) =====================
+# بياخد أحسن ترجمة إنجليزي مطابقة للفيلم من SubDL ويترجمها عربي بـ Claude، سطر مقابل سطر وبنفس التوقيت،
+# وبعدها بتعدّي على الضبط التلقائي بالصوت زي أي ترجمة. محتاج متغيّر AI_KEY (مفتاح Anthropic) على السيرفر.
+# اختياري: AI_MODEL (الافتراضي claude-sonnet-5-5).
+AI_KEY = os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or ""
+AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5-5")
+AI_BATCH = 50
+AI_RUN = {}
+AI_SEM = threading.BoundedSemaphore(2)
+AI_SYS = (
+    "You are a professional audiovisual translator working on movie and TV subtitles. "
+    "Translate each subtitle line into natural, fluent Arabic (clear Modern Standard Arabic that sounds like real speech). "
+    "Keep character names, keep the tone and emotion, translate idioms by meaning, keep lines short enough to read on screen. "
+    "Translate sound cues in brackets too, e.g. [music] -> [موسيقى]. "
+    "Rules: return ONLY a JSON array of strings, exactly the same length and order as the input 'lines'. "
+    "Never merge, split, skip or reorder lines. Use 'before' and 'after' only as context, do not translate them. "
+    "No explanations, no markdown."
+)
+
+
+def _ai_cpath(key):
+    return os.path.join(DATA_DIR, "aitr_%s.json" % key)
+
+
+def _vtt_text_cues(vtt):
+    out = []
+    for b in re.split(r"\n\s*\n", vtt.strip()):
+        ln = b.split("\n")
+        k = next((i for i, x in enumerate(ln) if "-->" in x), None)
+        if k is not None:
+            out.append(re.sub(r"<[^>]+>", "", "\n".join(ln[k + 1:])).strip())
+    return out
+
+
+def _ai_apply(vtt, key, rtl):
+    """بيبدّل نص كل جملة بالترجمة العربي (التوقيت زي ما هو)."""
+    texts = store_load(_ai_cpath(key)).get("texts") or []
+    parts, n = re.split(r"(\n\s*\n)", vtt.strip()), 0
+    for i, b in enumerate(parts):
+        ln = b.split("\n")
+        k = next((j for j, x in enumerate(ln) if "-->" in x), None)
+        if k is None:
+            continue
+        tx = texts[n] if n < len(texts) and texts[n] else None
+        n += 1
+        if tx:
+            body = [rtl_wrap(x) if rtl else x for x in tx.split("\n")]
+            parts[i] = "\n".join(ln[:k + 1] + body)
+    return "".join(parts) + "\n"
+
+
+def _ai_call(user):
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=150,
+                      headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
+                               "content-type": "application/json"},
+                      json={"model": AI_MODEL, "max_tokens": 8000, "temperature": 0.2,
+                            "system": AI_SYS, "messages": [{"role": "user", "content": user}]})
+    d = r.json()
+    if r.status_code != 200:
+        raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
+    return "".join(x.get("text", "") for x in d.get("content", []) if x.get("type") == "text")
+
+
+def _ai_batch(lines, before, after, title, depth=0):
+    """بيترجم مجموعة سطور. لو العدد ما طابقش بيقسمها نصين، وآخر حاجة بيسيب السطر زي ما هو."""
+    if not lines:
+        return []
+    msg = json.dumps({"title": title, "before": before, "lines": lines, "after": after}, ensure_ascii=False)
+    for _ in range(2):
+        try:
+            t = _ai_call(msg)
+            a, z = t.find("["), t.rfind("]")
+            res = json.loads(t[a:z + 1])
+            if isinstance(res, list) and len(res) == len(lines) and all(isinstance(x, str) for x in res):
+                return [x.strip() for x in res]
+        except requests.RequestException:
+            time.sleep(1.5)
+        except ValueError:
+            pass
+    if len(lines) == 1 or depth > 4:
+        return list(lines)
+    h = len(lines) // 2
+    return (_ai_batch(lines[:h], before, lines[h:h + 3], title, depth + 1) +
+            _ai_batch(lines[h:], lines[max(0, h - 3):h], after, title, depth + 1))
+
+
+def _ai_job(key, u, season, episode, title):
+    vtt, _ = build_sub(u, season, episode, False, "vtt", 0.0, 1.0)
+    src = _vtt_text_cues(vtt)
+    if len(src) < 20:
+        return {"ok": False, "reason": "fewcues"}
+    jobs = []
+    for i in range(0, len(src), AI_BATCH):
+        jobs.append((src[i:i + AI_BATCH], src[max(0, i - 4):i], src[i + AI_BATCH:i + AI_BATCH + 4]))
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        parts = list(ex.map(lambda j: _ai_batch(j[0], j[1], j[2], title), jobs))
+    texts = [x for p in parts for x in p]
+    done = sum(1 for a, b in zip(src, texts) if a != b)
+    if done < len(src) * 0.5:
+        return {"ok": False, "reason": "aifail"}
+    store_save(_ai_cpath(key), {"texts": texts, "model": AI_MODEL})
+    return {"ok": True, "ai": key, "n": len(texts)}
+
+
+def _ai_worker(key, u, se, ep, title):
+    res = None
+    try:
+        with AI_SEM:
+            res = _ai_job(key, u, int(se) if str(se).isdigit() else None,
+                          int(ep) if str(ep).isdigit() else None, title)
+    except Exception as ex:
+        res = {"ok": False, "reason": "error", "msg": str(ex)[:120]}
+    finally:
+        with AS_LOCK:
+            AI_RUN[key] = {"t": time.time(), "res": res}
+
+
+@app.post("/sub/ai")
+def sub_ai_start():
+    b = request.get_json(silent=True) or {}
+    u = str(b.get("u", ""))
+    if not ok_sub_path(u):
+        return jsonify(error="رابط ترجمة غير صالح"), 400
+    if not AI_KEY:
+        return jsonify(done=True, ok=False, reason="noai")
+    se, ep = str(b.get("s", ""))[:6], str(b.get("e", ""))[:6]
+    key = hashlib.sha1("|".join((u, se, ep, AI_MODEL)).encode()).hexdigest()[:32]
+    try:
+        store_load(_ai_cpath(key))
+        return jsonify(done=True, ok=True, ai=key)
+    except Exception:
+        pass
+    with AS_LOCK:
+        st = AI_RUN.get(key)
+        if not st or st.get("res") is not None:
+            AI_RUN[key] = {"t": time.time(), "res": None}
+            threading.Thread(target=_ai_worker, daemon=True,
+                             args=(key, u, se, ep, str(b.get("title", ""))[:120])).start()
+    return jsonify(done=False, job=key)
+
+
+@app.get("/sub/ai")
+def sub_ai_poll():
+    key = re.sub(r"[^a-f0-9]", "", request.args.get("job", ""))[:40]
+    with AS_LOCK:
+        st = AI_RUN.get(key)
+    if st and st.get("res") is not None:
+        return jsonify(done=True, **st["res"])
+    if st:
+        return jsonify(done=False, job=key)
+    try:
+        store_load(_ai_cpath(key))
+        return jsonify(done=True, ok=True, ai=key)
+    except Exception:
+        return jsonify(done=True, ok=False, reason="lost")
+
+
+# ===================== نهاية الترجمة بالذكاء الاصطناعي =====================
 
 
 # ----------------- إشعارات الحلقات الجديدة (Web Push) -----------------

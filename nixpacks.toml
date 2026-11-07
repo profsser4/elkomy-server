@@ -1,0 +1,3 @@
+# Railway: بيسطّب ffmpeg على السيرفر عشان الضبط التلقائي للترجمة بالصوت يشتغل
+[phases.setup]
+aptPkgs = ["ffmpeg"]
