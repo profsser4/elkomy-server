@@ -916,6 +916,15 @@ def iptv_pins_set():
                     out[k] = [str(i)[:20] for i in v][:800]
         return out
     order, hidden = idmap(p.get("order")), idmap(p.get("hidden"))
+    names = {}                           # أسماء مخصّصة للأقسام: {kind: {category_id: "اسم"}}
+    nm = p.get("names")
+    if isinstance(nm, dict):
+        for k in ("live", "vod", "series"):
+            v = nm.get(k)
+            if isinstance(v, dict):
+                d2 = {str(i)[:20]: str(n).strip()[:80] for i, n in list(v.items())[:800] if str(n).strip()}
+                if d2:
+                    names[k] = d2
     with IPTV_LOCK:
         al = iptv_load()
         rec = al.get(g.user)
@@ -928,7 +937,7 @@ def iptv_pins_set():
         gc = {(c.get("k"), c.get("id")) for c in (gp.get("cats") or []) if isinstance(c, dict)}
         live = [x for x in live if x not in gl]                      # تثبيتات الكل مابتتنسخش على حساب العضو
         cats = [c for c in cats if (c["k"], c["id"]) not in gc]
-        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats, "order": order, "hidden": hidden}
+        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats, "order": order, "hidden": hidden, "names": names}
         iptv_save(al)
     return jsonify(ok=True)
 
