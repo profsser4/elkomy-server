@@ -1770,6 +1770,9 @@ def ud_save(d, user):
     store_save(ud_path(user), d)
 
 
+IV_PID_RX = re.compile(r"iv:[A-Za-z0-9_.-]{1,24}")
+
+
 def ud_merge(base, inc):
     if not isinstance(inc, dict):
         return base
@@ -1786,7 +1789,15 @@ def ud_merge(base, inc):
             base["profiles"][pid] = p
     allit = inc.get("items")
     for pid, items in (allit.items() if isinstance(allit, dict) else []):
-        if pid not in base["profiles"] or not isinstance(items, dict):
+        if not isinstance(items, dict) or not isinstance(pid, str):
+            continue
+        if pid.startswith("iv:"):
+            # كمّل مشاهدة الـIPTV: معرّف 'iv:<بروفايل>' مش بروفايل حقيقي، فلازم يتقبل بشكل مستقل
+            if not IV_PID_RX.fullmatch(pid):
+                continue
+            if pid not in base["items"] and sum(1 for x in base["items"] if x.startswith("iv:")) >= MAX_PROFILES + 2:
+                continue
+        elif pid not in base["profiles"]:
             continue
         dst = base["items"].setdefault(pid, {})
         for k, it in items.items():
