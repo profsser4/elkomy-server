@@ -495,6 +495,7 @@ def guard():
             return jsonify(error=SUSP_MSG, suspended=True), 401
         return jsonify(error="غير مصرّح"), 401
     g.user, g.role = who
+    g.sid = _sid or hashlib.sha1(request.headers.get("X-Token", "").encode()).hexdigest()[:16]
     LAST[g.user] = time.time()
     if g.role != "admin":
         try:
@@ -1424,19 +1425,90 @@ def member_locked(user=None):
     return plan_of(rec)["state"] in ("free", "expired")
 
 
+# ---- أكتر من حساب IPTV: السيرفر بيوزّع الأجهزة على الحسابات (كل جهاز بيثبت على حساب) ----
+IPTV_ASSIGN = {}          # {devkey: (acckey, last_seen)}
+IPTV_ASSIGN_TTL = 3 * 3600
+IPTV_MAX_EXTRA = 8
+
+
+def _acc_key(a):
+    return f"{a.get('host', '')}|{a.get('user', '')}"
+
+
+def iptv_accs(rec):
+    """الحساب الأساسي + الحسابات الإضافية (كلهم dicts فيهم host/user/pass/stat)."""
+    if not rec or not rec.get("host"):
+        return []
+    out = [rec]
+    for x in (rec.get("extra") or []):
+        if isinstance(x, dict) and x.get("host") and x.get("user") and x.get("pass"):
+            out.append(x)
+    return out
+
+
+def iptv_owner(al, user):
+    """صاحب الحسابات: العضو نفسه لو عنده حساب، وإلا الحساب المشترك."""
+    rec = al.get(user) or {}
+    if rec.get("host"):
+        return user, rec
+    rec = al.get(IPTV_ALL) or {}
+    return (IPTV_ALL, rec) if rec.get("host") else (None, None)
+
+
+def iptv_pick(accs, devkey, rotate=False):
+    """بيختار الحساب الأقل ضغطاً للجهاز ده ويثبّته عليه. بيرجّع الـdict بتاع الحساب."""
+    now = time.time()
+    for k in [k for k, v in IPTV_ASSIGN.items() if now - v[1] > IPTV_ASSIGN_TTL]:
+        IPTV_ASSIGN.pop(k, None)
+    cur = (IPTV_ASSIGN.get(devkey) or ("", 0))[0]
+    byk = {_acc_key(a): a for a in accs}
+    if len(accs) == 1:
+        IPTV_ASSIGN[devkey] = (_acc_key(accs[0]), now)
+        return accs[0]
+
+    def expired(a):
+        e = (a.get("stat") or {}).get("exp") or 0
+        return bool(e) and e < now
+
+    if cur in byk and not rotate and not expired(byk[cur]):
+        IPTV_ASSIGN[devkey] = (cur, now)
+        return byk[cur]
+    load = {}
+    for dk, (ak, _t) in IPTV_ASSIGN.items():
+        if dk != devkey:
+            load[ak] = load.get(ak, 0) + 1
+    pool = [a for a in accs if not expired(a)] or list(accs)
+    if rotate and len(pool) > 1:
+        pool = [a for a in pool if _acc_key(a) != cur] or pool
+
+    def score(a):
+        mx = (a.get("stat") or {}).get("maxc") or 0
+        n = load.get(_acc_key(a), 0)
+        return (n / mx) if mx else n
+    best = min(pool, key=lambda a: (score(a), accs.index(a)))
+    IPTV_ASSIGN[devkey] = (_acc_key(best), now)
+    return best
+
+
+def _dev_key():
+    return f"{g.user}:{getattr(g, 'sid', '')}"
+
+
 @app.get("/iptv/cfg")
 def iptv_cfg():
     if member_locked():
         return jsonify(set=False, locked=True, error="الـIPTV للأعضاء المميزين بس")
     al = iptv_load()
-    rec = al.get(g.user) or {}
-    shared = False
-    if not rec.get("host"):
-        rec = al.get(IPTV_ALL) or {}
-        shared = bool(rec.get("host"))
-    o = iptv_pub(rec)
-    if shared:
+    owner, rec = iptv_owner(al, g.user)
+    accs = iptv_accs(rec)
+    if not accs:
+        return jsonify({"set": False})
+    acc = iptv_pick(accs, _dev_key(), rotate=request.args.get("rotate") == "1")
+    o = iptv_pub(acc)
+    if owner == IPTV_ALL:
         o["shared"] = True
+    if len(accs) > 1:
+        o["n"] = len(accs)
     return jsonify(o)
 
 
@@ -1454,12 +1526,12 @@ def iptv_stat():
             return 0
     with IPTV_LOCK:
         al = iptv_load()
-        rec = al.get(g.user)
-        if not rec or not rec.get("host"):
-            rec = al.get(IPTV_ALL)
-        if not rec or not rec.get("host"):
+        owner, rec = iptv_owner(al, g.user)
+        accs = iptv_accs(rec)
+        if not accs:
             return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
-        rec["stat"] = {"exp": num("exp"), "maxc": num("maxc"), "active": num("active"),
+        acc = iptv_pick(accs, _dev_key())
+        acc["stat"] = {"exp": num("exp"), "maxc": num("maxc"), "active": num("active"),
                        "status": str(d.get("status") or "")[:30],
                        "trial": bool(d.get("trial")), "t": int(time.time())}
         iptv_save(al)
@@ -1619,6 +1691,9 @@ def iptv_admin_list():
     for n in [IPTV_ALL] + names:
         o = iptv_pub(al.get(n))
         o["name"] = n
+        if o.get("set"):
+            o["extra"] = [{"host": x.get("host", ""), "user": x.get("user", ""), "pass": x.get("pass", ""),
+                           "stat": x.get("stat") or {}} for x in iptv_accs(al.get(n))[1:]]
         out.append(o)
     return jsonify(items=out)
 
@@ -1642,8 +1717,20 @@ def iptv_admin_set(name):
             return jsonify(error="الهوست واليوزر والباس كلهم مطلوبين"), 400
         old = al.get(name) or {}
         same = old.get("host") == host and old.get("user") == user
+        oldx = {_acc_key(x): x for x in (old.get("extra") or []) if isinstance(x, dict)}
+        extra, seen_k = [], {host + "|" + user}
+        for x in (d.get("extra") or [])[:IPTV_MAX_EXTRA]:
+            if not isinstance(x, dict):
+                continue
+            xh, xu, xp = iptv_host(x.get("host")), str(x.get("user", "")).strip()[:80], str(x.get("pass", "")).strip()[:80]
+            if not xh or not xu or not xp or (xh + "|" + xu) in seen_k:
+                continue
+            seen_k.add(xh + "|" + xu)
+            extra.append({"host": xh, "user": xu, "pass": xp,
+                          "stat": (oldx.get(xh + "|" + xu) or {}).get("stat") or {}})
         al[name] = {"host": host, "user": user, "pass": pw,
                     "stat": old.get("stat") if same else {},
+                    "extra": extra,
                     "pins": old.get("pins") or {}}
         iptv_save(al)
     return jsonify(ok=True, host=host)
