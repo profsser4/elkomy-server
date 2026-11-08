@@ -1494,8 +1494,21 @@ def _dev_key():
     return f"{g.user}:{getattr(g, 'sid', '')}"
 
 
+def iptv_cm(rec, acc):
+    """خريطة القنوات: {رقم القناة عند الحساب الأساسي: رقمها عند الحساب ده}"""
+    pk, ak = _acc_key(rec), _acc_key(acc)
+    cm = {}
+    for m in (rec.get("cmap") or []):
+        ids = m.get("ids") if isinstance(m, dict) else None
+        if isinstance(ids, dict) and ids.get(pk) and ids.get(ak):
+            cm[str(ids[pk])] = str(ids[ak])
+    return cm
+
+
 @app.get("/iptv/cfg")
 def iptv_cfg():
+    """host/user/pass = الحساب الأساسي (القوائم والأفلام والمسلسلات).
+    sa = حساب البث المخصّص للجهاز ده للقنوات المباشرة (لو غير الأساسي) ومعاه cm (ربط القنوات)."""
     if member_locked():
         return jsonify(set=False, locked=True, error="الـIPTV للأعضاء المميزين بس")
     al = iptv_load()
@@ -1503,12 +1516,16 @@ def iptv_cfg():
     accs = iptv_accs(rec)
     if not accs:
         return jsonify({"set": False})
-    acc = iptv_pick(accs, _dev_key(), rotate=request.args.get("rotate") == "1")
-    o = iptv_pub(acc)
+    o = iptv_pub(rec)
     if owner == IPTV_ALL:
         o["shared"] = True
     if len(accs) > 1:
         o["n"] = len(accs)
+        acc = iptv_pick(accs, _dev_key(), rotate=request.args.get("rotate") == "1")
+        if acc is not rec:
+            cm = iptv_cm(rec, acc)
+            if cm:
+                o["sa"] = {"host": acc["host"], "user": acc["user"], "pass": acc["pass"], "cm": cm}
     return jsonify(o)
 
 
@@ -1530,7 +1547,7 @@ def iptv_stat():
         accs = iptv_accs(rec)
         if not accs:
             return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
-        acc = iptv_pick(accs, _dev_key())
+        acc = rec
         acc["stat"] = {"exp": num("exp"), "maxc": num("maxc"), "active": num("active"),
                        "status": str(d.get("status") or "")[:30],
                        "trial": bool(d.get("trial")), "t": int(time.time())}
@@ -1683,6 +1700,18 @@ def iptv_feat_set():
 
 
 
+def _prune_cmap(cm, keys):
+    """بيشيل من ربط القنوات أي حساب اتمسح، وأي ربط فضل فيه أقل من حسابين."""
+    out = []
+    for m in (cm or [])[:200]:
+        if not isinstance(m, dict) or not isinstance(m.get("ids"), dict):
+            continue
+        ids = {k: str(v)[:20] for k, v in m["ids"].items() if k in keys and str(v).strip()}
+        if len(ids) >= 2:
+            out.append({"n": str(m.get("n") or "")[:80], "ids": ids})
+    return out
+
+
 @app.get("/iptv/admin")
 def iptv_admin_list():
     al = iptv_load()
@@ -1694,6 +1723,7 @@ def iptv_admin_list():
         if o.get("set"):
             o["extra"] = [{"host": x.get("host", ""), "user": x.get("user", ""), "pass": x.get("pass", ""),
                            "stat": x.get("stat") or {}} for x in iptv_accs(al.get(n))[1:]]
+            o["cmap"] = al.get(n, {}).get("cmap") or []
         out.append(o)
     return jsonify(items=out)
 
@@ -1731,9 +1761,26 @@ def iptv_admin_set(name):
         al[name] = {"host": host, "user": user, "pass": pw,
                     "stat": old.get("stat") if same else {},
                     "extra": extra,
+                    "cmap": _prune_cmap(old.get("cmap"), [host + "|" + user] + [_acc_key(x) for x in extra]),
                     "pins": old.get("pins") or {}}
         iptv_save(al)
     return jsonify(ok=True, host=host)
+
+
+@app.post("/iptv/admin/<name>/cmap")
+def iptv_admin_cmap(name):
+    """حفظ ربط القنوات بين حسابات نفس العضو: {cmap:[{n:'beIN 1', ids:{'host|user': stream_id}}]}"""
+    name = name.strip().lower()
+    d = request.get_json(silent=True) or {}
+    with IPTV_LOCK:
+        al = iptv_load()
+        rec = al.get(name)
+        if not rec or not rec.get("host"):
+            return jsonify(error="مفيش اشتراك للعضو ده"), 404
+        keys = [_acc_key(x) for x in iptv_accs(rec)]
+        rec["cmap"] = _prune_cmap(d.get("cmap"), keys)
+        iptv_save(al)
+    return jsonify(ok=True, cmap=rec["cmap"])
 
 
 @app.get("/providers")
