@@ -4728,7 +4728,7 @@ ROWS_DEF = [
     {"id": "ar_movies", "title": "🇪🇬 أفلام عربي", "type": "movie",
      "path": "/discover/movie",
      "q": {"sort_by": "popularity.desc", "with_original_language": "ar",
-           "primary_release_date.gte": "d:-365",
+           "without_genres": "99", "primary_release_date.gte": "d:-365",
            "primary_release_date.lte": "d:0"}},
     {"id": "ar_tv", "title": "🇪🇬 مسلسلات عربي", "type": "tv",
      "path": "/discover/tv",
@@ -6362,9 +6362,9 @@ def x_for_you_impl():
                         ("🇪🇬 كرتون مدبلج بالمصري", None, None)]
             else:
                 jobs = [(f"{'🎬' if ty == 'movie' else '📺'} {kind} {nm} ليك", ty,
-                         {"with_original_language": lg, "without_genres": 16}),
+                         {"with_original_language": lg, "without_genres": "16|99"}),
                         (f"⭐ الأعلى تقييماً — {kind} {nm}", ty,
-                         {"with_original_language": lg, "without_genres": 16,
+                         {"with_original_language": lg, "without_genres": "16|99",
                           "sort_by": "vote_average.desc", "vote_count.gte": "150"})]
                 if lite:
                     jobs = jobs[:1]
@@ -6703,7 +6703,7 @@ def build_new():
         ("tv", "all", NEW_MIN_POP_TV, "/discover/tv", {"first_air_date.gte": gt, "first_air_date.lte": tdy}),
         ("tv", "kr", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "KR", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
         ("tv", "in", NEW_MIN_POP_TV, "/discover/tv", {"with_origin_country": "IN", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
-        ("movie", "ar", 1.5, "/discover/movie", {"with_original_language": "ar", "primary_release_date.gte": gm, "primary_release_date.lte": tdy}),
+        ("movie", "ar", 1.5, "/discover/movie", {"with_original_language": "ar", "without_genres": "99", "primary_release_date.gte": gm, "primary_release_date.lte": tdy}),
         ("tv", "ar", 1.5, "/discover/tv", {"with_original_language": "ar", "first_air_date.gte": gt, "first_air_date.lte": tdy}),
     ]
     with ThreadPoolExecutor(max_workers=8) as ex:
