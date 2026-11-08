@@ -970,6 +970,65 @@ def iptv_pins_set():
     return jsonify(ok=True)
 
 
+IPTV_FEAT = "__feat__"    # ماتشات مميزة + بانرات إعلان + إعلان منبثق (الأدمن بس بيعدّلها)
+
+
+def _fs(x, n):
+    return str(x or "").strip()[:n]
+
+
+def _furl(x):
+    x = _fs(x, 600)
+    return x if x.lower().startswith(("http://", "https://")) else ""
+
+
+def _fdate(x):
+    x = _fs(x, 10)
+    return x if re.match(r"^\d{4}-\d{2}-\d{2}$", x) else ""
+
+
+def feat_clean(d):
+    out = {"mt": _fs(d.get("mt"), 60), "matches": [], "banners": [], "popup": {"on": False}}
+    for m in (d.get("matches") or [])[:12]:
+        if isinstance(m, dict) and _fs(m.get("ch"), 20):
+            out["matches"].append({"id": _fs(m.get("id"), 20) or uuid.uuid4().hex[:8], "ch": _fs(m.get("ch"), 20),
+                                   "n": _fs(m.get("n"), 80), "icon": _furl(m.get("icon")),
+                                   "title": _fs(m.get("title"), 80), "time": _fs(m.get("time"), 40),
+                                   "until": _fdate(m.get("until"))})
+    for b in (d.get("banners") or [])[:10]:
+        if isinstance(b, dict) and _fs(b.get("title"), 80):
+            k = b.get("k") if b.get("k") in ("vod", "series") else ""
+            out["banners"].append({"id": _fs(b.get("id"), 20) or uuid.uuid4().hex[:8], "k": k,
+                                   "sid": _fs(b.get("sid"), 20) if k else "", "title": _fs(b.get("title"), 80),
+                                   "sub": _fs(b.get("sub"), 160), "img": _furl(b.get("img")),
+                                   "tag": _fs(b.get("tag"), 30), "until": _fdate(b.get("until"))})
+    p = d.get("popup")
+    if isinstance(p, dict):
+        k = p.get("k") if p.get("k") in ("vod", "series") else ""
+        out["popup"] = {"on": bool(p.get("on")), "id": _fs(p.get("id"), 20), "title": _fs(p.get("title"), 80),
+                        "text": _fs(p.get("text"), 300), "img": _furl(p.get("img")), "k": k,
+                        "sid": _fs(p.get("sid"), 20) if k else "", "until": _fdate(p.get("until"))}
+    return out
+
+
+@app.get("/iptv/feat")
+def iptv_feat_get():
+    return jsonify((iptv_load().get(IPTV_FEAT) or {}))
+
+
+@app.post("/iptv/feat")
+def iptv_feat_set():
+    if g.role != "admin":
+        return jsonify(error="للأدمن بس"), 403
+    d = request.get_json(silent=True) or {}
+    with IPTV_LOCK:
+        al = iptv_load()
+        al[IPTV_FEAT] = feat_clean(d)
+        iptv_save(al)
+    return jsonify(ok=True)
+
+
+
 @app.get("/iptv/admin")
 def iptv_admin_list():
     al = iptv_load()
