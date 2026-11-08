@@ -4727,6 +4727,12 @@ import array
 import sys
 
 AS_FF = shutil.which("ffmpeg")
+if not AS_FF:                       # Vercel: مفيش ffmpeg في النظام، فنستخدم النسخة الجاهزة من حزمة imageio-ffmpeg
+    try:
+        import imageio_ffmpeg
+        AS_FF = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        AS_FF = None
 AS_FP = shutil.which("ffprobe")
 AS_HYP = (1.0, 0.95904, 1.04271, 1.04167, 0.96, 0.999, 1.001)   # نسب الفريمات المعروفة 23.976/24/25
 AS_RATIOS = AS_HYP[1:]
@@ -5021,7 +5027,15 @@ def _as_job(u, src, season, episode, lang, dur_hint):
                     wins.append(r)
     if len(wins) < 2:
         return {"ok": False, "reason": "noaudio"}
-    return _as_solve(cues, wins)
+    res = _as_solve(cues, wins)
+    if not res.get("ok") and res.get("reason") in ("low", "nosig"):
+        # ثقة ضعيفة: نجيب عينات صوت إضافية من أماكن تانية ونحاول تاني قبل ما نستسلم
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for w2 in ex.map(lambda f: _safe(grab, f), (0.05, 0.18, 0.50, 0.70, 0.95)):
+                if w2:
+                    wins.append(w2)
+        res = _as_solve(cues, wins)
+    return res
 
 
 def _safe(fn, *a):
@@ -5041,7 +5055,7 @@ def _as_worker(key, u, src, se, ep, lang, dur):
         with AS_SEM:
             res = _as_job(u, src, int(se) if str(se).isdigit() else None,
                           int(ep) if str(ep).isdigit() else None, lang, dur)
-        if res.get("reason") not in ("noaudio",):      # النتيجة النهائية بس هي اللي بتتحفظ
+        if res.get("ok"):      # بنحفظ النجاح بس، والفشل بيتعاد تاني (عشان التحسينات تشتغل)
             try:
                 store_save(_as_cpath(key), res)
             except Exception:
@@ -5075,6 +5089,9 @@ def sub_auto_start():
         dur = float(b.get("dur") or 0)
     except (TypeError, ValueError):
         dur = 0.0
+    if os.environ.get("VERCEL"):    # serverless: الـ thread بيتقتل بعد الرد، فنشتغل جوه نفس الطلب ونرد بالنتيجة
+        _as_worker(key, u, src, se, ep, str(b.get("lang", ""))[:20], dur)
+        return jsonify(done=True, **(AS_RUN.get(key, {}).get("res") or {"ok": False, "reason": "error"}))
     with AS_LOCK:
         for k in [k for k, v in AS_RUN.items() if v.get("res") and time.time() - v["t"] > 600]:
             AS_RUN.pop(k, None)
