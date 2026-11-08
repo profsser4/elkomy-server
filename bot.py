@@ -1703,7 +1703,7 @@ def iptv_feat_set():
 def _prune_cmap(cm, keys):
     """بيشيل من ربط القنوات أي حساب اتمسح، وأي ربط فضل فيه أقل من حسابين."""
     out = []
-    for m in (cm or [])[:200]:
+    for m in (cm or [])[:1500]:
         if not isinstance(m, dict) or not isinstance(m.get("ids"), dict):
             continue
         ids = {k: str(v)[:20] for k, v in m["ids"].items() if k in keys and str(v).strip()}
