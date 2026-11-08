@@ -6,6 +6,7 @@ import uuid
 import hmac
 import base64
 import hashlib
+import secrets
 import time
 import zipfile
 import threading
@@ -68,6 +69,8 @@ def _env_first(*names):
 KV_URL = _env_first("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL", "STORAGE_KV_REST_API_URL").rstrip("/")
 KV_TOKEN = _env_first("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN", "STORAGE_KV_REST_API_TOKEN")
 KV_ON = bool(KV_URL and KV_TOKEN)
+if not KV_ON:
+    print("WARNING: Redis مش متوصّل — على Vercel الأعضاء هيتمسحوا مع كل تحديث. وصّل Upstash/Vercel KV فورًا.")
 KV_PREFIX = os.environ.get("KV_PREFIX", "elkomy:")
 _KV_SES = requests.Session()
 
@@ -310,16 +313,52 @@ def jj(r):
 
 # ----------------- المستخدمين والتوكن -----------------
 
-def users_load():
+USERS_BAK = os.path.join(DATA_DIR, "users.bak.json")     # نسخة احتياطية تلقائية بتتحدّث مع كل حفظ
+
+
+def _users_read(path):
+    """(dict, ok): ok=False معناها القراءة فشلت (Redis واقع مثلاً) — ودي حاجة غير إن مفيش بيانات."""
     try:
-        d = store_load(USERS_FILE)
-        return d if isinstance(d, dict) else {}
+        d = store_load(path)
+        return (d if isinstance(d, dict) else {}), True
+    except FileNotFoundError:
+        return {}, True
     except Exception:
-        return {}
+        return {}, False
 
 
-def users_save(d):
+def users_load():
+    d, ok = _users_read(USERS_FILE)
+    if d:
+        return d
+    b, _bok = _users_read(USERS_BAK)       # الملف الأساسي فاضي/مفقود/مش مقروء: نرجّع من النسخة الاحتياطية
+    if b:
+        if ok:
+            try:
+                store_save(USERS_FILE, b)  # رجّع الأعضاء تلقائيًا
+            except Exception:
+                pass
+        return b
+    return d
+
+
+def users_save(d, allow_delete=False):
+    """حفظ الأعضاء بأمان: عمره ما بيمسح عضو غير لو حذف صريح من الأدمن (allow_delete=True)،
+    ويرفض الحفظ لو القراءة الحالية فشلت (عشان عطل مؤقت في Redis ما يمسحش الكل)."""
+    cur, ok = _users_read(USERS_FILE)
+    if not ok:
+        raise RuntimeError("تعذّر قراءة بيانات الأعضاء، اتلغى الحفظ حمايةً للبيانات")
+    if not cur:
+        cur, _ = _users_read(USERS_BAK)
+    if not allow_delete:
+        for n, r in cur.items():
+            if n not in d:
+                d[n] = r                   # أي عضو موجود ومش في النسخة اللي بتتحفظ بيرجع تلقائيًا
     store_save(USERS_FILE, d)
+    try:
+        store_save(USERS_BAK, d)
+    except Exception:
+        pass
 
 
 def fp_of(s):
@@ -431,7 +470,7 @@ def read_token(tok):
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
-    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith("/subx/"):
+    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith(("/subx/", "/auth/")):
         return None
     who, why, _rec, _sid = read_token_ex(request.headers.get("X-Token", ""))
     if not who:
@@ -474,6 +513,62 @@ def too_many(ip, limit=10):
     return len(lst) >= limit
 
 
+def _login_user(u, rec, d, ip):
+    """بيفتح جلسة لعضو (مع حد الأجهزة والتحذيرات) — مشتركة بين الدخول العادي والتسجيل وكود الإيميل"""
+    if rec.get("susp"):
+        return jsonify(ok=False, suspended=True, error=SUSP_MSG), 423
+    dv = str(d.get("dv", "")).strip()[:40] or ("ip:" + ip)
+    ty = str(d.get("ty", "")).strip().lower()
+    if ty not in DTYPES:
+        ty = "web"
+    now = time.time()
+    warn = ""
+    with USERS_LOCK:
+        us = users_load()
+        rec = us.get(u) or rec
+        lim = lim_of(rec)
+        if lim[ty] <= 0:
+            return jsonify(ok=False, blocked=True, title="الجهاز مش مسموح",
+                           error=f"حسابك مش مسموح له يدخل من {TYPE_AR[ty]}. كلّم الأدمن."), 423
+        ss = {k: v for k, v in sess_of(rec).items() if now - float(v.get("ls", 0) or 0) < 30 * 86400}
+        rec.pop("sid", None)
+        rec.pop("dv", None)
+        strikes = int(rec.get("st", 0))
+        cur = ss.get(dv)
+        if cur:                                              # نفس الجهاز: مفيش مشكلة
+            cur["ty"], cur["ls"] = ty, int(now)
+            sid = cur["sid"]
+        else:
+            same = sorted(((k, v) for k, v in ss.items() if v.get("ty") == ty), key=lambda kv: kv[1].get("ls", 0))
+            over = len(same) - lim[ty] + 1
+            for k, v in same:                                # الخاملين (مش شغّالين) بيتشالوا من غير تحذير
+                if over <= 0:
+                    break
+                if now - float(v.get("ls", 0) or 0) >= SESS_ACTIVE:
+                    ss.pop(k)
+                    over -= 1
+            if over > 0:                                     # لسه فيه أجهزة شغّالة فعلاً من نفس النوع = تجاوز
+                for k, v in [(k, v) for k, v in same if k in ss][:over]:
+                    ss.pop(k)
+                strikes += 1
+                rec["st"], rec["sa"] = strikes, int(now)
+                if strikes >= MAX_STRIKES:
+                    rec["susp"] = True
+                    rec["ss"] = {}
+                    us[u] = rec
+                    users_save(us)
+                    return jsonify(ok=False, suspended=True, title="الحساب موقوف", error=SUSP_MSG), 423
+                warn = (f"⚠️ تحذير {strikes} من {MAX_STRIKES}: الحساب اتفتح على أكتر من {TYPE_AR[ty]} "
+                        f"(المسموح {lim[ty]}) فاتقفل الأقدم. لو اتكرر الحساب هيتوقف.")
+            sid = uuid.uuid4().hex[:12]
+            ss[dv] = {"sid": sid, "ty": ty, "ls": int(now)}
+        rec["ss"] = ss
+        us[u] = rec
+        users_save(us)
+    return jsonify(ok=True, role="user", user=u, warn=warn, strikes=strikes,
+                   token=make_token(u, "user", fp_of(rec["h"]), sid))
+
+
 @app.post("/auth")
 def auth():
     ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -483,71 +578,336 @@ def auth():
     d = request.get_json(silent=True) or {}
     u = str(d.get("u", "")).strip().lower()
     p = str(d.get("p", "")).strip()
-    if len(u) > 64 or len(p) > 200:
+    if len(u) > 254 or len(p) > 200:
         return jsonify(ok=False), 400
     if too_many("u:" + u, 20):
         return jsonify(ok=False, error="محاولات كتير"), 429
     if u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
         return jsonify(ok=True, role="admin", user=u,
                        token=make_token(u, "admin", fp_of(APP_PASS)))
+    if "@" in u:
+        u = find_by_email(users_load(), u) or u
     rec = users_load().get(u)
     if rec and check_password_hash(rec["h"], p):
-        if rec.get("susp"):
-            return jsonify(ok=False, suspended=True, error=SUSP_MSG), 423
-        dv = str(d.get("dv", "")).strip()[:40] or ("ip:" + ip)
-        ty = str(d.get("ty", "")).strip().lower()
-        if ty not in DTYPES:
-            ty = "web"
-        now = time.time()
-        warn = ""
-        with USERS_LOCK:
-            us = users_load()
-            rec = us.get(u) or rec
-            lim = lim_of(rec)
-            if lim[ty] <= 0:
-                return jsonify(ok=False, blocked=True, title="الجهاز مش مسموح",
-                               error=f"حسابك مش مسموح له يدخل من {TYPE_AR[ty]}. كلّم الأدمن."), 423
-            ss = {k: v for k, v in sess_of(rec).items() if now - float(v.get("ls", 0) or 0) < 30 * 86400}
-            rec.pop("sid", None)
-            rec.pop("dv", None)
-            strikes = int(rec.get("st", 0))
-            cur = ss.get(dv)
-            if cur:                                              # نفس الجهاز: مفيش مشكلة
-                cur["ty"], cur["ls"] = ty, int(now)
-                sid = cur["sid"]
-            else:
-                same = sorted(((k, v) for k, v in ss.items() if v.get("ty") == ty), key=lambda kv: kv[1].get("ls", 0))
-                over = len(same) - lim[ty] + 1
-                for k, v in same:                                # الخاملين (مش شغّالين) بيتشالوا من غير تحذير
-                    if over <= 0:
-                        break
-                    if now - float(v.get("ls", 0) or 0) >= SESS_ACTIVE:
-                        ss.pop(k)
-                        over -= 1
-                if over > 0:                                     # لسه فيه أجهزة شغّالة فعلاً من نفس النوع = تجاوز
-                    for k, v in [(k, v) for k, v in same if k in ss][:over]:
-                        ss.pop(k)
-                    strikes += 1
-                    rec["st"], rec["sa"] = strikes, int(now)
-                    if strikes >= MAX_STRIKES:
-                        rec["susp"] = True
-                        rec["ss"] = {}
-                        us[u] = rec
-                        users_save(us)
-                        return jsonify(ok=False, suspended=True, title="الحساب موقوف", error=SUSP_MSG), 423
-                    warn = (f"⚠️ تحذير {strikes} من {MAX_STRIKES}: الحساب اتفتح على أكتر من {TYPE_AR[ty]} "
-                            f"(المسموح {lim[ty]}) فاتقفل الأقدم. لو اتكرر الحساب هيتوقف.")
-                sid = uuid.uuid4().hex[:12]
-                ss[dv] = {"sid": sid, "ty": ty, "ls": int(now)}
-            rec["ss"] = ss
-            us[u] = rec
-            users_save(us)
-        return jsonify(ok=True, role="user", user=u, warn=warn, strikes=strikes,
-                       token=make_token(u, "user", fp_of(rec["h"]), sid))
+        return _login_user(u, rec, d, ip)
     FAILS.setdefault(ip, []).append(time.time())
     FAILS.setdefault("u:" + u, []).append(time.time())
     time.sleep(0.5)
     return jsonify(ok=False), 401
+
+
+# ----------------- التسجيل الذاتي (يوزر/باسورد، إيميل/باسورد، تسجيل سريع بكود) -----------------
+# إعداد الإيميل (واحد من الاتنين) على Vercel Environment Variables:
+#   Resend:  RESEND_API_KEY  (+ MAIL_FROM مثلاً  Elkomy <no-reply@yourdomain.com>)
+#   SMTP:    SMTP_HOST, SMTP_PORT (465 أو 587), SMTP_USER, SMTP_PASS (+ MAIL_FROM)
+# REG_OPEN=0 بيقفل التسجيل نهائيًا من الإعدادات؛ وإلا الأدمن يفتحه ويقفله من جوه الموقع.
+EMAIL_RX = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s.]{2,24}$")
+OTP_FILE = os.path.join(DATA_DIR, "otp.json")
+OTP_LOCK = threading.Lock()
+OTP_TTL = 600        # صلاحية الكود 10 دقايق
+OTP_TRIES = 5        # محاولات غلط قبل ما الكود يتلغي
+OTP_GAP = 60         # أقل فاصل بين كودين لنفس الإيميل
+RL = {}
+
+
+def rl_hit(key, limit, window):
+    """True لو الحد اتعدّى. بيسجّل المحاولة لو لسه تحت الحد."""
+    now = time.time()
+    lst = [t for t in RL.get(key, []) if now - t < window]
+    if len(lst) >= limit:
+        RL[key] = lst
+        return True
+    lst.append(now)
+    RL[key] = lst
+    return False
+
+
+def client_ip():
+    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote_addr or "")
+
+
+def mail_on():
+    return bool(os.environ.get("RESEND_API_KEY", "").strip() or os.environ.get("SMTP_HOST", "").strip())
+
+
+def reg_open():
+    if os.environ.get("REG_OPEN", "1").strip() in ("0", "false", "no"):
+        return False
+    return bool(settings_load().get("reg", True))
+
+
+def norm_email(x):
+    e = str(x or "").strip().lower()
+    return e if len(e) <= 254 and EMAIL_RX.fullmatch(e) else ""
+
+
+def find_by_email(us, em):
+    """اسم العضو اللي إيميله موثّق = em (الإيميل الغير موثّق ما يتحسبش)"""
+    em = str(em or "").strip().lower()
+    for n, r in us.items():
+        if isinstance(r, dict) and r.get("ev") and r.get("em") == em:
+            return n
+    return ""
+
+
+def send_mail(to, subject, text, html):
+    frm = os.environ.get("MAIL_FROM", "").strip()
+    key = os.environ.get("RESEND_API_KEY", "").strip()
+    if key:
+        r = requests.post("https://api.resend.com/emails",
+                          headers={"Authorization": "Bearer " + key},
+                          json={"from": frm or "Elkomy <onboarding@resend.dev>", "to": [to],
+                                "subject": subject, "text": text, "html": html}, timeout=15)
+        if r.status_code >= 300:
+            raise Exception("mail " + str(r.status_code))
+        return
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if not host:
+        raise RuntimeError("mail off")
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    port = int(os.environ.get("SMTP_PORT", "465") or 465)
+    user = os.environ.get("SMTP_USER", "").strip()
+    pw = os.environ.get("SMTP_PASS", "")
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = subject, (frm or user), to
+    msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
+    ctx = ssl.create_default_context()
+    srv = smtplib.SMTP_SSL(host, port, timeout=15, context=ctx) if port == 465 else smtplib.SMTP(host, port, timeout=15)
+    try:
+        if port != 465:
+            srv.starttls(context=ctx)
+        if user:
+            srv.login(user, pw)
+        srv.send_message(msg)
+    finally:
+        try:
+            srv.quit()
+        except Exception:
+            pass
+
+
+def _mail_html(code):
+    return ('<div dir="rtl" style="font-family:Tahoma,Arial,sans-serif;background:#0f172a;padding:32px">'
+            '<div style="max-width:420px;margin:auto;background:#111c33;border-radius:16px;padding:28px;text-align:center;color:#e5ecff">'
+            '<h2 style="margin:0 0 6px;color:#38bdf8">Elkomy VIP</h2>'
+            '<p style="color:#9fb0d3;margin:0 0 18px">كود التحقق بتاعك</p>'
+            '<div style="font-size:38px;letter-spacing:10px;font-weight:bold;direction:ltr;background:#0b1224;border-radius:12px;padding:14px">'
+            + code + '</div>'
+            '<p style="color:#9fb0d3;font-size:13px;margin-top:18px">الكود صالح 10 دقايق. لو مش إنت اللي طلبته تجاهل الرسالة.</p>'
+            '</div></div>')
+
+
+def otp_load():
+    try:
+        d = store_load(OTP_FILE)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def otp_save(d):
+    now = time.time()
+    d = {k: v for k, v in d.items() if float(v.get("exp", 0)) > now}
+    store_save(OTP_FILE, d)
+
+
+def otp_key(em):
+    return hashlib.sha256(("em:" + em).encode()).hexdigest()[:32]
+
+
+def otp_hash(em, code):
+    return hmac.new(SECRET.encode(), (em + "|" + code).encode(), hashlib.sha256).hexdigest()
+
+
+def gen_username(us, em):
+    base = re.sub(r"[^a-z0-9_.-]", "", em.split("@")[0].lower())[:14]
+    if len(base) < 3:
+        base = (base + "user")[:14]
+    for _ in range(40):
+        n = base + str(secrets.randbelow(9000) + 1000)
+        if USER_RX.fullmatch(n) and n not in us and n != APP_USER.lower():
+            return n
+    return "u" + secrets.token_hex(7)
+
+
+def new_member(h, em="", ev=False, rp=False):
+    """العضو الجديد مجاني (تصفح بس) لحد ما الأدمن يفعّل له باقة مميزة"""
+    now = int(time.time())
+    r = {"h": h, "c": now, "plan": "free", "plan_at": now, "src": "self"}
+    if em:
+        r["em"], r["ev"] = em, bool(ev)
+    if rp:
+        r["rp"] = True
+    return r
+
+
+@app.get("/auth/config")
+def auth_config():
+    return jsonify(reg=reg_open(), mail=mail_on())
+
+
+@app.post("/auth/register")
+def auth_register():
+    """تسجيل بيوزر وباسورد (والإيميل اختياري ومش بيتوثّق هنا)"""
+    ip = client_ip()
+    d = request.get_json(silent=True) or {}
+    if str(d.get("hp", "")).strip():                       # honeypot للبوتات
+        return jsonify(error="طلب مرفوض"), 400
+    if not reg_open():
+        return jsonify(error="التسجيل مقفول دلوقتي. كلّم الأدمن."), 403
+    if rl_hit("reg:" + ip, 6, 3600):
+        return jsonify(error="محاولات تسجيل كتير. جرّب بعد شوية."), 429
+    n = str(d.get("username", "")).strip().lower()
+    p = str(d.get("password", "")).strip()
+    em = norm_email(d.get("email")) if str(d.get("email", "")).strip() else ""
+    if str(d.get("email", "")).strip() and not em:
+        return jsonify(error="الإيميل مش مكتوب صح"), 400
+    if not USER_RX.fullmatch(n):
+        return jsonify(error="الاسم 3-20 حرف إنجليزي أو أرقام أو _ . -"), 400
+    if n == APP_USER.lower():
+        return jsonify(error="الاسم ده محجوز"), 400
+    if len(p) < 6 or len(p) > 200:
+        return jsonify(error="الباسورد لازم 6 حروف على الأقل"), 400
+    with USERS_LOCK:
+        us = users_load()
+        if n in us:
+            return jsonify(error="الاسم ده متاخد، اختار اسم تاني"), 400
+        us[n] = new_member(generate_password_hash(p), em, False)
+        users_save(us)
+        rec = us[n]
+    return _login_user(n, rec, d, ip)
+
+
+@app.post("/auth/email/start")
+def auth_email_start():
+    """بيبعت كود من 6 أرقام على الإيميل (للتسجيل السريع، تسجيل إيميل+باسورد، دخول بالكود، أو استرجاع الباسورد)"""
+    ip = client_ip()
+    d = request.get_json(silent=True) or {}
+    if str(d.get("hp", "")).strip():
+        return jsonify(error="طلب مرفوض"), 400
+    if not mail_on():
+        return jsonify(error="التسجيل بالإيميل مش متاح دلوقتي."), 503
+    em = norm_email(d.get("email"))
+    if not em:
+        return jsonify(error="الإيميل مش مكتوب صح"), 400
+    if rl_hit("otp-ip:" + ip, 10, 3600):
+        return jsonify(error="طلبات كتير. جرّب بعد شوية."), 429
+    exists = bool(find_by_email(users_load(), em))
+    if not exists and not reg_open():
+        return jsonify(error="التسجيل مقفول دلوقتي. كلّم الأدمن."), 403
+    code = "%06d" % secrets.randbelow(10 ** 6)
+    k = otp_key(em)
+    with OTP_LOCK:
+        o = otp_load()
+        cur = o.get(k)
+        if cur and time.time() - float(cur.get("last", 0)) < OTP_GAP:
+            wait = int(OTP_GAP - (time.time() - float(cur.get("last", 0)))) + 1
+            return jsonify(error="استنى %d ثانية قبل ما تطلب كود جديد." % wait, wait=wait), 429
+        o[k] = {"h": otp_hash(em, code), "exp": int(time.time()) + OTP_TTL, "tries": 0, "last": int(time.time())}
+        otp_save(o)
+    try:
+        send_mail(em, "كود التحقق: " + code + " — Elkomy VIP",
+                  "كود التحقق بتاعك: " + code + "\nصالح 10 دقايق. لو مش إنت اللي طلبته تجاهل الرسالة.",
+                  _mail_html(code))
+    except Exception:
+        with OTP_LOCK:
+            o = otp_load()
+            o.pop(k, None)
+            otp_save(o)
+        return jsonify(error="مقدرتش أبعت الإيميل. اتأكد من العنوان أو جرّب بعد شوية."), 502
+    return jsonify(ok=True, ttl=OTP_TTL, gap=OTP_GAP)
+
+
+@app.post("/auth/email/verify")
+def auth_email_verify():
+    """بيتحقق من الكود: لو الإيميل ليه حساب بيدخّله (أو يغيّر الباسورد لو reset)، ولو لأ بيعمله حساب جديد"""
+    ip = client_ip()
+    d = request.get_json(silent=True) or {}
+    em = norm_email(d.get("email"))
+    code = re.sub(r"\D", "", str(d.get("code", "")))[:6]
+    if not em or len(code) != 6:
+        return jsonify(error="اكتب الإيميل وكود من 6 أرقام"), 400
+    if rl_hit("otpv:" + ip, 30, 3600):
+        return jsonify(error="محاولات كتير. جرّب بعد شوية."), 429
+    k = otp_key(em)
+    with OTP_LOCK:
+        o = otp_load()
+        cur = o.get(k)
+        if not cur or float(cur.get("exp", 0)) < time.time():
+            return jsonify(error="الكود انتهى. اطلب كود جديد."), 400
+        if int(cur.get("tries", 0)) >= OTP_TRIES:
+            o.pop(k, None)
+            otp_save(o)
+            return jsonify(error="محاولات غلط كتير. اطلب كود جديد."), 429
+        if not hmac.compare_digest(str(cur.get("h", "")), otp_hash(em, code)):
+            cur["tries"] = int(cur.get("tries", 0)) + 1
+            o[k] = cur
+            otp_save(o)
+            return jsonify(error="الكود غلط"), 400
+        o.pop(k, None)
+        otp_save(o)
+    pw = str(d.get("password", "")).strip()
+    with USERS_LOCK:
+        us = users_load()
+        un = find_by_email(us, em)
+        if un:
+            rec = us[un]
+            if d.get("reset"):
+                if len(pw) < 6 or len(pw) > 200:
+                    return jsonify(error="الباسورد لازم 6 حروف على الأقل"), 400
+                rec["h"] = generate_password_hash(pw)
+                rec.pop("rp", None)
+                us[un] = rec
+                users_save(us)
+        else:
+            if not reg_open():
+                return jsonify(error="التسجيل مقفول دلوقتي. كلّم الأدمن."), 403
+            n = str(d.get("username", "")).strip().lower()
+            if n:
+                if not USER_RX.fullmatch(n) or n == APP_USER.lower():
+                    return jsonify(error="الاسم 3-20 حرف إنجليزي أو أرقام أو _ . -"), 400
+                if n in us:
+                    return jsonify(error="الاسم ده متاخد، اختار اسم تاني"), 400
+            else:
+                n = gen_username(us, em)
+            rp = False
+            if pw:
+                if len(pw) < 6 or len(pw) > 200:
+                    return jsonify(error="الباسورد لازم 6 حروف على الأقل"), 400
+            else:
+                pw, rp = secrets.token_urlsafe(14), True    # تسجيل سريع: باسورد عشوائي، الدخول بعد كده بكود أو يحدد باسورد من حسابه
+            us[n] = new_member(generate_password_hash(pw), em, True, rp)
+            users_save(us)
+            un, rec = n, us[n]
+    return _login_user(un, rec, d, ip)
+
+
+@app.post("/me/password")
+def me_password():
+    """العضو يغيّر الباسورد (أو يحدد باسورد لو كان داخل بتسجيل سريع)"""
+    if g.role == "admin":
+        return jsonify(error="غيّر باسورد الأدمن من متغيرات السيرفر"), 400
+    d = request.get_json(silent=True) or {}
+    old, new = str(d.get("old", "")).strip(), str(d.get("new", "")).strip()
+    if len(new) < 6 or len(new) > 200:
+        return jsonify(error="الباسورد الجديد لازم 6 حروف على الأقل"), 400
+    _w, _y, _r, sid = read_token_ex(request.headers.get("X-Token", ""))
+    with USERS_LOCK:
+        us = users_load()
+        rec = us.get(g.user)
+        if not rec:
+            return jsonify(error="المستخدم مش موجود"), 404
+        if not rec.get("rp") and not check_password_hash(rec["h"], old):
+            return jsonify(error="الباسورد الحالي غلط"), 400
+        rec["h"] = generate_password_hash(new)
+        rec.pop("rp", None)
+        us[g.user] = rec
+        users_save(us)
+    return jsonify(ok=True, token=make_token(g.user, "user", fp_of(rec["h"]), sid))
 
 
 # ----------------- اختيار مزوّد المشاهدة والتحميل -----------------
@@ -556,7 +916,7 @@ def auth():
 #   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
 #   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
 # وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
-SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False}
+SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False, "reg": True}
 
 
 def settings_load():
@@ -570,6 +930,7 @@ def settings_load():
         if isinstance(d.get(k), str) and d[k].strip():
             out[k] = d[k].strip()[:40]
     out["strict"] = bool(d.get("strict"))
+    out["reg"] = bool(d.get("reg", True))
     return out
 
 
@@ -709,6 +1070,8 @@ def settings_set():
             cur[k] = v or dflt
     if "strict" in d:
         cur["strict"] = bool(d["strict"])
+    if "reg" in d:
+        cur["reg"] = bool(d["reg"])
     settings_save(cur)
     return jsonify(ok=True, settings=cur)
 
@@ -940,6 +1303,37 @@ def users_export():
     return resp
 
 
+@app.get("/users/backup")
+def users_backup():
+    """نسخة كاملة للأدمن (بهاشات الباسورد) عشان لو حصل أي حاجة ترجّع كل الأعضاء من غير ما حد يسجّل تاني"""
+    if g.role != "admin":
+        return jsonify(error="للأدمن بس"), 403
+    data = {"users": users_load(), "at": int(time.time())}
+    resp = make_response(json.dumps(data, ensure_ascii=False))
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=elkomy-users-FULL-backup.json"
+    return resp
+
+
+@app.post("/users/restore")
+def users_restore():
+    """بيرجّع الأعضاء الناقصين من ملف backup (من غير ما يمسح أو يغيّر الموجودين)"""
+    if g.role != "admin":
+        return jsonify(error="للأدمن بس"), 403
+    inc = (request.get_json(silent=True) or {}).get("users")
+    if not isinstance(inc, dict):
+        return jsonify(error="ملف النسخة الاحتياطية مش صالح"), 400
+    added = 0
+    with USERS_LOCK:
+        us = users_load()
+        for n, r in inc.items():
+            if isinstance(r, dict) and r.get("h") and USER_RX.fullmatch(str(n)) and n not in us:
+                us[n] = r
+                added += 1
+        users_save(us)
+    return jsonify(ok=True, added=added, total=len(us))
+
+
 @app.delete("/users/<name>")
 def users_del(name):
     with USERS_LOCK:
@@ -947,7 +1341,7 @@ def users_del(name):
         if name not in us:
             return jsonify(error="المستخدم مش موجود"), 404
         us.pop(name)
-        users_save(us)
+        users_save(us, allow_delete=True)
     try:
         store_del(ud_path(name))
     except Exception:
