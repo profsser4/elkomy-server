@@ -330,41 +330,102 @@ def sign(body):
     return hmac.new(SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
-def make_token(user, role, fp):
-    body = f"{user}|{role}|{int(time.time()) + 30 * 86400}|{fp}"
+# ----------------- حد الأجهزة لكل عضو (شاشة / موبايل / متصفح) -----------------
+SESS_ACTIVE = 180      # ثواني: الجهاز اللي اتحرك في آخر 3 دقايق يعتبر شغّال دلوقتي
+MAX_STRIKES = 3
+DTYPES = ("tv", "app", "web")
+DEF_LIM = {"tv": 1, "app": 1, "web": 1}
+TYPE_AR = {"tv": "شاشة", "app": "موبايل/تطبيق", "web": "متصفح"}
+SUSP_MSG = "⛔ حسابك اتوقف لأنه اتفتح على أجهزة أكتر من المسموح 3 مرات. كلّم الأدمن عشان يشغّله."
+SEEN = {}
+
+
+def kick_msg(st):
+    m = "اتقفلت هنا لأن الحساب اتفتح على جهاز تاني زيادة عن العدد المسموح لحسابك."
+    if st:
+        m += f"\n⚠️ تحذير {st} من {MAX_STRIKES}: لو اتكرر الحساب هيتوقف."
+    return m
+
+
+def lim_of(rec):
+    l = rec.get("lim") if isinstance(rec.get("lim"), dict) else {}
+    out = {}
+    for t in DTYPES:
+        try:
+            out[t] = max(0, min(5, int(l.get(t, DEF_LIM[t]))))
+        except (TypeError, ValueError):
+            out[t] = DEF_LIM[t]
+    return out
+
+
+def sess_of(rec):
+    """جلسات العضو {dv: {sid, ty, ls}} (مع ترحيل الشكل القديم sid/dv)"""
+    ss = rec.get("ss")
+    ss = dict(ss) if isinstance(ss, dict) else {}
+    if rec.get("sid") and not any(s.get("sid") == rec["sid"] for s in ss.values()):
+        ss[rec.get("dv") or "legacy"] = {"sid": rec["sid"], "ty": "web", "ls": int(rec.get("ls", 0) or 0)}
+    return ss
+
+
+def touch_seen(u, sid):
+    if not sid:
+        return
+    now = time.time()
+    if now - SEEN.get((u, sid), 0) < 60:
+        return
+    SEEN[(u, sid)] = now
+    with USERS_LOCK:
+        us = users_load()
+        r = us.get(u)
+        if r is None:
+            return
+        ss = sess_of(r)
+        for s in ss.values():
+            if s.get("sid") == sid:
+                s["ls"] = int(now)
+                r["ss"] = ss
+                r.pop("sid", None)
+                r.pop("dv", None)
+                users_save(us)
+                return
+
+
+def make_token(user, role, fp, sid=""):
+    body = f"{user}|{role}|{int(time.time()) + 30 * 86400}|{fp}" + (f"|{sid}" if sid else "")
     return base64.urlsafe_b64encode(body.encode()).decode() + "." + sign(body)
 
 
-def read_token(tok):
+def read_token_ex(tok):
+    """بيرجّع (who, why, rec, sid): why = '' تمام | bad | kicked (اتقفل لإن جهاز تاني دخل) | suspended (موقوف)"""
     try:
         b64, sig = str(tok).rsplit(".", 1)
         body = base64.urlsafe_b64decode(b64.encode()).decode()
         if not hmac.compare_digest(sig.encode(), sign(body).encode()):
-            return None
-        user, role, exp, fp = body.split("|")
+            return None, "bad", None, ""
+        parts = body.split("|")
+        user, role, exp, fp = parts[:4]
+        sid = parts[4] if len(parts) > 4 else ""
         if int(exp) < time.time():
-            return None
+            return None, "bad", None, ""
         if role == "admin":
             if user != APP_USER.lower() or not hmac.compare_digest(fp.encode(), fp_of(APP_PASS).encode()):
-                return None
-        else:
-            rec = users_load().get(user)
-            if not rec or fp != fp_of(rec["h"]):
-                return None
-        return user, role
+                return None, "bad", None, ""
+            return (user, role), "", None, ""
+        rec = users_load().get(user)
+        if not rec or fp != fp_of(rec["h"]):
+            return None, "bad", None, ""
+        if rec.get("susp"):
+            return None, "suspended", rec, sid
+        ss = sess_of(rec)
+        if ss and sid not in {s.get("sid") for s in ss.values()}:
+            return None, "kicked", rec, sid
+        return (user, role), "", rec, sid
     except Exception:
-        return None
+        return None, "bad", None, ""
 
 
-def needs_admin(path, method):
-    if path.startswith(("/providers", "/users", "/iptv/admin", "/settings", "/home/", "/activity", "/push/check", "/websearch", "/sitesearch")):
-        return True
-    if path in ("/stremio/login", "/stremio/sync", "/stremio/logout",
-                "/stremio/library"):
-        return True
-    if path.startswith("/stremio/addon"):
-        return not (path == "/stremio/addons" and method == "GET")
-    return False
+def read_token(tok):
+    return read_token_ex(tok)[0]
 
 
 @app.before_request
@@ -372,11 +433,21 @@ def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
     if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith("/subx/"):
         return None
-    who = read_token(request.headers.get("X-Token", ""))
+    who, why, _rec, _sid = read_token_ex(request.headers.get("X-Token", ""))
     if not who:
+        if why == "kicked":
+            st = int((_rec or {}).get("st", 0))
+            return jsonify(error=kick_msg(st), kicked=True, strikes=st, max=MAX_STRIKES), 401
+        if why == "suspended":
+            return jsonify(error=SUSP_MSG, suspended=True), 401
         return jsonify(error="غير مصرّح"), 401
     g.user, g.role = who
     LAST[g.user] = time.time()
+    if g.role != "admin":
+        try:
+            touch_seen(g.user, _sid)
+        except Exception:
+            pass
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
     if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
@@ -421,8 +492,58 @@ def auth():
                        token=make_token(u, "admin", fp_of(APP_PASS)))
     rec = users_load().get(u)
     if rec and check_password_hash(rec["h"], p):
-        return jsonify(ok=True, role="user", user=u,
-                       token=make_token(u, "user", fp_of(rec["h"])))
+        if rec.get("susp"):
+            return jsonify(ok=False, suspended=True, error=SUSP_MSG), 423
+        dv = str(d.get("dv", "")).strip()[:40] or ("ip:" + ip)
+        ty = str(d.get("ty", "")).strip().lower()
+        if ty not in DTYPES:
+            ty = "web"
+        now = time.time()
+        warn = ""
+        with USERS_LOCK:
+            us = users_load()
+            rec = us.get(u) or rec
+            lim = lim_of(rec)
+            if lim[ty] <= 0:
+                return jsonify(ok=False, blocked=True, title="الجهاز مش مسموح",
+                               error=f"حسابك مش مسموح له يدخل من {TYPE_AR[ty]}. كلّم الأدمن."), 423
+            ss = {k: v for k, v in sess_of(rec).items() if now - float(v.get("ls", 0) or 0) < 30 * 86400}
+            rec.pop("sid", None)
+            rec.pop("dv", None)
+            strikes = int(rec.get("st", 0))
+            cur = ss.get(dv)
+            if cur:                                              # نفس الجهاز: مفيش مشكلة
+                cur["ty"], cur["ls"] = ty, int(now)
+                sid = cur["sid"]
+            else:
+                same = sorted(((k, v) for k, v in ss.items() if v.get("ty") == ty), key=lambda kv: kv[1].get("ls", 0))
+                over = len(same) - lim[ty] + 1
+                for k, v in same:                                # الخاملين (مش شغّالين) بيتشالوا من غير تحذير
+                    if over <= 0:
+                        break
+                    if now - float(v.get("ls", 0) or 0) >= SESS_ACTIVE:
+                        ss.pop(k)
+                        over -= 1
+                if over > 0:                                     # لسه فيه أجهزة شغّالة فعلاً من نفس النوع = تجاوز
+                    for k, v in [(k, v) for k, v in same if k in ss][:over]:
+                        ss.pop(k)
+                    strikes += 1
+                    rec["st"], rec["sa"] = strikes, int(now)
+                    if strikes >= MAX_STRIKES:
+                        rec["susp"] = True
+                        rec["ss"] = {}
+                        us[u] = rec
+                        users_save(us)
+                        return jsonify(ok=False, suspended=True, title="الحساب موقوف", error=SUSP_MSG), 423
+                    warn = (f"⚠️ تحذير {strikes} من {MAX_STRIKES}: الحساب اتفتح على أكتر من {TYPE_AR[ty]} "
+                            f"(المسموح {lim[ty]}) فاتقفل الأقدم. لو اتكرر الحساب هيتوقف.")
+                sid = uuid.uuid4().hex[:12]
+                ss[dv] = {"sid": sid, "ty": ty, "ls": int(now)}
+            rec["ss"] = ss
+            us[u] = rec
+            users_save(us)
+        return jsonify(ok=True, role="user", user=u, warn=warn, strikes=strikes,
+                       token=make_token(u, "user", fp_of(rec["h"]), sid))
     FAILS.setdefault(ip, []).append(time.time())
     FAILS.setdefault("u:" + u, []).append(time.time())
     time.sleep(0.5)
@@ -662,8 +783,48 @@ def users_list():
                       "msg": v.get("nodl_msg", ""),
                       "wp": v.get("wp", ""), "dp": v.get("dp", ""),
                       "plan": pl["state"], "until": pl["until"], "left": pl["left"],
-                      "legacy": pl["legacy"]})
+                      "legacy": pl["legacy"], "st": int(v.get("st", 0)), "susp": bool(v.get("susp")), "lim": lim_of(v),
+                      "on": {t: sum(1 for s in sess_of(v).values() if s.get("ty") == t and time.time() - float(s.get("ls", 0) or 0) < SESS_ACTIVE) for t in DTYPES}})
     return jsonify(items=items)
+
+
+@app.post("/users/<name>/unlock")
+def users_unlock(name):
+    """الأدمن بيشغّل الحساب الموقوف ويصفّر التحذيرات"""
+    name = name.strip().lower()
+    with USERS_LOCK:
+        us = users_load()
+        r = us.get(name)
+        if r is None:
+            return jsonify(error="المستخدم مش موجود"), 404
+        r.pop("susp", None)
+        r.pop("sid", None)
+        r.pop("dv", None)
+        r.pop("ss", None)
+        r["st"] = 0
+        users_save(us)
+    return jsonify(ok=True)
+
+
+@app.post("/users/<name>/limits")
+def users_limits(name):
+    """عدد الأجهزة المسموحة لكل نوع: {tv, app, web} من 0 لـ 5 (0 = النوع ده ممنوع)"""
+    d = request.get_json(silent=True) or {}
+    name = name.strip().lower()
+    with USERS_LOCK:
+        us = users_load()
+        r = us.get(name)
+        if r is None:
+            return jsonify(error="المستخدم مش موجود"), 404
+        lim = {}
+        for t in DTYPES:
+            try:
+                lim[t] = max(0, min(5, int(d.get(t, DEF_LIM[t]))))
+            except (TypeError, ValueError):
+                lim[t] = DEF_LIM[t]
+        r["lim"] = lim
+        users_save(us)
+    return jsonify(ok=True, lim=lim)
 
 
 @app.post("/users")
