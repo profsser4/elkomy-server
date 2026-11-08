@@ -1476,9 +1476,13 @@ def iptv_pins_get():
     gc = [c for c in (gp.get("cats") or []) if isinstance(c, dict)]
     merged = dict(own)
     merged["live"] = gl + [x for x in (own.get("live") or []) if x not in gl]
+    gv = [str(x) for x in (gp.get("vod") or [])]
+    gs = [str(x) for x in (gp.get("ser") or [])]
+    merged["vod"] = gv + [x for x in (own.get("vod") or []) if x not in gv]
+    merged["ser"] = gs + [x for x in (own.get("ser") or []) if x not in gs]
     merged["cats"] = gc + [c for c in (own.get("cats") or [])
                            if not any(c.get("k") == x.get("k") and c.get("id") == x.get("id") for x in gc)]
-    return jsonify(pins=merged, g={"live": gl, "cats": gc, "ln": gp.get("ln") or {}})
+    return jsonify(pins=merged, g={"live": gl, "cats": gc, "vod": gv, "ser": gs, "ln": gp.get("ln") or {}})
 
 
 @app.post("/iptv/pins")
@@ -1488,6 +1492,8 @@ def iptv_pins_set():
     d = request.get_json(silent=True) or {}
     p = d.get("pins") if isinstance(d.get("pins"), dict) else {}
     live = [str(x)[:20] for x in (p.get("live") or [])][:200]
+    vod_p = [str(x)[:20] for x in (p.get("vod") or [])][:200]
+    ser_p = [str(x)[:20] for x in (p.get("ser") or [])][:200]
     cats = []
     for c in (p.get("cats") or [])[:60]:
         if isinstance(c, dict) and c.get("k") in ("live", "vod", "series"):
@@ -1502,7 +1508,7 @@ def iptv_pins_set():
                 for i, n in list(p["ln"].items())[:200]:
                     if str(i)[:20] in live and str(n).strip():
                         ln[str(i)[:20]] = str(n).strip()[:80]
-            al[IPTV_PINS] = {"live": live, "cats": cats, "ln": ln}
+            al[IPTV_PINS] = {"live": live, "cats": cats, "vod": vod_p, "ser": ser_p, "ln": ln}
             iptv_save(al)
         return jsonify(ok=True)
     pid = str(d.get("pid", ""))[:40]
@@ -1537,9 +1543,11 @@ def iptv_pins_set():
         gp = al.get(IPTV_PINS) or {}
         gl = {str(x) for x in (gp.get("live") or [])}
         gc = {(c.get("k"), c.get("id")) for c in (gp.get("cats") or []) if isinstance(c, dict)}
+        vod_p = [x for x in vod_p if x not in {str(i) for i in (gp.get("vod") or [])}]
+        ser_p = [x for x in ser_p if x not in {str(i) for i in (gp.get("ser") or [])}]
         live = [x for x in live if x not in gl]                      # تثبيتات الكل مابتتنسخش على حساب العضو
         cats = [c for c in cats if (c["k"], c["id"]) not in gc]
-        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats, "order": order, "hidden": hidden, "names": names}
+        rec.setdefault("pins", {})[pid] = {"live": live, "cats": cats, "vod": vod_p, "ser": ser_p, "order": order, "hidden": hidden, "names": names}
         iptv_save(al)
     return jsonify(ok=True)
 
