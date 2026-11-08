@@ -909,7 +909,7 @@ def iptv_pins_get():
     merged["live"] = gl + [x for x in (own.get("live") or []) if x not in gl]
     merged["cats"] = gc + [c for c in (own.get("cats") or [])
                            if not any(c.get("k") == x.get("k") and c.get("id") == x.get("id") for x in gc)]
-    return jsonify(pins=merged, g={"live": gl, "cats": gc})
+    return jsonify(pins=merged, g={"live": gl, "cats": gc, "ln": gp.get("ln") or {}})
 
 
 @app.post("/iptv/pins")
@@ -928,7 +928,12 @@ def iptv_pins_set():
             return jsonify(error="للأدمن بس"), 403
         with IPTV_LOCK:
             al = iptv_load()
-            al[IPTV_PINS] = {"live": live, "cats": cats}
+            ln = {}                      # أسماء القنوات المثبّتة للكل (عشان تتلاقي بالاسم عند مزوّد تاني)
+            if isinstance(p.get("ln"), dict):
+                for i, n in list(p["ln"].items())[:200]:
+                    if str(i)[:20] in live and str(n).strip():
+                        ln[str(i)[:20]] = str(n).strip()[:80]
+            al[IPTV_PINS] = {"live": live, "cats": cats, "ln": ln}
             iptv_save(al)
         return jsonify(ok=True)
     pid = str(d.get("pid", ""))[:40]
@@ -1001,13 +1006,13 @@ def feat_clean(d):
             out["banners"].append({"id": _fs(b.get("id"), 20) or uuid.uuid4().hex[:8], "k": k,
                                    "sid": _fs(b.get("sid"), 20) if k else "", "title": _fs(b.get("title"), 80),
                                    "sub": _fs(b.get("sub"), 160), "img": _furl(b.get("img")),
-                                   "tag": _fs(b.get("tag"), 30), "until": _fdate(b.get("until"))})
+                                   "tag": _fs(b.get("tag"), 30), "nm": _fs(b.get("nm"), 80), "until": _fdate(b.get("until"))})
     p = d.get("popup")
     if isinstance(p, dict):
         k = p.get("k") if p.get("k") in ("vod", "series") else ""
         out["popup"] = {"on": bool(p.get("on")), "id": _fs(p.get("id"), 20), "title": _fs(p.get("title"), 80),
                         "text": _fs(p.get("text"), 300), "img": _furl(p.get("img")), "k": k,
-                        "sid": _fs(p.get("sid"), 20) if k else "", "until": _fdate(p.get("until"))}
+                        "sid": _fs(p.get("sid"), 20) if k else "", "nm": _fs(p.get("nm"), 80), "until": _fdate(p.get("until"))}
     return out
 
 
