@@ -467,6 +467,20 @@ def read_token(tok):
     return read_token_ex(tok)[0]
 
 
+_ADMIN_PREFIXES = ("/users", "/iptv/admin/")
+_ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
+_ADMIN_ANY = ("/home/dub-refresh",)
+
+
+def needs_admin(path, method):
+    """المسارات اللي للأدمن بس (الباقي مفتوح لأي عضو مسجّل)"""
+    if path.startswith(_ADMIN_PREFIXES) or path in _ADMIN_ANY:
+        return True
+    if method in ("POST", "PUT", "DELETE") and path.startswith(_ADMIN_WRITE):
+        return True
+    return False
+
+
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
