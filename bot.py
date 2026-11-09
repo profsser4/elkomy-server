@@ -5853,12 +5853,58 @@ def _as_worker(key, u, src, se, ep, lang, dur):
             AS_RUN[key] = {"t": time.time(), "res": res}
 
 
+# ===================== حفظ ضبط الترجمة اليدوي لكل الأعضاء =====================
+# كل عضو يظبط توقيت الترجمة بالأسهم/الأزرار بيتحفظ ضبطه على حسابه هو بس، ولما يفتح نفس الفيلم تاني بتفتح له متظبطة. محدش بيأثر على غيره.
+def _sf_args(b):
+    u = str(b.get("u", ""))
+    se = "" if b.get("s") in (None, "") else str(b.get("s"))[:6]
+    ep = "" if b.get("e") in (None, "") else str(b.get("e"))[:6]
+    fk = str(b.get("fkey") or b.get("key") or re.sub(r"[?#].*$", "", str(b.get("src", ""))))[:300]
+    k = hashlib.sha1("|".join((str(g.user), u, se, ep, fk)).encode()).hexdigest()[:32]   # الضبط لكل عضو لوحده
+    return os.path.join(DATA_DIR, "subfix_%s.json" % k)
+
+
+@app.post("/sub/fix")
+def sub_fix_save():
+    b = request.get_json(silent=True) or {}
+    if not ok_sub_path(str(b.get("u", ""))):
+        return jsonify(error="رابط ترجمة غير صالح"), 400
+    p = _sf_args(b)
+    if b.get("clear"):
+        try:
+            store_del(p)
+        except Exception:
+            pass
+        return jsonify(ok=True, cleared=True)
+    try:
+        sh = float(b.get("shift"))
+        sc = float(b.get("scale") or 1)
+    except (TypeError, ValueError):
+        return jsonify(error="قيمة غير صالحة"), 400
+    if not (math.isfinite(sh) and math.isfinite(sc) and abs(sh) <= 3600 and 0.9 <= sc <= 1.1):
+        return jsonify(error="قيمة غير منطقية"), 400
+    try:
+        store_save(p, {"ok": True, "shift": round(sh, 2), "scale": round(sc, 6), "manual": True,
+                       "by": g.user, "t": int(time.time())})
+    except Exception:
+        return jsonify(error="تعذّر الحفظ"), 500
+    return jsonify(ok=True)
+
+
 @app.post("/sub/auto")
 def sub_auto_start():
     b = request.get_json(silent=True) or {}
     u, src = str(b.get("u", "")), str(b.get("src", ""))
     if not ok_sub_path(u):
         return jsonify(error="رابط ترجمة غير صالح"), 400
+    if not b.get("nofix"):          # ضبط يدوي محفوظ من أي عضو؟ بيتقدّم على الضبط التلقائي
+        try:
+            fx = store_load(_sf_args(b))
+            return jsonify(done=True, ok=True, shift=fx.get("shift", 0), scale=fx.get("scale", 1), manual=True)
+        except Exception:
+            pass
+    if b.get("fixonly"):
+        return jsonify(done=True, ok=False, reason="nofix")
     if not AS_FF:
         return jsonify(done=True, ok=False, reason="noffmpeg")
     if not _as_safe_url(src):
