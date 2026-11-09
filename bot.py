@@ -467,7 +467,7 @@ def read_token(tok):
     return read_token_ex(tok)[0]
 
 
-_ADMIN_PREFIXES = ("/users", "/iptv/admin/")
+_ADMIN_PREFIXES = ("/users", "/iptv/admin")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
 _ADMIN_ANY = ("/home/dub-refresh",)
 
@@ -1781,6 +1781,191 @@ def iptv_admin_cmap(name):
         rec["cmap"] = _prune_cmap(d.get("cmap"), keys)
         iptv_save(al)
     return jsonify(ok=True, cmap=rec["cmap"])
+
+
+# ----------------- IPTV: مخزن حسابات كبير (مئات/آلاف) + فحص + اختيار الأساسي -----------------
+# الفحص بيتم من جهاز الأدمن (آيبي مصري) والسيرفر بيحفظ النتايج بس.
+IPTV_POOL_FILE = os.path.join(DATA_DIR, "iptv_pool.json")
+IPTV_POOL_MAX = 3000
+
+
+def pool_load():
+    try:
+        d = store_load(IPTV_POOL_FILE)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def pool_save(d):
+    store_save(IPTV_POOL_FILE, d)
+
+
+def _pool_owner_ok(name):
+    return name == IPTV_ALL or name == APP_USER.lower() or name in users_load()
+
+
+def _pool_pub(a):
+    return {"host": a.get("host", ""), "user": a.get("user", ""), "pass": a.get("pass", ""),
+            "st": a.get("st", ""), "exp": a.get("exp", 0), "maxc": a.get("maxc", 0),
+            "act": a.get("act", 0), "t": a.get("t", 0)}
+
+
+@app.get("/iptv/admin/<name>/pool")
+def iptv_pool_get(name):
+    name = name.strip().lower()
+    if not _pool_owner_ok(name):
+        return jsonify(error="المستخدم مش موجود"), 404
+    pool = pool_load().get(name) or []
+    al = iptv_load()
+    rec = al.get(name) or {}
+    prim = None
+    if rec.get("host"):
+        prim = {"host": rec["host"], "user": rec.get("user", ""), "pass": rec.get("pass", ""),
+                "stat": rec.get("stat") or {}}
+    return jsonify(items=[_pool_pub(a) for a in pool if isinstance(a, dict)], primary=prim)
+
+
+@app.post("/iptv/admin/<name>/pool/add")
+def iptv_pool_add(name):
+    """إضافة حسابات بالجملة: {items:[{host,user,pass}]} — بيتجاهل المكرر."""
+    name = name.strip().lower()
+    if not _pool_owner_ok(name):
+        return jsonify(error="المستخدم مش موجود"), 404
+    d = request.get_json(silent=True) or {}
+    with IPTV_LOCK:
+        pd = pool_load()
+        pool = [a for a in (pd.get(name) or []) if isinstance(a, dict)]
+        seen = {_acc_key(a) for a in pool}
+        rec = iptv_load().get(name) or {}
+        if rec.get("host"):
+            seen.add(_acc_key(rec))
+        added = dup = bad = 0
+        for x in (d.get("items") or [])[:IPTV_POOL_MAX]:
+            if not isinstance(x, dict):
+                bad += 1
+                continue
+            h = iptv_host(x.get("host"))
+            u = str(x.get("user", "")).strip()[:80]
+            p = str(x.get("pass", "")).strip()[:80]
+            if not h or not u or not p:
+                bad += 1
+                continue
+            k = h + "|" + u
+            if k in seen:
+                dup += 1
+                continue
+            if len(pool) >= IPTV_POOL_MAX:
+                bad += 1
+                continue
+            seen.add(k)
+            pool.append({"host": h, "user": u, "pass": p})
+            added += 1
+        pd[name] = pool
+        pool_save(pd)
+    return jsonify(ok=True, added=added, dup=dup, bad=bad, total=len(pool))
+
+
+@app.post("/iptv/admin/<name>/pool/stat")
+def iptv_pool_stat(name):
+    """حفظ نتايج الفحص: {items:[{k:'host|user', st:'ok|dead|down', exp, maxc, act}]}"""
+    name = name.strip().lower()
+    if not _pool_owner_ok(name):
+        return jsonify(error="المستخدم مش موجود"), 404
+    d = request.get_json(silent=True) or {}
+
+    def num(v):
+        try:
+            return max(0, int(float(v or 0)))
+        except (TypeError, ValueError):
+            return 0
+    now = int(time.time())
+    res = {}
+    for x in (d.get("items") or [])[:500]:
+        if isinstance(x, dict) and x.get("st") in ("ok", "dead", "down"):
+            res[str(x.get("k"))] = x
+    with IPTV_LOCK:
+        pd = pool_load()
+        pool = pd.get(name) or []
+        n = 0
+        for a in pool:
+            x = res.get(_acc_key(a)) if isinstance(a, dict) else None
+            if not x:
+                continue
+            a["st"] = x["st"]
+            a["why"] = str(x.get("why") or "")[:40]
+            a["t"] = now
+            if x["st"] != "down":          # لو مفيش رد، منمسحش آخر بيانات معروفة
+                a["exp"], a["maxc"], a["act"] = num(x.get("exp")), num(x.get("maxc")), num(x.get("act"))
+            n += 1
+        if n:
+            pd[name] = pool
+            pool_save(pd)
+    return jsonify(ok=True, saved=n)
+
+
+@app.post("/iptv/admin/<name>/pool/del")
+def iptv_pool_del(name):
+    """مسح: {keys:[...]} أو {status:'dead'|'down'|'all'}"""
+    name = name.strip().lower()
+    if not _pool_owner_ok(name):
+        return jsonify(error="المستخدم مش موجود"), 404
+    d = request.get_json(silent=True) or {}
+    keys = set(str(k) for k in (d.get("keys") or []))
+    status = d.get("status")
+    with IPTV_LOCK:
+        pd = pool_load()
+        pool = pd.get(name) or []
+        keep = []
+        for a in pool:
+            hit = _acc_key(a) in keys or (status == "all") or (status in ("dead", "down") and a.get("st") == status)
+            if not hit:
+                keep.append(a)
+        gone = len(pool) - len(keep)
+        pd[name] = keep
+        pool_save(pd)
+    return jsonify(ok=True, deleted=gone, total=len(keep))
+
+
+@app.post("/iptv/admin/<name>/pool/primary")
+def iptv_pool_primary(name):
+    """يخلّي حساب من البول هو الأساسي (الأفلام/المسلسلات/القوائم). القديم بيرجع للبول."""
+    name = name.strip().lower()
+    if not _pool_owner_ok(name):
+        return jsonify(error="المستخدم مش موجود"), 404
+    d = request.get_json(silent=True) or {}
+    k = str(d.get("k") or "")
+    with IPTV_LOCK:
+        pd = pool_load()
+        pool = pd.get(name) or []
+        pick = next((a for a in pool if _acc_key(a) == k), None)
+        if not pick:
+            return jsonify(error="الحساب مش موجود في المخزن"), 404
+        al = iptv_load()
+        old = al.get(name) or {}
+        if old.get("host") and old.get("user"):
+            back = {"host": old["host"], "user": old["user"], "pass": old.get("pass", "")}
+            st = old.get("stat") or {}
+            if st.get("t"):
+                back.update({"st": "ok" if (st.get("status") or "").lower() == "active" else "down",
+                             "exp": st.get("exp", 0), "maxc": st.get("maxc", 0), "act": st.get("active", 0),
+                             "t": int(st.get("t") or 0)})
+            pool = [a for a in pool if _acc_key(a) != k] + [back]
+        else:
+            pool = [a for a in pool if _acc_key(a) != k]
+        extra = [x for x in (old.get("extra") or []) if isinstance(x, dict) and _acc_key(x) != k]
+        newrec = {"host": pick["host"], "user": pick["user"], "pass": pick["pass"],
+                  "stat": ({"exp": pick.get("exp", 0), "maxc": pick.get("maxc", 0), "active": pick.get("act", 0),
+                            "status": "Active", "trial": False, "t": int(pick.get("t") or 0)}
+                           if pick.get("t") and pick.get("st") == "ok" else {}),
+                  "extra": extra,
+                  "pins": old.get("pins") or {}}
+        newrec["cmap"] = _prune_cmap(old.get("cmap"), [_acc_key(newrec)] + [_acc_key(x) for x in extra])
+        al[name] = newrec
+        iptv_save(al)
+        pd[name] = pool
+        pool_save(pd)
+    return jsonify(ok=True, host=newrec["host"], user=newrec["user"])
 
 
 @app.get("/providers")
