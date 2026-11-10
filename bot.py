@@ -469,7 +469,9 @@ def read_token(tok):
 
 _ADMIN_PREFIXES = ("/users", "/iptv/admin")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
-_ADMIN_ANY = ("/home/dub-refresh",)
+_ADMIN_ANY = ("/home/dub-refresh", "/providers/export", "/play/diag", "/play/reports")
+# مسارات ستريميو بتغيّر إعداد مشترك للموقع كله (حساب + إضافات + مفاتيح مزوّدين): للأدمن بس
+_ADMIN_POST_EXACT = ("/stremio/login", "/stremio/sync", "/stremio/logout", "/stremio/addon")
 
 
 def needs_admin(path, method):
@@ -477,6 +479,10 @@ def needs_admin(path, method):
     if path.startswith(_ADMIN_PREFIXES) or path in _ADMIN_ANY:
         return True
     if method in ("POST", "PUT", "DELETE") and path.startswith(_ADMIN_WRITE):
+        return True
+    if method == "POST" and path in _ADMIN_POST_EXACT:
+        return True
+    if method == "DELETE" and path.startswith("/stremio/addons/"):
         return True
     return False
 
@@ -504,7 +510,7 @@ def guard():
             pass
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
-    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
+    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/play/hls", "/play/ext", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
         lk, msg = lock_of(g.user)
         if lk >= 2:                                   # تصفح فقط: مفيش مشاهدة ولا تحميل
             return jsonify(error=msg, nodl=True, lock=2), 403
@@ -4040,6 +4046,8 @@ def st_add_ep():
     base = st_base((request.get_json() or {}).get("url", ""))
     if not base.startswith(("http://", "https://")):
         return jsonify(error="الرابط لازم يبدأ بـ https:// أو stremio://"), 400
+    if not _public_url(base):      # حماية SSRF: ممنوع عناوين داخلية (localhost / شبكة خاصة)
+        return jsonify(error="الرابط ده مش مسموح (لازم يكون عنوان عام)"), 400
     try:
         man = st_manifest(base)
     except Exception as e:
