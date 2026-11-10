@@ -406,6 +406,79 @@ def sess_of(rec):
     return ss
 
 
+LASTP = {}                  # {(user, sid): (path, time)} آخر حاجة العضو عملها (من غير الطلبات الدورية)
+ADMIN_META = {}             # {user: {ip, ua, geo, t}} الأدمن مالوش جلسات فبنحفظ بياناته في الذاكرة
+_POLL_PATHS = ("/me", "/usage", "/users", "/activity", "/ud/", "/settings", "/auth")
+_PATH_AR = (("/play", "تشغيل/مشاهدة"), ("/generate", "سحب ملفات"), ("/tb/", "TorBox"), ("/stremio", "Stremio"),
+            ("/iptv", "IPTV"), ("/search", "بحث"), ("/tmdb", "تصفح"), ("/home", "الرئيسية"), ("/sub", "ترجمة"),
+            ("/dl", "تحميل"), ("/download", "تحميل"))
+
+
+def path_ar(p):
+    for pre, lb in _PATH_AR:
+        if p.startswith(pre):
+            return lb
+    return p[:40]
+
+
+def ua_label(ua):
+    """وصف مختصر للمتصفح/الجهاز من User-Agent"""
+    ua = str(ua or "")
+    if not ua:
+        return ""
+    low = ua.lower()
+    if "okhttp" in low or "elkomy" in low or "; wv)" in low:
+        br = "تطبيق أندرويد"
+    elif "smart-tv" in low or "smarttv" in low or "tizen" in low or "webos" in low or "android tv" in low or "bravia" in low or " aft" in low:
+        br = "تلفزيون"
+    else:
+        br = ""
+        for key, nm in (("edg/", "Edge"), ("opr/", "Opera"), ("samsungbrowser", "Samsung Browser"), ("firefox/", "Firefox"),
+                        ("chrome/", "Chrome"), ("safari/", "Safari")):
+            if key in low:
+                m = re.search(re.escape(key) + r"(\d+)", low)
+                br = nm + (" " + m.group(1) if m else "")
+                break
+    osn = ""
+    for key, nm in (("android", "Android"), ("iphone", "iPhone"), ("ipad", "iPad"), ("windows", "Windows"),
+                    ("mac os", "macOS"), ("cros", "ChromeOS"), ("linux", "Linux")):
+        if key in low:
+            osn = nm
+            m = re.search(r"android[ /]([\d.]+)", low) if nm == "Android" else None
+            if m:
+                osn += " " + m.group(1)
+            break
+    mm = re.search(r";\s*([^;()]+?)\s+build/", ua, re.I)
+    model = mm.group(1).strip() if mm and osn.startswith("Android") else ""
+    return " · ".join(x for x in (br, osn, model) if x) or ua[:60]
+
+
+def req_meta():
+    try:
+        city = unquote(request.headers.get("X-Vercel-IP-City", "") or "")
+        ctry = request.headers.get("X-Vercel-IP-Country", "") or ""
+        ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "")
+        return {"ip": ip, "ua": (request.headers.get("User-Agent", "") or "")[:220],
+                "geo": ", ".join(x for x in (city, ctry) if x)}
+    except Exception:
+        return {"ip": "", "ua": "", "geo": ""}
+
+
+def note_open(s, now, meta=None):
+    """بيسجّل «فتحة» جديدة للجلسة لو كان فيه خمول أكتر من SESS_ACTIVE"""
+    prev = float(s.get("ls", 0) or 0)
+    if not s.get("fs"):
+        s["fs"] = int(now)
+    if not s.get("lo") or now - prev >= SESS_ACTIVE:
+        s["lo"] = int(now)
+        s["oc"] = int(s.get("oc", 0) or 0) + 1
+    s["ls"] = int(now)
+    if meta:
+        for k in ("ip", "ua", "geo"):
+            if meta.get(k):
+                s[k] = meta[k]
+
+
 def touch_seen(u, sid):
     if not sid:
         return
@@ -413,6 +486,8 @@ def touch_seen(u, sid):
     if now - SEEN.get((u, sid), 0) < 60:
         return
     SEEN[(u, sid)] = now
+    meta = req_meta()
+    lp = LASTP.get((u, sid))
     with USERS_LOCK:
         us = users_load()
         r = us.get(u)
@@ -421,12 +496,29 @@ def touch_seen(u, sid):
         ss = sess_of(r)
         for s in ss.values():
             if s.get("sid") == sid:
-                s["ls"] = int(now)
+                note_open(s, now, meta)
+                if lp:
+                    s["lp"], s["lpt"] = lp[0], int(lp[1])
                 r["ss"] = ss
                 r.pop("sid", None)
                 r.pop("dv", None)
                 users_save(us)
                 return
+
+
+def devs_of(rec):
+    """أجهزة العضو (جلساته) بتفاصيلها لعرضها للأدمن"""
+    now = time.time()
+    out = []
+    for k, s in sess_of(rec).items():
+        ls = float(s.get("ls", 0) or 0)
+        out.append({"ty": s.get("ty", "web"), "ip": s.get("ip", ""), "ua": ua_label(s.get("ua", "")),
+                    "geo": s.get("geo", ""), "ls": int(ls * 1000), "lo": int(float(s.get("lo", 0) or 0) * 1000),
+                    "fs": int(float(s.get("fs", 0) or 0) * 1000), "lg": int(float(s.get("lg", 0) or 0) * 1000),
+                    "oc": int(s.get("oc", 0) or 0), "lp": path_ar(s.get("lp", "")) if s.get("lp") else "",
+                    "lpt": int(float(s.get("lpt", 0) or 0) * 1000), "on": now - ls < SESS_ACTIVE})
+    out.sort(key=lambda x: x["ls"], reverse=True)
+    return out
 
 
 def make_token(user, role, fp, sid=""):
@@ -503,6 +595,15 @@ def guard():
     g.user, g.role = who
     g.sid = _sid or hashlib.sha1(request.headers.get("X-Token", "").encode()).hexdigest()[:16]
     LAST[g.user] = time.time()
+    try:
+        if request.method != "OPTIONS" and not request.path.startswith(_POLL_PATHS):
+            LASTP[(g.user, _sid)] = (request.path, time.time())
+            if len(LASTP) > 5000:
+                LASTP.clear()
+        if g.role == "admin":
+            ADMIN_META[g.user] = dict(req_meta(), t=time.time())
+    except Exception:
+        pass
     if g.role != "admin":
         try:
             touch_seen(g.user, _sid)
@@ -556,8 +657,10 @@ def _login_user(u, rec, d, ip):
         rec.pop("dv", None)
         strikes = int(rec.get("st", 0))
         cur = ss.get(dv)
+        meta = req_meta()
         if cur:                                              # نفس الجهاز: مفيش مشكلة
-            cur["ty"], cur["ls"] = ty, int(now)
+            note_open(cur, now, meta)
+            cur["ty"], cur["lg"] = ty, int(now)
             sid = cur["sid"]
         else:
             same = sorted(((k, v) for k, v in ss.items() if v.get("ty") == ty), key=lambda kv: kv[1].get("ls", 0))
@@ -582,7 +685,9 @@ def _login_user(u, rec, d, ip):
                 warn = (f"⚠️ تحذير {strikes} من {MAX_STRIKES}: الحساب اتفتح على أكتر من {TYPE_AR[ty]} "
                         f"(المسموح {lim[ty]}) فاتقفل الأقدم. لو اتكرر الحساب هيتوقف.")
             sid = uuid.uuid4().hex[:12]
-            ss[dv] = {"sid": sid, "ty": ty, "ls": int(now)}
+            ss[dv] = {"sid": sid, "ty": ty, "ls": int(now), "lg": int(now)}
+            note_open(ss[dv], now, meta)
+            ss[dv]["ls"] = int(now)
         rec["ss"] = ss
         us[u] = rec
         users_save(us)
@@ -4888,7 +4993,22 @@ def activity_list():
         last = max(last_w, ev[-1]["t"] if ev else 0, int(LAST.get(n, 0) * 1000))
         rec = us.get(n) or {}
         pl = plan_of(rec) if role == "user" else {"state": "admin", "until": 0, "left": None}
-        out.append({"name": n, "role": role, "bytes": a.get("bytes", 0),
+        devs = devs_of(rec) if role == "user" else []
+        top = devs[0] if devs else {}
+        if role == "admin":
+            am = ADMIN_META.get(n) or {}
+            if am:
+                devs = [{"ty": "web", "ip": am.get("ip", ""), "ua": ua_label(am.get("ua", "")), "geo": am.get("geo", ""),
+                         "ls": int(am.get("t", 0) * 1000), "lo": 0, "fs": 0, "lg": 0, "oc": 0, "lp": "", "lpt": 0,
+                         "on": time.time() - am.get("t", 0) < SESS_ACTIVE}]
+                top = devs[0]
+        if top:
+            last = max(last, top.get("ls", 0))
+        out.append({"devs": devs, "online": any(x["on"] for x in devs), "ty": top.get("ty", ""),
+                    "ip": top.get("ip", ""), "ua": top.get("ua", ""), "geo": top.get("geo", ""),
+                    "lo": max([x.get("lo", 0) for x in devs] or [0]), "oc": sum(x.get("oc", 0) for x in devs),
+                    "lp": top.get("lp", ""), "lpt": top.get("lpt", 0),
+                    "name": n, "role": role, "bytes": a.get("bytes", 0),
                     "count": a.get("count", 0), "watch": secs, "titles": titles,
                     "last": last, "tw": int(a.get("w", 0)), "dl": int(a.get("dl", 0)),
                     "plan": pl["state"], "until": pl["until"], "left": pl["left"],
@@ -4916,7 +5036,8 @@ def activity_user(name):
             days[k]["n"] += 1
     rec = users_load().get(name) or {}
     pl = plan_of(rec) if name != APP_USER.lower() else {"state": "admin", "until": 0, "left": None}
-    return jsonify(pulls=list(reversed(a.get("ev") or []))[:100], watched=watched[:100],
+    return jsonify(devs=devs_of(rec) if name != APP_USER.lower() else [],
+                   pulls=list(reversed(a.get("ev") or []))[:100], watched=watched[:100],
                    bytes=a.get("bytes", 0), count=a.get("count", 0),
                    tw=int(a.get("w", 0)), dl=int(a.get("dl", 0)),
                    days=[{"d": k, **v} for k, v in days.items()],
