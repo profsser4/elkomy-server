@@ -1250,8 +1250,10 @@ def me():
     out = {"user": g.user, "role": g.role}
     if g.role == "admin":
         out["plan"] = {"state": "admin", "until": 0, "left": None}
+        out["ad"] = True
     else:
         pl = plan_of(users_load().get(g.user) or {})
+        out["ad"] = bool((users_load().get(g.user) or {}).get("ad"))
         out["plan"] = {"state": pl["state"], "until": pl["until"], "left": pl["left"]}
     if g.role != "admin":
         lk, msg = lock_of(g.user)
@@ -1262,6 +1264,21 @@ def me():
     return jsonify(out)
 
 
+def _ad_provider():
+    return next((p for p in load() if p["type"] == "alldebrid" and p.get("key")), None)
+
+
+@app.get("/ad/key")
+def ad_key():
+    """مفتاح AllDebrid للجهاز: الأدمن دايمًا، والعضو بس لو الأدمن فعّله له (بيشتغل من موبايله مش من السيرفر)"""
+    if g.role != "admin" and not (users_load().get(g.user) or {}).get("ad"):
+        return jsonify(error="مش مسموح"), 403
+    p = _ad_provider()
+    if not p:
+        return jsonify(error="مفيش مزوّد AllDebrid مضاف"), 404
+    return jsonify(key=p["key"])
+
+
 @app.get("/users")
 def users_list():
     us = users_load()
@@ -1270,7 +1287,7 @@ def users_list():
         pl = plan_of(v)
         items.append({"name": n, "c": v.get("c", 0), "lock": lock_of(n)[0],
                       "msg": v.get("nodl_msg", ""),
-                      "wp": v.get("wp", ""), "dp": v.get("dp", ""),
+                      "wp": v.get("wp", ""), "dp": v.get("dp", ""), "ad": bool(v.get("ad")),
                       "plan": pl["state"], "until": pl["until"], "left": pl["left"],
                       "legacy": pl["legacy"], "st": int(v.get("st", 0)), "susp": bool(v.get("susp")), "lim": lim_of(v),
                       "on": {t: sum(1 for s in sess_of(v).values() if s.get("ty") == t and time.time() - float(s.get("ls", 0) or 0) < SESS_ACTIVE) for t in DTYPES}})
@@ -1365,6 +1382,11 @@ def users_perms(name):
         us[name]["lock"] = lk
         us[name].pop("nodl", None)
         us[name]["nodl_msg"] = str(d.get("msg") or "").strip()[:300]
+        if "ad" in d:
+            if d.get("ad"):
+                us[name]["ad"] = 1
+            else:
+                us[name].pop("ad", None)
         for k in ("wp", "dp"):
             if k in d:
                 v = str(d.get(k) or "").strip()
