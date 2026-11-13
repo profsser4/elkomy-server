@@ -5966,6 +5966,78 @@ def subdl_search(base, s, e, is_tv):
     return [], "none"
 
 
+# ===== تنضيف اسم الإصدار (تشغيل من لينك/ماجنت) عشان الترجمة تتلاقي زي التشغيل من صفحة الفيلم =====
+_REL_EXT = re.compile(r"\.(mkv|mp4|avi|m4v|mov|wmv|ts|m2ts|webm)$", re.I)
+_REL_MARK = re.compile(
+    r"\b(2160p|1440p|1080p|1080i|720p|576p|480p|4k|uhd|bluray|blu ray|bdrip|brrip|bd ?remux|remux|web ?dl|web ?rip|webrip|"
+    r"hdtv|pdtv|dvdrip|dvdscr|hdrip|hdcam|cam|x264|x265|h 264|h 265|h264|h265|hevc|avc|xvid|10bit|hdr10|hdr|dolby vision|"
+    r"amzn|nf|dsnp|hmax|atvp|hulu|ddp ?\d|dd ?\d|dts|truehd|atmos|aac|ac3|eac3|multi|dual audio|extended|unrated|proper|repack|imax)\b",
+    re.I)
+
+
+def _guess_release(raw):
+    """اسم ملف/رابط (Movie.2023.1080p.WEB-DL.x264-GRP.mkv) -> (عنوان نضيف, سنة, موسم, حلقة, هل كان اسم إصدار؟)"""
+    src = str(raw or "").strip()
+    t = _REL_EXT.sub("", re.sub(r"https?://\S+/", " ", src))
+    t = re.sub(r"[_.]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    m_se = re.search(r"\bS(\d{1,2}) ?E(\d{1,3})\b", t, re.I) or re.search(r"\b(\d{1,2})x(\d{2,3})\b", t)
+    season = int(m_se.group(1)) if m_se else None
+    episode = int(m_se.group(2)) if m_se else None
+    mk = _REL_MARK.search(t)
+    cut = len(t)
+    if m_se:
+        cut = min(cut, m_se.start())
+    if mk:
+        cut = min(cut, mk.start())
+    years = [m for m in re.finditer(r"(?<!\d)((?:19|20)\d{2})(?!\d)", t) if m.start() > 2 and m.start() < cut + 1]
+    year = ""
+    if years:
+        y = years[-1]
+        year = y.group(1)
+        cut = min(cut, y.start())
+    title = t[:cut]
+    title = re.sub(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}", " ", title)
+    title = re.sub(r"\s+", " ", title).strip(" -–—:,([{")
+    dirty = bool(m_se or mk or year or _REL_EXT.search(src) or src.count(".") >= 3 or src.count("_") >= 2)
+    return title, year, season, episode, dirty
+
+
+_TMDB_RES = {}
+
+
+def _tmdb_resolve(title, year, typ):
+    """بيجيب (النوع, id) من TMDB لاسم نضيف عشان الترجمة تتدوّر بالـid بدل اسم الملف الخام"""
+    key = (title.lower(), str(year or ""), typ or "")
+    if key in _TMDB_RES:
+        return _TMDB_RES[key]
+    out = None
+    try:
+        kinds = [("tv", "/search/tv")] if typ == "tv" else [("movie", "/search/movie")] if typ == "movie" \
+            else [("movie", "/search/movie"), ("tv", "/search/tv")]
+        best = None
+        for kind, path in kinds:
+            prm = {"query": title, "language": "en-US", "include_adult": "false"}
+            ykey = "year" if kind == "movie" else "first_air_date_year"
+            if year:
+                prm[ykey] = year
+            res = tmdb_get(path, **prm).get("results", [])
+            if not res and year:
+                prm.pop(ykey, None)
+                res = tmdb_get(path, **prm).get("results", [])
+            if res:
+                pop = res[0].get("popularity") or 0
+                if best is None or pop > best[2]:
+                    best = (kind, res[0]["id"], pop)
+        out = (best[0], best[1]) if best else None
+    except Exception:
+        out = None
+    if len(_TMDB_RES) > 500:
+        _TMDB_RES.clear()
+    _TMDB_RES[key] = out
+    return out
+
+
 @app.get("/subs")
 def subs():
     if not SUBDL_KEY:
@@ -5977,12 +6049,33 @@ def subs():
     q = request.args.get("q", "").strip()
     s = request.args.get("s", "")
     e = request.args.get("e", "")
+    year = ""
+    # تشغيل من لينك/ماجنت: مفيش TMDB id واسم الملف خام (Movie.2023.1080p.WEB-DL...mkv) فالبحث كان بيرجّع صفر.
+    # بننضّف الاسم ونجيب الـid من TMDB، وده بيفعّل كل مصادر الترجمة زي التشغيل من صفحة الفيلم
+    if q and not (tid.isdigit() and typ in ("movie", "tv")):
+        try:
+            gt, gy, gs, ge, dirty = _guess_release(q)
+        except Exception:
+            gt, gy, gs, ge, dirty = "", "", None, None, False
+        if dirty and gt:
+            q, year = gt, gy
+            if gs is not None:
+                if not s.isdigit():
+                    s, e = str(gs), str(ge)
+                if typ not in ("movie", "tv"):
+                    typ = "tv"
+            rid = _tmdb_resolve(gt, gy, typ if typ in ("movie", "tv") else "")
+            if rid:
+                typ, tid = rid[0], str(rid[1])
+    g._sub_se = (s, e)
     base = {"api_key": SUBDL_KEY, "languages": lang}
     if tid.isdigit() and typ in ("movie", "tv"):
         base["tmdb_id"] = tid
         base["type"] = typ
     elif q:
         base["film_name"] = q
+        if year and typ != "tv":
+            base["year"] = year
         if typ in ("movie", "tv"):
             base["type"] = typ
     else:
@@ -5995,6 +6088,8 @@ def subs():
     if not blocked:
         try:
             items, mode = subdl_search(base, s_i, e_i, is_tv)
+            if not items and base.get("year"):      # السنة ممكن تكون غلط في اسم الملف: نجرّب من غيرها
+                items, mode = subdl_search({k: v for k, v in base.items() if k != "year"}, s_i, e_i, is_tv)
         except requests.Timeout:
             err = "SubDL بطيء، جرّب تاني"
         except Exception as ex:
@@ -6635,7 +6730,7 @@ def subx_pack():
     if isinstance(r, tuple):
         return r
     d = r.get_json() or {}
-    se, ep = request.args.get("s", ""), request.args.get("e", "")
+    se, ep = getattr(g, "_sub_se", None) or (request.args.get("s", ""), request.args.get("e", ""))
     items = _rank_subs(d.get("items") or [], request.args.get("fname", ""))[:8]
     out = [{"n": x["name"], "a": x.get("author", ""), "u": x["u"], "l": x.get("lang", ""), "f": bool(x.get("full")),
             "url": _subx_url(x["u"], se, ep, x.get("lang") or "AR")} for x in items]
