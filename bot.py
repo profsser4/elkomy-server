@@ -5141,28 +5141,57 @@ def tmdb():
     if not q:
         return jsonify(results=[])
     try:
-        used, ar = q, []
-        for qq in _ar_variants(q):
-            ar = _tmdb_multi(qq, "ar")
-            if ar:
-                used = qq
-                break
-        en_list = tmdb_get("/search/multi", query=used, language="en-US",
-                           include_adult="false").get("results", [])
-        en = {(i.get("media_type"), i["id"]): i for i in en_list}
-        out = []
-        for x in ar:
-            if x.get("media_type") not in ("movie", "tv"):
-                continue
-            e = en.get((x["media_type"], x["id"]), x)
+        def _row(x, e, ar_x=None):
             date_s = x.get("release_date") or x.get("first_air_date") or ""
-            out.append({
+            return {
                 "id": x["id"], "type": x["media_type"], "year": date_s[:4],
                 "title": x.get("title") or x.get("name") or "",
                 "search_title": e.get("title") or e.get("name")
                 or x.get("original_title") or x.get("original_name") or "",
                 "poster": img(x.get("poster_path"), "w342"),
-            })
+            }
+
+        if _AR_RE.search(q):
+            # ===== اسم عربي: نفس السلوك القديم =====
+            used, ar = q, []
+            for qq in _ar_variants(q):
+                ar = _tmdb_multi(qq, "ar")
+                if ar:
+                    used = qq
+                    break
+            en_list = tmdb_get("/search/multi", query=used, language="en-US",
+                               include_adult="false").get("results", [])
+            en = {(i.get("media_type"), i["id"]): i for i in en_list}
+            out = [_row(x, en.get((x["media_type"], x["id"]), x)) for x in ar]
+            return jsonify(results=out[:30])
+
+        # ===== اسم إنجليزي/أجنبي: نتايج بالاسم الإنجليزي والبوستر الأصلي الأول، =====
+        # ===== وبعدها نتايج البحث العربي الحالية (من غير تكرار) =====
+        en_res = _tmdb_multi(q, "en-US")
+        try:
+            ar_res = _tmdb_multi(q, "ar")
+        except Exception:
+            ar_res = []
+        ar_map = {(i.get("media_type"), i["id"]): i for i in ar_res}
+        out, seen = [], set()
+        for x in en_res:
+            k = (x["media_type"], x["id"])
+            seen.add(k)
+            r = _row(x, x)
+            a = ar_map.get(k)
+            if a:
+                at = a.get("title") or a.get("name") or ""
+                if at and at != r["title"]:
+                    r["title_ar"] = at
+                if not r["poster"]:
+                    r["poster"] = img(a.get("poster_path"), "w342")
+            out.append(r)
+        for x in ar_res:
+            k = (x["media_type"], x["id"])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(_row(x, x))
         return jsonify(results=out[:30])
     except Exception as e:
         return jsonify(error=str(e)), 500
