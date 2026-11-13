@@ -5641,30 +5641,43 @@ def get_zip(u):
     return r.content
 
 
+_SUB_EXTS = (".srt", ".vtt", ".ass", ".ssa", ".txt")
+
+
+def _sub_entries(z, depth=0):
+    """كل ملفات الترجمة جوه الأرشيف (بما فيها أرشيف جوه أرشيف). كل عنصر: (الاسم, الحجم, دالة بترجّع البايتات)"""
+    out = []
+    for i in z.infolist():
+        if i.is_dir():
+            continue
+        low = i.filename.lower()
+        if low.endswith(_SUB_EXTS) and i.file_size < 10000000 and "__macosx" not in low:
+            out.append((i.filename, i.file_size, (lambda z=z, i=i: z.read(i))))
+        elif low.endswith(".zip") and depth < 2 and i.file_size < 10000000:
+            try:
+                out += _sub_entries(zipfile.ZipFile(io.BytesIO(z.read(i))), depth + 1)
+            except Exception:
+                pass
+    return out
+
+
 def pick_sub(z, season, episode):
-    exts = (".srt", ".vtt", ".ass", ".ssa")
-    names = [
-        i for i in z.infolist()
-        if not i.is_dir() and i.filename.lower().endswith(exts)
-        and i.file_size < 3000000
-    ]
+    names = _sub_entries(z)
     if not names:
         return None
     if episode is not None:
         hits = []
-        for i in names:
-            s, e = parse_ep(i.filename)
+        for n in names:
+            s, e = parse_ep(n[0])
             if e == episode and (season is None or s is None or s == season):
-                hits.append(i)
+                hits.append(n)
         if not hits:
             pat = re.compile(r"(?<!\d)0*%d(?!\d)" % episode)
-            hits = [i for i in names if pat.search(os.path.basename(i.filename))]
+            hits = [n for n in names if pat.search(os.path.basename(n[0]))]
         if hits:
             names = hits
-    pref = {".srt": 0, ".vtt": 1, ".ass": 2, ".ssa": 3}
-    names.sort(key=lambda i: (
-        pref.get(os.path.splitext(i.filename.lower())[1], 9), -i.file_size
-    ))
+    pref = {".srt": 0, ".vtt": 1, ".ass": 2, ".ssa": 3, ".txt": 4}
+    names.sort(key=lambda n: (pref.get(os.path.splitext(n[0].lower())[1], 9), -n[1]))
     return names[0]
 
 
@@ -5675,12 +5688,16 @@ def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0, ai=None):
         info = pick_sub(z, season, episode)
         if not info:
             raise LookupError("مفيش ملف ترجمة مدعوم جوه الأرشيف")
-        raw = z.read(info)
-        ext = os.path.splitext(info.filename.lower())[1]
+        raw = info[2]()
+        ext = os.path.splitext(info[0].lower())[1]
+    elif data[:4] == b"Rar!" or data[:2] == b"7z":
+        raise LookupError("الأرشيف مضغوط بصيغة RAR/7z مش مدعومة")
     else:
         raw = data
         ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
     text = decode_sub(raw, ar)
+    if "-->" not in text and "[Events]" not in text:
+        raise LookupError("الملف مش ترجمة مفهومة")
     rtl = bool(ar) and fmt != "srt"
     if ext in (".ass", ".ssa"):
         vtt = ass_to_vtt(text, shift, scale, rtl)
