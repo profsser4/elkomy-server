@@ -561,9 +561,10 @@ def read_token(tok):
 
 _ADMIN_PREFIXES = ("/users", "/iptv/admin")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
-_ADMIN_ANY = ("/home/dub-refresh", "/providers/export", "/play/diag", "/play/reports")
+_ADMIN_ANY = ("/home/dub-refresh", "/providers/export", "/play/diag", "/play/reports", "/play/probe", "/clib/item")
 # مسارات ستريميو بتغيّر إعداد مشترك للموقع كله (حساب + إضافات + مفاتيح مزوّدين): للأدمن بس
-_ADMIN_POST_EXACT = ("/stremio/login", "/stremio/sync", "/stremio/logout", "/stremio/addon")
+_ADMIN_POST_EXACT = ("/stremio/login", "/stremio/sync", "/stremio/logout", "/stremio/addon",
+                     "/series/map", "/series/map/bulk", "/series/unmap", "/clib/save", "/clib/delete")
 
 
 def needs_admin(path, method):
@@ -611,13 +612,13 @@ def guard():
             pass
     if g.role != "admin" and needs_admin(request.path, request.method):
         return jsonify(error="للأدمن بس"), 403
-    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/play/hls", "/play/ext", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
+    if g.role != "admin" and request.method == "POST" and request.path in ("/play/start", "/play/hls", "/play/ext", "/clib/play", "/generate", "/stremio/resolve", "/tb/stream", "/sub/auto", "/sub/ai"):
         lk, msg = lock_of(g.user)
         if lk >= 2:                                   # تصفح فقط: مفيش مشاهدة ولا تحميل
             return jsonify(error=msg, nodl=True, lock=2), 403
         if lk == 1:                                   # ممنوع التحميل بس
             b = request.get_json(silent=True) or {}
-            if (request.path == "/play/start" and b.get("mode") == "download") or \
+            if (request.path in ("/play/start", "/clib/play") and b.get("mode") == "download") or \
                     (request.path == "/generate" and (b.get("zip") or b.get("all"))):
                 return jsonify(error=msg, nodl=True, lock=1), 403
     return None
@@ -1042,7 +1043,7 @@ def me_password():
 #   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
 #   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
 # وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
-SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False, "reg": True}
+SET_DEF = {"watch": "torbox", "dl": "same", "strict": False, "reg": True}
 
 
 def settings_load():
@@ -3961,6 +3962,682 @@ def generate():
         except Exception:
             pass
     return resp
+
+
+# ----------------- /play/start و /play/hls (المشاهدة والتحميل من الموقع والتلفزيون والأندرويد) -----------------
+def _pick_ep_file(files, s_, e_):
+    """بيختار ملف الحلقة المطلوبة من قايمة ملفات الباك (season/episode)."""
+    try:
+        s_ = int(s_) if s_ is not None else None
+        e_ = int(e_) if e_ is not None else None
+    except (TypeError, ValueError):
+        return None
+    if e_ is None:
+        return None
+    exact = [f for f in files if f.get("episode") == e_ and f.get("season") == s_]
+    if exact:
+        return max(exact, key=lambda f: f.get("size") or 0)
+    loose = [f for f in files if f.get("episode") == e_ and f.get("season") is None]
+    if loose:
+        return max(loose, key=lambda f: f.get("size") or 0)
+    return None
+
+
+def _norm_resp(r):
+    resp = make_response(r)
+    return resp, (resp.get_json(silent=True) or {})
+
+
+def _torrent_pick(q, tid, s_, e_, pf, stc):
+    """بيجهّز التورنت وبيختار ملف الحلقة (لو باك). بيرجّع (response, json)."""
+    resp, d = _norm_resp(torrent_dispatch(q, tid, prefer=pf, strict=stc))
+    if resp.status_code != 200:
+        return resp, d
+    if d.get("pack") and d.get("files") and s_ is not None and e_ is not None:
+        f = _pick_ep_file(d["files"], s_, e_)
+        if f and str(f.get("id")) != str(d.get("file_id")):
+            resp2, d2 = _norm_resp(torrent_dispatch(q, d.get("torrent_id"), file_id=f["id"], prefer=pf, strict=stc))
+            return resp2, d2
+    return resp, d
+
+
+@app.post("/play/start")
+def play_start():
+    b = request.get_json(silent=True) or {}
+    mode = "download" if b.get("mode") == "download" else "watch"
+    h = str(b.get("hash") or "").strip().lower()
+    ref = str(b.get("ref") or "").strip()
+    tid = b.get("torrent_id")
+    name, size = b.get("name"), b.get("size")
+    try:
+        # نسخة Stremio / رابط مباشر (بيتحل عن طريق ref)
+        if ref and not h and not tid:
+            resp, d = _norm_resp(st_resolve())
+            if resp.status_code == 200 and d.get("url"):
+                return jsonify(direct=d["url"], direct_link=d["url"], name=name or "", size=size or 0,
+                               provider="Stremio", probe_failed=d.get("probe_failed"))
+            return jsonify(error=d.get("error") or "فشل تجهيز الرابط"), (resp.status_code if resp.status_code >= 400 else 502)
+
+        if not h and not tid:
+            return jsonify(error="مفيش نسخة مبعوتة"), 400
+
+        q = ("magnet:?xt=urn:btih:" + h) if h else ""
+        pf, stc = prov_pref(g.user, mode)
+        resp, d = _torrent_pick(q, tid, b.get("s"), b.get("e"), pf, stc)
+        if resp.status_code != 200:
+            return resp          # 202 = لسه بيجهّز، أو الخطأ زي ما هو
+        url = d.get("direct_link")
+        if not url:
+            return jsonify(error=d.get("error") or "المزوّد ماردّش برابط"), 400
+        d["direct"] = url
+        try:
+            act_log(g.user, "dl" if mode == "download" else "watch", d.get("name") or name,
+                    d.get("size") or size, d.get("provider"))
+        except Exception:
+            pass
+        return jsonify(d)
+    except requests.Timeout:
+        return jsonify(error="السيرفرات بطيئة حالياً، جرب تاني"), 504
+    except Exception as ex:
+        return jsonify(error=f"مشكلة في السيرفر: {str(ex)[:150]}"), 500
+
+
+@app.post("/play/hls")
+def play_hls():
+    b = request.get_json(silent=True) or {}
+    tid, fid = b.get("torrent_id"), b.get("file_id")
+    if tid in (None, "") or fid in (None, ""):
+        return jsonify(hls="", note="torrent_id و file_id مطلوبين")
+    if str(tid).startswith("x:") or not str(tid).isdigit():
+        return jsonify(hls="", note="المزوّد ده مفيهوش بث محوَّل")
+    p = tb_provider()
+    if not p:
+        return jsonify(hls="", note="TorBox مش مضاف")
+    try:
+        url, note = tb_hls(p["key"], tid, fid)
+        return jsonify(hls=url, note=note)
+    except Exception as ex:
+        return jsonify(hls="", note=f"TorBox: {str(ex)[:100]}")
+
+
+# ----------------- نسخ المشاهدة /play/versions -----------------
+_Q_RXS = ((re.compile(r"2160p|\b4k\b|\buhd\b", re.I), "2160P"), (re.compile(r"1080p|\bfhd\b", re.I), "1080P"),
+          (re.compile(r"720p", re.I), "720P"), (re.compile(r"480p|\bsd\b", re.I), "480P"))
+_RISKY_RX = re.compile(r"x265|h\.?265|hevc|10[- ]?bit|hdr|dolby|\bdv\b|remux|2160p|\b4k\b|truehd|atmos", re.I)
+_VER_CACHE = {}
+_VER_LOCK = threading.Lock()
+
+
+def _q_of(t):
+    for rx, q in _Q_RXS:
+        if rx.search(t or ""):
+            return q
+    return ""
+
+
+@app.get("/play/versions")
+def play_versions():
+    typ = "tv" if request.args.get("type") == "tv" else "movie"
+    imdb = request.args.get("imdb", "")
+    qn = request.args.get("q", "").strip()[:120]
+    s_, e_ = request.args.get("s", ""), request.args.get("e", "")
+    ck = (typ, imdb, qn, s_, e_, g.role == "admin")
+    now = time.time()
+    with _VER_LOCK:
+        hit = _VER_CACHE.get(ck)
+    if hit and now - hit[0] < 90:
+        return jsonify(hit[1])
+
+    raw, notes = [], []
+    try:
+        resp, d = _norm_resp(st_streams())
+        raw += d.get("results") or []
+        if d.get("error"):
+            notes.append(d["error"])
+    except Exception as ex:
+        notes.append(f"Stremio: {short_err(ex)}")
+    # بحث Prowlarr احتياطي/مكمّل (لو متضاف)
+    if PROWLARR_URL and PROWLARR_KEY and qn:
+        try:
+            qq = qn + (f" S{int(s_):02d}E{int(e_):02d}" if typ == "tv" and s_.isdigit() and e_.isdigit() else "")
+            for x in prowlarr_search(qq, CATS["tv" if typ == "tv" else "movie"], timeout=20)[:40]:
+                raw.append({**x, "ref": "", "cached": False})
+        except Exception as ex:
+            notes.append(f"Prowlarr: {str(ex)[:80]}")
+
+    seen, items = set(), []
+    for x in raw:
+        key = x.get("hash") or x.get("ref") or ""
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(x)
+    hs = [x["hash"] for x in items if x.get("hash")][:100]
+    cached = set()
+    if hs:
+        try:
+            cached = cached_hashes(hs)
+        except Exception:
+            cached = set()
+    out = []
+    for x in items:
+        h, ref, title = x.get("hash") or "", x.get("ref") or "", x.get("title") or ""
+        out.append({
+            "hash": h, "ref": ref, "title": title, "size": x.get("size") or 0,
+            "q": _q_of(title), "instant": bool(ref) or (h in cached),
+            "seeders": x.get("seeders") or 0, "risky": (not h) and bool(_RISKY_RX.search(title)),
+            "dub": bool(x.get("dub")), "eg": bool(x.get("eg")),
+            "indexer": x.get("indexer") if g.role == "admin" else "",
+        })
+    res = {"versions": out}
+    if not out:
+        res["error"] = (notes[0] if notes else "مفيش نسخ متاحة للعمل ده حالياً")
+    elif g.role == "admin" and notes:
+        res["notes"] = notes
+    with _VER_LOCK:
+        if len(_VER_CACHE) > 200:
+            _VER_CACHE.clear()
+        _VER_CACHE[ck] = (now, res)
+    return jsonify(res)
+
+
+# ----------------- بلاغات التشغيل + فحص الملف + تشخيص البث -----------------
+REPORTS_FILE = os.path.join(DATA_DIR, "playreports.json")
+_REP_LOCK = threading.Lock()
+
+
+@app.post("/play/report")
+def play_report():
+    b = request.get_json(silent=True) or {}
+    msg = str(b.get("msg") or "")[:300]
+    if not msg:
+        return jsonify(ok=False), 400
+    rec = {"t": int(time.time()), "u": g.user, "title": str(b.get("title") or "")[:120],
+           "s": b.get("s"), "e": b.get("e"), "mode": str(b.get("mode") or "")[:20], "msg": msg,
+           "f": str(b.get("f") or "")[:200], "ua": str(b.get("ua") or "")[:160]}
+    with _REP_LOCK:
+        try:
+            d = store_load(REPORTS_FILE)
+            d = d if isinstance(d, list) else []
+        except Exception:
+            d = []
+        if not (d and d[-1].get("msg") == msg and d[-1].get("u") == g.user and rec["t"] - d[-1].get("t", 0) < 60):
+            d.append(rec)
+        del d[:-200]
+        try:
+            store_save(REPORTS_FILE, d)
+        except Exception:
+            pass
+    return jsonify(ok=True)
+
+
+@app.get("/play/reports")
+def play_reports():
+    try:
+        d = store_load(REPORTS_FILE)
+        d = d if isinstance(d, list) else []
+    except Exception:
+        d = []
+    return jsonify(items=list(reversed(d))[:100])
+
+
+def _public_host(host):
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for i in infos:
+        try:
+            ip = ipaddress.ip_address(i[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return bool(infos)
+
+
+_CODEC_TOKENS = (
+    (b"V_MPEGH/ISO/HEVC", "HEVC"), (b"hvc1", "HEVC"), (b"hev1", "HEVC"), (b"V_MPEG4/ISO/AVC", "H.264"), (b"avc1", "H.264"),
+    (b"V_VP9", "VP9"), (b"V_AV1", "AV1"), (b"av01", "AV1"),
+    (b"A_EAC3", "EAC3"), (b"ec-3", "EAC3"), (b"A_AC3", "AC3"), (b"ac-3", "AC3"), (b"A_TRUEHD", "TrueHD"),
+    (b"A_DTS", "DTS"), (b"A_AAC", "AAC"), (b"mp4a", "AAC"), (b"A_OPUS", "Opus"), (b"A_FLAC", "FLAC"),
+)
+
+
+@app.post("/play/probe")
+def play_probe():
+    url = str((request.get_json(silent=True) or {}).get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify(error="رابط غير صالح"), 400
+    cur, r = url, None
+    try:
+        for _ in range(6):
+            host = urlparse(cur).hostname or ""
+            if not _public_host(host):
+                return jsonify(error="الرابط ده مش مسموح بفحصه")
+            r = requests.get(cur, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-262143"},
+                             stream=True, timeout=15, allow_redirects=False)
+            loc = r.headers.get("Location")
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                r.close()
+                cur = urljoin(cur, loc)
+                continue
+            break
+        status = r.status_code
+        ctype = r.headers.get("Content-Type", "")
+        cr = r.headers.get("Content-Range", "")
+        total = int(cr.rsplit("/", 1)[1]) if "/" in cr and cr.rsplit("/", 1)[1].isdigit() else int(r.headers.get("Content-Length") or 0)
+        data = b""
+        if status < 400:
+            data = r.raw.read(262144, decode_content=True) or b""
+        r.close()
+        host = urlparse(cur).netloc
+        if status >= 400:
+            return jsonify(error=f"المصدر رد {status} ({host}): الرابط منتهي أو محجوب", status=status, host=host)
+        if data[:7] == b"#EXTM3U":
+            cont = "HLS"
+        elif data[:4] == b"\x1aE\xdf\xa3":
+            cont = "WebM" if b"webm" in data[:64] else "MKV"
+        elif data[4:8] == b"ftyp":
+            cont = "MP4"
+        elif data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+            cont = "AVI"
+        elif data[:1] == b"G":
+            cont = "TS"
+        else:
+            cont = "غير معروف"
+        codecs = []
+        for tok, name in _CODEC_TOKENS:
+            if tok in data and name not in codecs:
+                codecs.append(name)
+        if cont == "غير معروف" and "text/html" in ctype:
+            fix = "الرابط رجّع صفحة ويب مش فيديو: الرابط منتهي أو محتاج تسجيل دخول. هات رابط جديد."
+        elif "HEVC" in codecs:
+            fix = "الفيديو HEVC/H.265: كتير من المتصفحات والموبايلات مابتفكهوش. استخدم البث المحوَّل أو المشغّل الداخلي/VLC أو نسخة H.264."
+        elif cont in ("MKV", "AVI", "TS") and not (set(codecs) & {"AAC"}):
+            fix = "الصوت في الملف ده غالباً مش مدعوم في المتصفح (AC3/DTS/TrueHD). استخدم البث المحوَّل (HLS) أو VLC."
+        elif cont == "MKV":
+            fix = "حاوية MKV: بتشتغل في التطبيق وVLC، والمتصفح ممكن يرفضها. البث المحوَّل بيحلها."
+        else:
+            fix = "الملف سليم ومفروض يشتغل."
+        return jsonify(status=status, type=ctype, total=total, host=host, container=cont, codecs=codecs, fix=fix)
+    except requests.Timeout:
+        return jsonify(error="انتهى الوقت وانا بفحص الرابط")
+    except Exception as ex:
+        return jsonify(error=f"فشل الفحص: {str(ex)[:120]}")
+
+
+@app.post("/play/diag")
+def play_diag():
+    b = request.get_json(silent=True) or {}
+    h = str(b.get("hash") or "").strip().lower()
+    steps = []
+
+    def add(step, ok, **kw):
+        steps.append({"step": step, "ok": bool(ok), **kw})
+        return ok
+
+    p = tb_provider()
+    if not add("provider", p, name=(p or {}).get("name", ""), note="" if p else "TorBox مش مضاف في المزوّدين"):
+        return jsonify(steps=steps)
+    k = p["key"]
+    try:
+        u = tb(k, "GET", "/user/me")
+        ud = u.get("data") if isinstance(u.get("data"), dict) else {}
+        if not add("account", u.get("success"), plan=ud.get("plan"), expires=ud.get("premium_expires_at"),
+                   note="" if u.get("success") else str(u.get("detail") or u.get("error") or "المفتاح غلط أو الحساب موقوف")):
+            return jsonify(steps=steps)
+        if not re.fullmatch(r"[0-9a-f]{40}", h):
+            add("hash", False, note="الـ hash غير صالح")
+            return jsonify(steps=steps)
+        is_cached = h in tb_cached(k, [h])
+        add("cached", is_cached, note="" if is_cached else "النسخة مش متخزّنة على TorBox: هتتسحب الأول (بطيء)، ماعملتش إضافة للتشخيص")
+        if not is_cached:
+            return jsonify(steps=steps)
+        magnet = "magnet:?xt=urn:btih:" + h
+        tid = find_existing(k, magnet)
+        if not tid:
+            c = tb(k, "POST", "/torrents/createtorrent", data={"magnet": magnet, "seed": 1})
+            tid = (c.get("data") or {}).get("torrent_id") if c.get("success") else None
+            if not add("add", tid, note="" if tid else str(c.get("detail") or c.get("error") or "فشل الإضافة")):
+                return jsonify(steps=steps)
+        info = as_dict(tb(k, "GET", "/torrents/mylist", params={"id": tid, "bypass_cache": "true"}).get("data"))
+        vids = video_files(info)
+        if not add("torrent", is_ready(info) and vids, id=tid, state=info.get("download_state"), videos=len(vids),
+                   note="" if vids else "مفيش ملفات فيديو جاهزة"):
+            return jsonify(steps=steps)
+        f = _pick_ep_file(vids, b.get("s"), b.get("e")) if b.get("e") is not None else None
+        f = f or main_file(vids, info)
+        add("file", f, name=(f or {}).get("name"), id=(f or {}).get("id"), size=(f or {}).get("size"))
+        if not f:
+            return jsonify(steps=steps)
+        try:
+            tb_link(k, tid, f["id"])
+            add("link", True)
+        except Exception as ex:
+            add("link", False, note=str(ex)[:150])
+        url, sd, note = tb_hls_opts(k, tid, f["id"])
+        add("stream", url, hls=url, note=note)
+    except Exception as ex:
+        add("error", False, note=str(ex)[:200])
+    return jsonify(steps=steps)
+
+
+# ----------------- تسلسل المسلسل /series/map -----------------
+SMAP_FILE = os.path.join(DATA_DIR, "series_map.json")
+_SMAP_LOCK = threading.Lock()
+
+
+def _smap_all():
+    try:
+        d = store_load(SMAP_FILE)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _smap_clean_spec(sp):
+    sp = sp if isinstance(sp, dict) else {}
+    h = str(sp.get("hash") or "").strip().lower()
+    return {"hash": h if re.fullmatch(r"[0-9a-f]{40}", h) else "", "name": str(sp.get("name") or "")[:200],
+            "fid": sp.get("fid"), "src": str(sp.get("src") or "")[:600], "ref": str(sp.get("ref") or "")[:40]}
+
+
+def _smap_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/series/map")
+def series_map_get():
+    return jsonify(eps=_smap_all().get(str(request.args.get("id", "")), {}))
+
+
+@app.post("/series/map")
+def series_map_set():
+    b = request.get_json(silent=True) or {}
+    sid, s_, e_ = str(b.get("id") or ""), _smap_int(b.get("s")), _smap_int(b.get("e"))
+    sp = _smap_clean_spec(b.get("spec"))
+    if not sid or s_ is None or e_ is None or not (sp["hash"] or sp["ref"] or sp["src"]):
+        return jsonify(error="بيانات الحلقة ناقصة"), 400
+    with _SMAP_LOCK:
+        d = _smap_all()
+        eps = d.setdefault(sid, {})
+        eps[f"{s_}:{e_}"] = {**sp, "by": g.user, "t": int(time.time())}
+        store_save(SMAP_FILE, d)
+    return jsonify(eps=eps)
+
+
+@app.post("/series/map/bulk")
+def series_map_bulk():
+    b = request.get_json(silent=True) or {}
+    sid = str(b.get("id") or "")
+    if not sid:
+        return jsonify(error="id ناقص"), 400
+    todo = []   # [(s, e, spec)]
+    if isinstance(b.get("eps"), list):
+        base = _smap_clean_spec({"hash": b.get("hash"), "name": b.get("name")})
+        if not base["hash"]:
+            return jsonify(error="hash غير صالح"), 400
+        for x in b["eps"][:500]:
+            s_, e_ = _smap_int((x or {}).get("s")), _smap_int((x or {}).get("e"))
+            if s_ is not None and e_ is not None:
+                todo.append((s_, e_, {**base, "fid": (x or {}).get("fid")}))
+    else:
+        s_, cnt = _smap_int(b.get("s")), _smap_int(b.get("count"))
+        sp = _smap_clean_spec(b.get("spec"))
+        if s_ is None or not cnt or cnt < 1 or not sp["hash"]:
+            return jsonify(error="بيانات الموسم ناقصة"), 400
+        for e_ in range(1, min(cnt, 500) + 1):
+            todo.append((s_, e_, sp))
+    added = 0
+    with _SMAP_LOCK:
+        d = _smap_all()
+        eps = d.setdefault(sid, {})
+        for s_, e_, sp in todo:
+            k = f"{s_}:{e_}"
+            if k in eps:
+                continue
+            eps[k] = {**sp, "by": g.user, "t": int(time.time())}
+            added += 1
+        if added:
+            store_save(SMAP_FILE, d)
+    return jsonify(eps=eps, added=added)
+
+
+@app.post("/series/unmap")
+def series_unmap():
+    b = request.get_json(silent=True) or {}
+    sid, s_, e_ = str(b.get("id") or ""), _smap_int(b.get("s")), _smap_int(b.get("e"))
+    with _SMAP_LOCK:
+        d = _smap_all()
+        eps = d.get(sid, {})
+        if eps.pop(f"{s_}:{e_}", None) is not None:
+            d[sid] = eps
+            store_save(SMAP_FILE, d)
+    return jsonify(eps=eps)
+
+
+# ----------------- المكتبة السحابية /clib -----------------
+CLIB_FILE = os.path.join(DATA_DIR, "clib.json")
+_CLIB_LOCK = threading.Lock()
+_CLIB_TAG = re.compile(r"S(\d{1,3})(?:E(\d{1,4}))?$", re.I)
+
+
+def _clib_all():
+    try:
+        d = store_load(CLIB_FILE)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _clib_links(text):
+    out = []
+    for tok in re.split(r"[\s|]+", str(text or "")):
+        tok = tok.strip()
+        if tok.startswith(("http://", "https://", "magnet:")) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _clib_eps(text):
+    eps, cs, ce = [], 1, 0
+    for line in str(text or "").splitlines():
+        toks = [t for t in re.split(r"[\s|]+", line.strip()) if t]
+        if not toks:
+            continue
+        tag = _CLIB_TAG.match(toks[0])
+        e_set = None
+        if tag:
+            toks = toks[1:]
+            cs = int(tag.group(1))
+            if tag.group(2):
+                e_set = int(tag.group(2))
+            else:
+                ce = 0
+        links = _clib_links(" ".join(toks))
+        if not links:
+            continue
+        ce = e_set if e_set is not None else ce + 1
+        eps.append({"s": cs, "e": ce, "links": links})
+    return eps
+
+
+def _clib_warm(links):
+    """بيبدأ سحب الماجنتس على TorBox (اللي مش متخزّنة) عشان تبقى جاهزة وقت التشغيل."""
+    p = tb_provider()
+    mags = [l for l in links if l.startswith("magnet:")][:20]
+    if not p or not mags:
+        return 0
+    hs = [magnet_hash(m) for m in mags]
+    try:
+        cached = tb_cached(p["key"], [h for h in hs if h])
+    except Exception:
+        cached = set()
+    todo = [m for m, h in zip(mags, hs) if h and h not in cached]
+
+    def add(m):
+        try:
+            if "&tr=" not in m:
+                m += TRACKERS
+            r = tb(p["key"], "POST", "/torrents/createtorrent", data={"magnet": m, "seed": 1})
+            return bool(r.get("success"))
+        except Exception:
+            return False
+    if not todo:
+        return 0
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        return sum(1 for ok in ex.map(add, todo) if ok)
+
+
+@app.get("/clib/list")
+def clib_list():
+    items = []
+    for it in _clib_all().values():
+        items.append({"id": it["id"], "cat": it.get("cat", "movie"), "kind": it.get("kind", "movie"),
+                      "title": it.get("title", ""), "year": it.get("year", ""), "poster": it.get("poster", ""),
+                      "eps": [{"s": e["s"], "e": e["e"]} for e in it.get("eps", [])], "t": it.get("t", 0)})
+    items.sort(key=lambda x: x["t"], reverse=True)
+    return jsonify(items=items)
+
+
+@app.get("/clib/item")
+def clib_item():
+    it = _clib_all().get(str(request.args.get("id", "")))
+    if not it:
+        return jsonify(error="العنصر مش موجود"), 404
+    return jsonify({k: it.get(k, "") for k in ("id", "cat", "kind", "title", "year", "poster", "links_text", "eps_text")})
+
+
+@app.post("/clib/save")
+def clib_save():
+    b = request.get_json(silent=True) or {}
+    title = str(b.get("title") or "").strip()[:150]
+    kind = "tv" if b.get("kind") == "tv" else "movie"
+    cat = b.get("cat") if b.get("cat") in ("movie", "series", "cartoon") else "movie"
+    links_text, eps_text = str(b.get("links_text") or "")[:20000], str(b.get("eps_text") or "")[:100000]
+    links = _clib_links(links_text)
+    eps = _clib_eps(eps_text) if kind == "tv" else []
+    if not title:
+        return jsonify(error="اكتب الاسم"), 400
+    if not links and not eps:
+        return jsonify(error="ضيف رابط واحد على الأقل"), 400
+    iid = str(b.get("id") or "").strip() or uuid.uuid4().hex[:10]
+    with _CLIB_LOCK:
+        d = _clib_all()
+        old = d.get(iid) or {}
+        old_links = set(old.get("links", [])) | {l for e in old.get("eps", []) for l in e["links"]}
+        d[iid] = {"id": iid, "cat": cat, "kind": kind, "title": title, "year": str(b.get("year") or "")[:6],
+                  "poster": str(b.get("poster") or "")[:500], "links_text": links_text, "eps_text": eps_text,
+                  "links": links, "eps": eps, "t": int(time.time())}
+        store_save(CLIB_FILE, d)
+    new_links = [l for l in (links + [x for e in eps for x in e["links"]]) if l not in old_links]
+    warming = 0
+    try:
+        warming = _clib_warm(new_links)
+    except Exception:
+        pass
+    return jsonify(ok=True, id=iid, warming=warming)
+
+
+@app.post("/clib/delete")
+def clib_delete():
+    iid = str((request.get_json(silent=True) or {}).get("id") or "")
+    with _CLIB_LOCK:
+        d = _clib_all()
+        if d.pop(iid, None) is None:
+            return jsonify(error="العنصر مش موجود"), 404
+        store_save(CLIB_FILE, d)
+    return jsonify(ok=True)
+
+
+def _clib_try(link, tid, s_, e_, pf, stc):
+    """بيجرّب رابط واحد: بيرجّع (status, json)."""
+    if link.startswith("magnet:"):
+        resp, d = _torrent_pick(link, tid, s_, e_, pf, stc)
+        return resp.status_code, d
+    t = str(tid or "")
+    if t.startswith("web:"):
+        _, pid, wid = t.split(":", 2)
+        p = next((x for x in load() if x["id"] == pid), None)
+        if not p:
+            return 400, {"error": "المزوّد اتحذف"}
+        body, code = torbox_web(p, link, wid)
+        return code, body
+    cands = candidates(link)
+    errs = []
+    for p in cands:
+        try:
+            if p["type"] == "torbox":
+                body, code = torbox_web(p, link)
+                if code in (200, 202):
+                    return code, body
+                errs.append(f"{p['name']}: {body.get('error')}")
+                continue
+            url = INSTANT[p["type"]](p["key"], link)
+            return 200, {"direct_link": url, "name": unquote(url.split("?")[0].rsplit("/", 1)[-1]) or "ملف", "provider": p["name"]}
+        except Exception as ex:
+            errs.append(f"{p['name']}: {str(ex)[:100]}")
+    if VIDEO and urlparse(link).path.lower().endswith(VIDEO):   # رابط فيديو مباشر من غير مزوّد
+        return 200, {"direct_link": link, "name": unquote(urlparse(link).path.rsplit("/", 1)[-1]) or "ملف", "provider": "رابط مباشر"}
+    return 400, {"error": " | ".join(errs) or "مفيش مزوّد مناسب للرابط ده"}
+
+
+@app.post("/clib/play")
+def clib_play():
+    b = request.get_json(silent=True) or {}
+    it = _clib_all().get(str(b.get("id") or ""))
+    if not it:
+        return jsonify(error="العنصر ده اتحذف"), 404
+    mode = "download" if b.get("mode") == "download" else "watch"
+    s_, e_ = _smap_int(b.get("s")), _smap_int(b.get("e"))
+    links = it.get("links", [])
+    if it.get("kind") == "tv" and it.get("eps"):
+        ep = next((x for x in it["eps"] if x["s"] == s_ and x["e"] == e_), None) or it["eps"][0]
+        links, s_, e_ = ep["links"], ep["s"], ep["e"]
+    n = len(links)
+    if not n:
+        return jsonify(error="مفيش روابط للعنصر ده"), 400
+    skip = {int(x) for x in (b.get("skip") or []) if str(x).isdigit()}
+    tid, li = b.get("torrent_id"), b.get("li")
+    li = li if isinstance(li, int) and 0 <= li < n else None
+    order = [li] if (tid and li is not None) else [i for i in range(n) if i not in skip]
+    pf, stc = prov_pref(g.user, mode)
+    tried = []
+    try:
+        for i in order:
+            code, d = _clib_try(links[i], tid if i == li else None, s_, e_, pf, stc)
+            if code == 202:
+                return jsonify({**d, "li": i, "n": n}), 202
+            if code == 200 and d.get("direct_link"):
+                d.update({"direct": d["direct_link"], "li": i, "n": n})
+                try:
+                    act_log(g.user, "dl" if mode == "download" else "watch", d.get("name") or it["title"], d.get("size"), d.get("provider"))
+                except Exception:
+                    pass
+                return jsonify(d)
+            tried.append(f"رابط {i + 1}: {str(d.get('error') or 'فشل')[:140]}")
+            tid = None
+        return jsonify(error="كل الروابط فشلت ❌", tried=tried), 400
+    except requests.Timeout:
+        return jsonify(error="السيرفرات بطيئة حالياً، جرب تاني", tried=tried), 504
+    except Exception as ex:
+        return jsonify(error=f"مشكلة في السيرفر: {str(ex)[:150]}", tried=tried), 500
+
+
+# ----------------- صفوف الرئيسية /fresh و /latest -----------------
+# بدون مصدر بيانات حالياً: بنرجّع فاضي بدل 404 (الموقع بيتجاهل الفاضي)
+@app.get("/fresh")
+def fresh_rows():
+    return jsonify(rows=[])
+
+
+@app.get("/latest")
+def latest_items():
+    return jsonify(items=[])
 
 
 # ----------------- Stremio (حساب + إضافات + مكتبة) -----------------
