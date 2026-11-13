@@ -6315,6 +6315,110 @@ def sub_auto_poll():
         return jsonify(done=True, ok=False, reason="lost")
 
 
+# ===================== مشغّل الأندرويد الداخلي: تذكرة موقّعة بدل تسجيل الدخول =====================
+# المشغّل الداخلي (LibVLC) مالوش توكن دخول، فالصفحة بتديله تذكرة موقّعة (12 ساعة) يقدر بيها يجيب قايمة الترجمات
+# العربي الأقرب للملف، ويظبطها بالصوت، ويحفظ ضبطك على حسابك: نفس نظام المتصفح بالظبط.
+SUBT_TTL = 12 * 3600
+
+
+def _subt_make(user):
+    tok = _b64e(json.dumps({"u": str(user), "exp": int(time.time()) + SUBT_TTL}, separators=(",", ":")).encode())
+    return tok + "." + sign("subt|" + tok)[:40]
+
+
+def _subt_user(tk):
+    try:
+        tok, sig = str(tk).rsplit(".", 1)
+        if not hmac.compare_digest(sig, sign("subt|" + tok)[:40]):
+            return None
+        p = json.loads(_b64d(tok))
+        if int(p["exp"]) < time.time():
+            return None
+        return str(p["u"])
+    except Exception:
+        return None
+
+
+def _public_base():
+    proto = request.headers.get("X-Forwarded-Proto", "https").split(",")[0].strip()
+    return (os.environ.get("PUBLIC_URL") or f"{proto}://{request.host}").rstrip("/")
+
+
+def _subx_url(u, s, e, lang, fmt="srt"):
+    p = {"u": u, "shift": 0, "scale": 1, "s": str(s or "")[:6], "e": str(e or "")[:6],
+         "lang": str(lang or "")[:20], "ai": "", "exp": int(time.time()) + SUBX_TTL, "f": fmt}
+    tok = _b64e(json.dumps(p, separators=(",", ":")).encode())
+    return f"{_public_base()}/subx/{tok}.{sign('subx|' + tok)[:40]}/sub.{fmt}"
+
+
+def _rel_tok(s):
+    s = re.sub(r"\.[a-z0-9]{2,4}$", "", str(s or "").lower())
+    return [t for t in re.split(r"[^a-z0-9]+", s) if t]
+
+
+def _rank_subs(items, fname):
+    """نفس ترتيب المتصفح: الأقرب لاسم الملف (إصدار/جروب) الأول، والموسم الكامل في الآخر"""
+    have = set(_rel_tok(fname))
+    gm = re.search(r"-([a-z0-9]+)(?:\.[a-z0-9]{2,4})?$", str(fname).strip(), re.I)
+    grp = gm.group(1).lower() if gm else ""
+    for it in items:
+        toks = _rel_tok(it.get("name"))
+        sc = sum((2 if len(t) > 3 else 1) for t in toks if t in have)
+        if grp and grp in toks:
+            sc += 6
+        if it.get("full"):
+            sc -= 3
+        it["_sc"] = sc
+    return [x for _, x in sorted(enumerate(items), key=lambda p: (-p[1]["_sc"], p[0]))]
+
+
+@app.get("/sub/ticket")
+def sub_ticket():
+    return jsonify(tk=_subt_make(g.user), base=_public_base(), ttl=SUBT_TTL)
+
+
+@app.get("/subx/pack")
+def subx_pack():
+    who = _subt_user(request.args.get("tk", ""))
+    if not who:
+        return jsonify(error="forbidden"), 403
+    g.user, g.role = who, "member"
+    r = subs()
+    if isinstance(r, tuple):
+        return r
+    d = r.get_json() or {}
+    se, ep = request.args.get("s", ""), request.args.get("e", "")
+    items = _rank_subs(d.get("items") or [], request.args.get("fname", ""))[:8]
+    out = [{"n": x["name"], "a": x.get("author", ""), "u": x["u"], "l": x.get("lang", ""), "f": bool(x.get("full")),
+            "url": _subx_url(x["u"], se, ep, x.get("lang") or "AR")} for x in items]
+    return jsonify(items=out, mode=d.get("mode", ""))
+
+
+@app.route("/subx/auto", methods=["POST", "GET"])
+def subx_auto():
+    b = request.get_json(silent=True) or {}
+    who = _subt_user(request.args.get("tk") or b.get("tk") or "")
+    if not who:
+        return jsonify(error="forbidden"), 403
+    g.user, g.role = who, "member"
+    if request.method == "GET":
+        return sub_auto_poll()
+    lk, msg = lock_of(who)
+    if lk >= 2:
+        return jsonify(error=msg, nodl=True, lock=2), 403
+    return sub_auto_start()
+
+
+@app.post("/subx/fix")
+def subx_fix():
+    b = request.get_json(silent=True) or {}
+    who = _subt_user(request.args.get("tk") or b.get("tk") or "")
+    if not who:
+        return jsonify(error="forbidden"), 403
+    g.user, g.role = who, "member"
+    return sub_fix_save()
+
+
 # ===================== نهاية ضبط الترجمة بالصوت =====================
 
 
