@@ -5630,9 +5630,19 @@ def ok_sub_path(u):
 def get_zip(u):
     if u in ZIP_CACHE:
         return ZIP_CACHE[u]
-    r = requests.get(SUBDL_DL + u, timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"تحميل الترجمة فشل ({r.status_code})")
+    r = None
+    for attempt in range(3):
+        try:
+            r = requests.get(SUBDL_DL + u, timeout=30)
+        except requests.RequestException:
+            r = None
+        if r is not None and r.status_code == 200:
+            break
+        if r is not None and r.status_code in (403, 404):
+            break
+        time.sleep(0.6 * (attempt + 1))
+    if r is None or r.status_code != 200:
+        raise Exception(f"تحميل الترجمة فشل ({r.status_code if r is not None else 'مفيش اتصال'})")
     if len(r.content) > 6000000:
         raise Exception("ملف الترجمة كبير زيادة")
     if len(ZIP_CACHE) >= 20:
@@ -5710,15 +5720,64 @@ def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0, ai=None):
     return vtt, "text/vtt"
 
 
+SUBDL_CACHE = {}
+
+
 def subdl_call(params):
-    r = requests.get(SUBDL_API, params=params, timeout=25)
-    res = jj(r)
-    if res.get("status") is False and not res.get("subtitles"):
-        msg = str(res.get("error") or "")
-        if "key" in msg.lower() or "api" in msg.lower():
-            raise Exception(msg)
-        return {}
-    return res
+    """بحث SubDL مع كاش وإعادة محاولة. قبل كده أي رفض مؤقت (حد الاستخدام مثلاً) كان بيتفسّر «مفيش ترجمة»
+    فكل الأفلام تبان من غير ترجمة عربي. دلوقتي بنعيد المحاولة، وبنستخدم الكاش، ولو فشل فعلاً بنرجّع خطأ واضح."""
+    key = hashlib.sha1(json.dumps({k: v for k, v in params.items() if k != "api_key"},
+                                  sort_keys=True).encode()).hexdigest()[:32]
+    now = time.time()
+    c = SUBDL_CACHE.get(key)
+    if c and now - c[0] < 6 * 3600:
+        return c[1]
+    path = os.path.join(DATA_DIR, "subdl_%s.json" % key)
+    stale = None
+    try:
+        d = store_load(path)
+        if isinstance(d, dict) and (d.get("res") or {}).get("subtitles"):
+            stale = d["res"]
+            if now - d.get("t", 0) < 24 * 3600:
+                SUBDL_CACHE[key] = (now, stale)
+                return stale
+    except Exception:
+        pass
+    last = ""
+    for attempt in range(3):
+        try:
+            r = requests.get(SUBDL_API, params=params, timeout=20)
+        except requests.RequestException as ex:
+            last = str(ex)[:80]
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = "SubDL رد بكود %s" % r.status_code
+            time.sleep(0.7 * (attempt + 1))
+            continue
+        res = jj(r)
+        if res.get("status") is False and not res.get("subtitles"):
+            msg = str(res.get("error") or "")
+            low = msg.lower()
+            if any(w in low for w in ("limit", "quota", "too many", "rate", "wait")):
+                last = msg[:80] or "حد الاستخدام"
+                time.sleep(0.7 * (attempt + 1))
+                continue
+            if "key" in low or "api" in low:
+                raise Exception(msg)
+            return {}                       # مفيش ترجمات فعلاً
+        if res.get("subtitles"):
+            SUBDL_CACHE[key] = (now, res)
+            if len(SUBDL_CACHE) > 300:
+                SUBDL_CACHE.pop(next(iter(SUBDL_CACHE)))
+            try:
+                store_save(path, {"t": now, "res": res})
+            except Exception:
+                pass
+        return res
+    if stale:                               # SubDL واقع: نستخدم آخر نتيجة محفوظة بدل ما نقول «مفيش ترجمة»
+        return stale
+    raise Exception("SubDL مش بيرد دلوقتي (" + last + ")، جرّب بعد شوية")
 
 
 def sub_items(res):
