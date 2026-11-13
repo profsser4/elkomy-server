@@ -5622,14 +5622,140 @@ def decode_sub(raw, ar):
 
 def ok_sub_path(u):
     return (
-        u.startswith("/subtitle/") and len(u) < 300
+        u.startswith("/subtitle/") and len(u) < (1500 if u.startswith("/subtitle/os3~") else 300)
         and ".." not in u and not re.search(r"[\s\\]", u)
     )
+
+
+# ===== مصادر ترجمة احتياطية مجانية (غير SubDL) =====
+# 1) OpenSubtitles عن طريق إضافة Stremio: من غير مفتاح ولا حد يومي.
+# 2) Wyzie Subs: بيجمع ترجمات من مصادر كتير؛ محتاج مفتاح مجاني (WYZIE_KEY في Variables، من store.wyzie.io/redeem). لو مفيش مفتاح بيتخطّى.
+# بتتضاف جنب نتايج SubDL، ولما SubDL يوصل لحد التحميل اليومي بتبقى هي المصدر الوحيد لمدة ساعة.
+OS3_BASE = "https://opensubtitles-v3.strem.io"
+WYZIE_BASE = os.environ.get("WYZIE_BASE", "https://sub.wyzie.io").rstrip("/")
+WYZIE_KEY = os.environ.get("WYZIE_KEY", "")
+EXT_PREFIX = "/subtitle/os3~"
+SUBDL_BLOCK = {"until": 0.0}
+_IMDB_CACHE = {}
+
+
+def _ext_u(url):
+    """مسار موقّع لرابط ترجمة خارجي: السيرفر بيقبل بس الروابط اللي هو نفسه طلّعها."""
+    tok = _b64e(url.encode())
+    return EXT_PREFIX + tok + "." + sign("os3|" + tok)[:24]
+
+
+def _ext_url(u):
+    tok, sig = u[len(EXT_PREFIX):].rsplit(".", 1)
+    if not hmac.compare_digest(sig, sign("os3|" + tok)[:24]):
+        raise Exception("رابط ترجمة غير صالح")
+    url = _b64d(tok).decode("utf-8", "replace")
+    if not url.startswith("https://") or not _as_safe_url(url):
+        raise Exception("رابط ترجمة غير مسموح")
+    return url
+
+
+def _imdb_of(typ, tid):
+    k = (typ, tid)
+    if k not in _IMDB_CACHE:
+        _IMDB_CACHE[k] = (tmdb_get("/%s/%s/external_ids" % (typ, tid)) or {}).get("imdb_id") or ""
+    return _IMDB_CACHE[k]
+
+
+def os3_items(typ, tid, s, e, lang):
+    want = {"AR": "ara", "EN": "eng"}.get(str(lang).split(",")[0].upper())
+    if not want or typ not in ("movie", "tv") or not str(tid).isdigit():
+        return []
+    imdb = _imdb_of(typ, tid)
+    if not imdb:
+        return []
+    kind = "series" if typ == "tv" else "movie"
+    vid = imdb + (":%s:%s" % (s, e) if kind == "series" and s and e else "")
+    r = requests.get("%s/subtitles/%s/%s.json" % (OS3_BASE, kind, vid), timeout=15)
+    if r.status_code != 200:
+        return []
+    out = []
+    for x in (r.json() or {}).get("subtitles") or []:
+        if str(x.get("lang", "")).lower() not in (want, want[:2]):
+            continue
+        url = str(x.get("url") or "")
+        if not url.startswith("https://"):
+            continue
+        out.append({"u": _ext_u(url), "name": "OpenSubtitles " + str(x.get("id") or len(out) + 1),
+                    "lang": "AR" if want == "ara" else "EN", "author": "OpenSubtitles", "season": s or None,
+                    "episode": e or None, "full": False})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def wyzie_items(typ, tid, s, e, lang):
+    lg = str(lang).split(",")[0].lower()
+    if not WYZIE_KEY or lg not in ("ar", "en") or typ not in ("movie", "tv") or not str(tid).isdigit():
+        return []
+    prm = {"id": tid, "language": lg, "format": "srt", "key": WYZIE_KEY}
+    if typ == "tv" and s and e:
+        prm.update(season=s, episode=e)
+    r = requests.get(WYZIE_BASE + "/search", params=prm, timeout=20)
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    out, seen = [], set()
+    for x in data:
+        url = str((x or {}).get("url") or "")
+        if not url.startswith("https://") or url in seen:
+            continue
+        seen.add(url)
+        nm = x.get("release") or x.get("display") or x.get("source") or "Wyzie"
+        if x.get("isHearingImpaired"):
+            nm = str(nm) + " (SDH)"
+        out.append({"u": _ext_u(url), "name": "Wyzie · " + str(nm)[:80], "lang": lg.upper(),
+                    "author": str(x.get("source") or "Wyzie"), "season": s or None, "episode": e or None,
+                    "full": False})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def extra_sources(typ, tid, s, e, lang):
+    """كل المصادر المجانية الإضافية بالتوازي، مدموجة بالتبادل (واحدة من كل مصدر)."""
+    from concurrent.futures import ThreadPoolExecutor
+    fns = [os3_items] + ([wyzie_items] if WYZIE_KEY else [])
+    res = []
+
+    def run(f):
+        try:
+            return f(typ, tid, s, e, lang)
+        except Exception:
+            return []
+    with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+        res = list(ex.map(run, fns))
+    out = []
+    for i in range(max(len(r) for r in res) if res else 0):
+        for r in res:
+            if i < len(r):
+                out.append(r[i])
+    return out
 
 
 def get_zip(u):
     if u in ZIP_CACHE:
         return ZIP_CACHE[u]
+    if u.startswith(EXT_PREFIX):
+        url = _ext_url(u)
+        r = requests.get(url, timeout=30)
+        if r.status_code != 200:
+            raise Exception("تحميل الترجمة فشل (%s)" % r.status_code)
+        data = r.content
+        if data[:2] == b"\x1f\x8b":
+            import gzip
+            data = gzip.decompress(data)
+        if len(data) > 6000000:
+            raise Exception("ملف الترجمة كبير زيادة")
+        ZIP_CACHE[u] = data
+        return data
     r = None
     for attempt in range(3):
         try:
@@ -5641,8 +5767,18 @@ def get_zip(u):
         if r is not None and r.status_code in (403, 404):
             break
         time.sleep(0.6 * (attempt + 1))
+    if r is not None and r.status_code in (402, 403, 429):
+        SUBDL_BLOCK["until"] = time.time() + 3600
+        raise Exception("حد تحميلات SubDL اليومي خلص (الخطة المجانية 50 تحميل/يوم) — بيتجدد 2 الفجر، أو رقّي الخطة")
     if r is None or r.status_code != 200:
         raise Exception(f"تحميل الترجمة فشل ({r.status_code if r is not None else 'مفيش اتصال'})")
+    if r.content[:1] == b"{":                 # رد JSON بدل ملف: غالباً رسالة حد التحميل
+        try:
+            m = str((r.json() or {}).get("error") or (r.json() or {}).get("message") or "")
+        except Exception:
+            m = ""
+        SUBDL_BLOCK["until"] = time.time() + 3600
+        raise Exception("SubDL رفض التحميل: " + (m[:100] or "حد التحميل اليومي غالباً خلص"))
     if len(r.content) > 6000000:
         raise Exception("ملف الترجمة كبير زيادة")
     if len(ZIP_CACHE) >= 20:
@@ -5691,20 +5827,38 @@ def pick_sub(z, season, episode):
     return names[0]
 
 
+def _raw_path(u, season, episode):
+    k = hashlib.sha1(("%s|%s|%s" % (u, season, episode)).encode()).hexdigest()[:32]
+    return os.path.join(DATA_DIR, "subraw_%s.json" % k)
+
+
 def build_sub(u, season, episode, ar, fmt="vtt", shift=0.0, scale=1.0, ai=None):
-    data = get_zip(u)
-    if data[:2] == b"PK":
-        z = zipfile.ZipFile(io.BytesIO(data))
-        info = pick_sub(z, season, episode)
-        if not info:
-            raise LookupError("مفيش ملف ترجمة مدعوم جوه الأرشيف")
-        raw = info[2]()
-        ext = os.path.splitext(info[0].lower())[1]
-    elif data[:4] == b"Rar!" or data[:2] == b"7z":
-        raise LookupError("الأرشيف مضغوط بصيغة RAR/7z مش مدعومة")
-    else:
-        raw = data
-        ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
+    # كاش دائم لنص الترجمة: نفس الترجمة ما تتحمّلش من SubDL تاني (الخطة المجانية 50 تحميل/يوم بس)
+    raw = ext = None
+    try:
+        c = store_load(_raw_path(u, season, episode))
+        raw, ext = base64.b64decode(c["b64"]), c["ext"]
+    except Exception:
+        raw = None
+    if raw is None:
+        data = get_zip(u)
+        if data[:2] == b"PK":
+            z = zipfile.ZipFile(io.BytesIO(data))
+            info = pick_sub(z, season, episode)
+            if not info:
+                raise LookupError("مفيش ملف ترجمة مدعوم جوه الأرشيف")
+            raw = info[2]()
+            ext = os.path.splitext(info[0].lower())[1]
+        elif data[:4] == b"Rar!" or data[:2] == b"7z":
+            raise LookupError("الأرشيف مضغوط بصيغة RAR/7z مش مدعومة")
+        else:
+            raw = data
+            ext = ".ass" if b"[Script Info]" in raw[:3000] else ".srt"
+        if len(raw) < 600000 and (b"-->" in raw or b"[Events]" in raw):
+            try:
+                store_save(_raw_path(u, season, episode), {"ext": ext, "b64": base64.b64encode(raw).decode()})
+            except Exception:
+                pass
     text = decode_sub(raw, ar)
     if "-->" not in text and "[Events]" not in text:
         raise LookupError("الملف مش ترجمة مفهومة")
@@ -5836,13 +5990,31 @@ def subs():
     is_tv = base.get("type") == "tv"
     s_i = int(s) if s.isdigit() else None
     e_i = int(e) if e.isdigit() else None
-    try:
-        items, mode = subdl_search(base, s_i, e_i, is_tv)
-        return jsonify(items=items[:40], mode=mode)
-    except requests.Timeout:
-        return jsonify(error="SubDL بطيء، جرّب تاني"), 504
-    except Exception as ex:
-        return jsonify(error=f"الترجمة: {ex}"), 500
+    items, mode, err = [], "none", None
+    blocked = time.time() < SUBDL_BLOCK["until"]
+    if not blocked:
+        try:
+            items, mode = subdl_search(base, s_i, e_i, is_tv)
+        except requests.Timeout:
+            err = "SubDL بطيء، جرّب تاني"
+        except Exception as ex:
+            err = f"الترجمة: {ex}"
+    extra = []
+    if tid.isdigit() and typ in ("movie", "tv"):
+        try:
+            extra = extra_sources(typ, tid, s, e, lang)
+        except Exception:
+            extra = []
+    if blocked:
+        items = extra
+        mode = "extra" if extra else "none"
+    elif extra:
+        # أول نتيجة SubDL، وبعدها أحسن نتيجة OpenSubtitles (احتياطي لو SubDL فشل في التحميل)، وبعدين الباقي
+        items = items[:1] + extra[:1] + items[1:] + extra[1:]
+        mode = mode if mode != "none" else "extra"
+    if err and not items:
+        return jsonify(error=err), 500
+    return jsonify(items=items[:40], mode=mode)
 
 
 SUBX_TTL = 12 * 3600
