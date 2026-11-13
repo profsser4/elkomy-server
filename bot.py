@@ -5684,7 +5684,7 @@ def os3_items(typ, tid, s, e, lang):
         out.append({"u": _ext_u(url), "name": "OpenSubtitles " + str(x.get("id") or len(out) + 1),
                     "lang": "AR" if want == "ara" else "EN", "author": "OpenSubtitles", "season": s or None,
                     "episode": e or None, "full": False})
-        if len(out) >= 8:
+        if len(out) >= 15:
             break
     return out
 
@@ -5719,10 +5719,86 @@ def wyzie_items(typ, tid, s, e, lang):
     return out
 
 
+_TI_CACHE = {}
+POD_BASE = "https://www.podnapisi.net"
+YIFY_BASE = os.environ.get("YIFY_SUBS_BASE", "https://yifysubtitles.ch").rstrip("/")
+SUB_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+
+def _title_year(typ, tid):
+    k = (typ, tid)
+    if k not in _TI_CACHE:
+        d = tmdb_get("/%s/%s" % (typ, tid), language="en-US")
+        _TI_CACHE[k] = (d.get("title") or d.get("name") or "",
+                        (d.get("release_date") or d.get("first_air_date") or "")[:4])
+    return _TI_CACHE[k]
+
+
+def podnapisi_items(typ, tid, s, e, lang):
+    """Podnapisi: مصدر مجاني من غير مفتاح وفيه ترجمات عربي كتير (أفلام ومسلسلات)."""
+    lg = str(lang).split(",")[0].lower()
+    if lg not in ("ar", "en") or typ not in ("movie", "tv") or not str(tid).isdigit():
+        return []
+    title, year = _title_year(typ, tid)
+    if not title:
+        return []
+    prm = {"keywords": title, "language": lg, "movie_type": "movie" if typ == "movie" else "tv-series"}
+    if typ == "movie" and year:
+        prm["year"] = year
+    if typ == "tv" and s and e:
+        prm.update(seasons=s, episodes=e)
+    r = requests.get(POD_BASE + "/subtitles/search/advanced", params=prm, timeout=20,
+                     headers=dict(SUB_UA, Accept="application/json"))
+    if r.status_code != 200:
+        return []
+    out, seen = [], set()
+    for x in (r.json() or {}).get("data") or []:
+        pid = str((x or {}).get("id") or "")
+        if not pid or pid in seen or str(x.get("language", lg)).lower() != lg:
+            continue
+        seen.add(pid)
+        rels = x.get("releases") or []
+        nm = (rels[0] if rels else x.get("title")) or "Podnapisi"
+        out.append({"u": _ext_u("%s/subtitles/%s/download" % (POD_BASE, pid)),
+                    "name": "Podnapisi \u00b7 " + str(nm)[:80], "lang": lg.upper(), "author": "Podnapisi",
+                    "season": s or None, "episode": e or None, "full": False})
+        if len(out) >= 15:
+            break
+    return out
+
+
+def yify_items(typ, tid, s, e, lang):
+    """YIFY Subtitles: ترجمات عربي للأفلام بس، مرتبة حسب تقييم المستخدمين."""
+    if typ != "movie" or str(lang).split(",")[0].lower() != "ar" or not str(tid).isdigit():
+        return []
+    imdb = _imdb_of(typ, tid)
+    if not imdb:
+        return []
+    r = requests.get("%s/movie-imdb/%s" % (YIFY_BASE, imdb), timeout=15, headers=SUB_UA)
+    if r.status_code != 200:
+        return []
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", r.text, re.S):
+        if "arabic" not in tr.lower():
+            continue
+        hm = re.search(r'href="(/subtitles/[^"]+)"', tr)
+        if not hm:
+            continue
+        rm = re.search(r"label[^>]*>\s*(-?\d+)", tr)
+        am = re.search(r'<a[^>]*href="/subtitles/[^"]+"[^>]*>(.*?)</a>', tr, re.S)
+        nm = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", am.group(1) if am else "")).strip()
+        nm = re.sub(r"^subtitle\s+", "", nm, flags=re.I)
+        rows.append((int(rm.group(1)) if rm else 0, hm.group(1), nm))
+    rows.sort(key=lambda x: -x[0])
+    return [{"u": _ext_u(YIFY_BASE + h.replace("/subtitles/", "/subtitle/", 1) + ".zip"),
+             "name": "YIFY \u00b7 " + (nm or "Arabic")[:80], "lang": "AR", "author": "YIFY",
+             "season": None, "episode": None, "full": False} for _, h, nm in rows[:10]]
+
+
 def extra_sources(typ, tid, s, e, lang):
     """كل المصادر المجانية الإضافية بالتوازي، مدموجة بالتبادل (واحدة من كل مصدر)."""
     from concurrent.futures import ThreadPoolExecutor
-    fns = [os3_items] + ([wyzie_items] if WYZIE_KEY else [])
+    fns = [os3_items, podnapisi_items, yify_items] + ([wyzie_items] if WYZIE_KEY else [])
     res = []
 
     def run(f):
@@ -5745,7 +5821,7 @@ def get_zip(u):
         return ZIP_CACHE[u]
     if u.startswith(EXT_PREFIX):
         url = _ext_url(u)
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, timeout=30, headers=SUB_UA)
         if r.status_code != 200:
             raise Exception("تحميل الترجمة فشل (%s)" % r.status_code)
         data = r.content
@@ -6109,7 +6185,7 @@ def subs():
         mode = mode if mode != "none" else "extra"
     if err and not items:
         return jsonify(error=err), 500
-    return jsonify(items=items[:40], mode=mode)
+    return jsonify(items=items[:60], mode=mode)
 
 
 SUBX_TTL = 12 * 3600
