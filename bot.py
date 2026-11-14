@@ -2211,6 +2211,22 @@ def providers_add():
     return jsonify(ok=True)
 
 
+@app.post("/providers/<pid>/mode")
+def providers_mode(pid):
+    """تحويل حساب 1fichier بين بريميم وترافيك (CDN) من غير ما تمسحه وتضيفه تاني."""
+    cdn = bool((request.get_json() or {}).get("cdn"))
+    ps = load()
+    p = next((x for x in ps if x["id"] == pid), None)
+    if not p or p["type"] != "1fichier":
+        return jsonify(error="مش موجود"), 404
+    p["cdn"] = cdn
+    if p.get("name", "") in ("1Fichier", "1Fichier CDN"):
+        p["name"] = "1Fichier CDN" if cdn else "1Fichier"
+    _FI_BAD.pop(pid, None)
+    save(ps)
+    return jsonify(ok=True, cdn=cdn)
+
+
 @app.delete("/providers/<pid>")
 def providers_del(pid):
     save([p for p in load() if p["id"] != pid])
@@ -2247,6 +2263,14 @@ def providers_test(pid):
     k, t = p["key"], p["type"]
     h = {"Authorization": f"Bearer {k}"}
     try:
+        tu = str((request.get_json(silent=True) or {}).get("url") or "").strip()
+        if t == "1fichier" and tu.startswith(("http://", "https://")):
+            # تجربة فعلية: نطلب رابط تحميل للرابط ده بنفس طريقة السحب (cdn لو الحساب ترافيك) ونرجّع رد 1fichier زي ما هو
+            try:
+                r_1fichier(k, tu, bool(p.get("cdn")))
+                return jsonify(ok=True, msg="✅ 1fichier رجّع رابط تحميل (الحساب شغّال على الرابط ده)")
+            except Exception as e:
+                return jsonify(ok=False, error="رد 1fichier: " + str(e))
         if t == "torbox":
             ok = tb(k, "GET", "/user/me").get("success")
         elif t == "realdebrid":
