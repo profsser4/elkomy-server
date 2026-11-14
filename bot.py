@@ -258,6 +258,23 @@ def _fi_split(raw):
     return out
 
 
+def _fi_logins(raw):
+    """حسابات يوزر/باسورد: mail:password بينهم مسافة أو سطر. الباسورد ممكن يحتوي على : عادي (بنقسم عند أول : بس)."""
+    out = []
+    for t in re.split(r"\s+", str(raw or "").strip()):
+        if ":" in t:
+            m, pw = t.split(":", 1)
+            if m.strip() and pw:
+                out.append((m.strip(), pw))
+    return out
+
+
+def _fi_short(mail):
+    m = str(mail or "")
+    i = m.find("@")
+    return (m[:2] + "•••" + m[i:]) if i > 2 else (m[:2] + "•••")
+
+
 def _fi_env():
     """ONEFICHIER_KEY = حسابات بريميم (كتير بفاصلة/مسافة) ، ONEFICHIER_CDN_KEY = حسابات رصيد ترافيك CDN."""
     items = []
@@ -271,6 +288,11 @@ def _fi_env():
             "type": "1fichier",
             "name": ("1Fichier CDN" if cdn else "1Fichier") + (" %d" % i if len(items) > 1 else ""),
             "key": k, "cdn": cdn, "domains": DEFAULT_DOMAINS.get("1fichier", []),
+        })
+    for j, (mail, pw) in enumerate(_fi_logins(os.environ.get("ONEFICHIER_LOGIN", "")), 1):
+        out.append({
+            "id": "env_1fichier_login_%d" % j, "type": "1fichier", "name": "1Fichier 👤 " + _fi_short(mail),
+            "key": mail, "pw": pw, "login": True, "domains": DEFAULT_DOMAINS.get("1fichier", []),
         })
     return out
 
@@ -319,7 +341,7 @@ def dom(x):
     return h.replace("www.", "")
 
 
-_FI_RR = {"p": 0, "c": 0}
+_FI_RR = {"p": 0, "c": 0, "l": 0}
 _FI_BAD = {}
 
 
@@ -337,8 +359,9 @@ def _fi_sort(lst):
             g = g[i:] + g[:i]
         return g
 
-    return (rot([p for p in good if not p.get("cdn")], "p")
-            + rot([p for p in good if p.get("cdn")], "c") + bad)
+    return (rot([p for p in good if not p.get("cdn") and not p.get("login")], "p")
+            + rot([p for p in good if p.get("cdn") and not p.get("login")], "c")
+            + rot([p for p in good if p.get("login")], "l") + bad)
 
 
 def _fi_mark(p, msg):
@@ -346,7 +369,7 @@ def _fi_mark(p, msg):
     m = str(msg or "")
     if re.search(r"#887|location", m, re.I):
         return   # الحساب بيحمّل من مكان تاني دلوقتي: نجرّب حساب تاني بس من غير إيقافه
-    if re.search(r"customer|premium|cdn|credit|traffic|quota|invalid|bad key|auth|forbidden|expired|subscri", m, re.I):
+    if re.search(r"customer|premium|cdn|credit|traffic|quota|invalid|bad key|auth|forbidden|expired|subscri|تسجيل الدخول|الرصيد|login", m, re.I):
         _FI_BAD[p["id"]] = time.time() + 1800
 
 
@@ -2172,8 +2195,9 @@ def iptv_pool_primary(name):
 def providers_get():
     items = [{
         "id": p["id"], "name": p["name"], "type": p["type"],
-        "domains": p.get("domains", []), "key": "••••" + p["key"][-4:],
-        "cdn": bool(p.get("cdn")),
+        "domains": p.get("domains", []),
+        "key": (_fi_short(p["key"]) if p.get("login") else "••••" + p["key"][-4:]),
+        "cdn": bool(p.get("cdn")), "login": bool(p.get("login")),
     } for p in load()]
     return jsonify(types=TYPES, items=items)
 
@@ -2189,6 +2213,17 @@ def providers_add():
     doms = [dom(x) for x in raw if x.strip()]
     doms = doms or DEFAULT_DOMAINS.get(t, [])
     ps = load()
+    if t == "1fichier" and d.get("login"):
+        accs = _fi_logins(k)
+        if not accs:
+            return jsonify(error="اكتب الحساب كده: email:password (وممكن كذا حساب بمسافة بينهم)"), 400
+        base = (d.get("name") or "").strip()
+        for i, (mail, pw) in enumerate(accs, 1):
+            nm = (base + (" %d" % i if len(accs) > 1 else "")) if base else "1Fichier 👤 " + _fi_short(mail)
+            ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": nm,
+                       "key": mail, "pw": pw, "login": True, "domains": doms})
+        save(ps)
+        return jsonify(ok=True, added=len(accs))
     if t == "1fichier":
         # أكتر من حساب في نفس الخانة (مسافة/فاصلة/سطر). مفتاح الترافيك يبدأ بـ cdn:  أو ابعت cdn=true
         keys = _fi_split(k) or [(k, False)]
@@ -2217,8 +2252,8 @@ def providers_mode(pid):
     cdn = bool((request.get_json() or {}).get("cdn"))
     ps = load()
     p = next((x for x in ps if x["id"] == pid), None)
-    if not p or p["type"] != "1fichier":
-        return jsonify(error="مش موجود"), 404
+    if not p or p["type"] != "1fichier" or p.get("login"):
+        return jsonify(error="مش موجود أو حساب يوزر/باسورد (مفيش فيه تحويل)"), 404
     p["cdn"] = cdn
     if p.get("name", "") in ("1Fichier", "1Fichier CDN"):
         p["name"] = "1Fichier CDN" if cdn else "1Fichier"
@@ -2264,6 +2299,13 @@ def providers_test(pid):
     h = {"Authorization": f"Bearer {k}"}
     try:
         tu = str((request.get_json(silent=True) or {}).get("url") or "").strip()
+        if t == "1fichier" and p.get("login"):
+            _FI_SESS.pop(p["id"], None)
+            _fi_login(p, force=True)
+            if tu.startswith(("http://", "https://")):
+                r_1fichier_login(p, tu)
+                return jsonify(ok=True, msg="✅ سجّل دخول وسحب رابط تحميل من الرصيد")
+            return jsonify(ok=True, msg="✅ تسجيل الدخول نجح (جرّب بلصق رابط عشان تتأكد إنه بياخد من الرصيد)")
         if t == "1fichier" and tu.startswith(("http://", "https://")):
             # تجربة فعلية: نطلب رابط تحميل للرابط ده بنفس طريقة السحب (cdn لو الحساب ترافيك) ونرجّع رد 1fichier زي ما هو
             try:
@@ -3904,6 +3946,61 @@ def sitesearch():
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
 
+_FI_SESS = {}
+_FI_UA = ("Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/124.0 Mobile Safari/537.36")
+_FI_DIRECT = re.compile(r"https?://[a-z0-9-]+\.1fichier\.com/[A-Za-z0-9_\-]{5,}[^\s\"'<>]*", re.I)
+
+
+def _fi_login(p, force=False):
+    """يسجّل دخول حساب 1fichier (يوزر/باسورد) ويحتفظ بالجلسة 6 ساعات عشان ما نكررش الدخول (يسبب كابتشا/حظر)."""
+    now = time.time()
+    c = _FI_SESS.get(p["id"])
+    if c and not force and now - c[1] < 6 * 3600:
+        return c[0]
+    s = requests.Session()
+    s.headers.update({"User-Agent": _FI_UA, "Accept-Language": "en-US,en;q=0.9"})
+    r = s.post("https://1fichier.com/login.pl",
+               data={"mail": p["key"], "pass": p.get("pw", ""), "lt": "on", "purge": "off", "valider": "Send"},
+               timeout=25, allow_redirects=True)
+    ok = bool(s.cookies.get("SID")) or bool(re.search(r"logout|deconnexion", r.text or "", re.I))
+    if not ok:
+        raise Exception("تسجيل الدخول فشل (اليوزر/الباسورد غلط، أو فيه 2FA/كابتشا/حماية) كود %s" % r.status_code)
+    _FI_SESS[p["id"]] = (s, now)
+    return s
+
+
+def r_1fichier_login(p, u):
+    """سحب رابط تحميل من رصيد CDN بحساب يوزر/باسورد (زي ما المتصفح بيعمل لما تكون مسجّل دخول)."""
+    last = "فشل"
+    for attempt in (0, 1):
+        s = _fi_login(p, force=bool(attempt))
+        r = s.get(u, allow_redirects=False, timeout=25, stream=True)
+        try:
+            loc = r.headers.get("Location", "")
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                if re.match(r"https?://[a-z0-9-]+\.1fichier\.com/", loc, re.I) and not re.match(r"https?://(www\.)?1fichier\.com", loc, re.I):
+                    return loc
+                last = "1fichier حوّل لصفحة تانية (%s)" % loc[:60]
+                _FI_SESS.pop(p["id"], None)
+                continue
+            body = r.text[:200000] if r.status_code == 200 else ""
+        finally:
+            r.close()
+        m = _FI_DIRECT.search(body)
+        if m and not re.match(r"https?://(www\.)?1fichier\.com", m.group(0), re.I):
+            return m.group(0).replace("&amp;", "&")
+        if re.search(r'name="pass"|login\.pl', body):
+            _FI_SESS.pop(p["id"], None)     # الجلسة انتهت: نسجّل دخول من جديد ونجرّب مرة تانية
+            last = "الجلسة انتهت"
+            continue
+        txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body)).strip()
+        if re.search(r"adz|Click here to download|must wait|You must wait", body, re.I):
+            raise Exception("الحساب ده مش بياخد من الرصيد (فعّل Use my credits for my own downloads) — رد الموقع: " + txt[:120])
+        raise Exception("رد غير متوقع من 1fichier (كود %s): %s" % (r.status_code, txt[:120]))
+    raise Exception(last)
+
+
 def r_1fichier(k, u, cdn=False):
     body = {"url": u}
     if cdn:
@@ -4011,7 +4108,7 @@ def _generate():
                     body["tried"] = tried
                     return jsonify(body), code
                 if p["type"] == "1fichier":
-                    url = r_1fichier(p["key"], q, bool(p.get("cdn")))
+                    url = r_1fichier_login(p, q) if p.get("login") else r_1fichier(p["key"], q, bool(p.get("cdn")))
                     _FI_BAD.pop(p["id"], None)
                 else:
                     url = INSTANT[p["type"]](p["key"], q)
