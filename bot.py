@@ -243,9 +243,43 @@ NONLAT_RE = re.compile(
 
 # ----------------- المزوّدين (محفوظين في ملف) -----------------
 
-def _env_providers():
+def _fi_split(raw):
+    """مفاتيح 1fichier كتير في خانة واحدة (فاصلة/مسافة/سطر). البادئة cdn: بتعني حساب رصيد ترافيك (CDN) مش بريميم."""
     out = []
+    for k in re.split(r"[,;\s]+", str(raw or "").strip()):
+        k = k.strip()
+        if not k:
+            continue
+        cdn = k.lower().startswith("cdn:")
+        if cdn:
+            k = k[4:].strip()
+        if k:
+            out.append((k, cdn))
+    return out
+
+
+def _fi_env():
+    """ONEFICHIER_KEY = حسابات بريميم (كتير بفاصلة/مسافة) ، ONEFICHIER_CDN_KEY = حسابات رصيد ترافيك CDN."""
+    items = []
+    for env, force_cdn in (("ONEFICHIER_KEY", False), ("ONEFICHIER_CDN_KEY", True)):
+        for k, cdn in _fi_split(os.environ.get(env, "")):
+            items.append((k, cdn or force_cdn))
+    out = []
+    for i, (k, cdn) in enumerate(items, 1):
+        out.append({
+            "id": "env_1fichier" if i == 1 else "env_1fichier_%d" % i,
+            "type": "1fichier",
+            "name": ("1Fichier CDN" if cdn else "1Fichier") + (" %d" % i if len(items) > 1 else ""),
+            "key": k, "cdn": cdn, "domains": DEFAULT_DOMAINS.get("1fichier", []),
+        })
+    return out
+
+
+def _env_providers():
+    out = list(_fi_env())
     for t, env in ENV_SEED.items():
+        if t == "1fichier":
+            continue
         k = os.environ.get(env, "").strip()
         if k:
             out.append({
@@ -285,6 +319,37 @@ def dom(x):
     return h.replace("www.", "")
 
 
+_FI_RR = {"p": 0, "c": 0}
+_FI_BAD = {}
+
+
+def _fi_sort(lst):
+    """حسابات 1fichier: البريميم الأول (عشان نوفّر رصيد الـ CDN)، وبعدين حسابات الترافيك.
+    جوه كل مجموعة بنبدّل بين الحسابات عشان الحمل يتوزّع، واللي فشل (مفتاح غلط / خلص رصيده) بيتأخر مؤقتاً."""
+    now = time.time()
+    good = [p for p in lst if _FI_BAD.get(p["id"], 0) <= now]
+    bad = [p for p in lst if p not in good]
+
+    def rot(g, k):
+        if len(g) > 1:
+            i = _FI_RR[k] % len(g)
+            _FI_RR[k] += 1
+            g = g[i:] + g[:i]
+        return g
+
+    return (rot([p for p in good if not p.get("cdn")], "p")
+            + rot([p for p in good if p.get("cdn")], "c") + bad)
+
+
+def _fi_mark(p, msg):
+    """لو الرد معناه إن الحساب نفسه مش شغّال (مفتاح غلط / مش مشترك / رصيد خلص) نوقفه 30 دقيقة ونجرّب اللي بعده."""
+    m = str(msg or "")
+    if re.search(r"#887|location", m, re.I):
+        return   # الحساب بيحمّل من مكان تاني دلوقتي: نجرّب حساب تاني بس من غير إيقافه
+    if re.search(r"customer|premium|cdn|credit|traffic|quota|invalid|bad key|auth|forbidden|expired|subscri", m, re.I):
+        _FI_BAD[p["id"]] = time.time() + 1800
+
+
 def candidates(u):
     host = urlparse(u).netloc.lower().replace("www.", "")
     ps = [p for p in load() if p["type"] != "alldebrid" or AD_SERVER]
@@ -296,6 +361,8 @@ def candidates(u):
         )
 
     first = [p for p in ps if hit(p)]
+    _it = iter(_fi_sort([p for p in first if p["type"] == "1fichier"]))
+    first = [next(_it) if p["type"] == "1fichier" else p for p in first]
     rest = [
         p for p in ps
         if p not in first and p["type"] not in DEFAULT_DOMAINS
@@ -2106,6 +2173,7 @@ def providers_get():
     items = [{
         "id": p["id"], "name": p["name"], "type": p["type"],
         "domains": p.get("domains", []), "key": "••••" + p["key"][-4:],
+        "cdn": bool(p.get("cdn")),
     } for p in load()]
     return jsonify(types=TYPES, items=items)
 
@@ -2121,6 +2189,19 @@ def providers_add():
     doms = [dom(x) for x in raw if x.strip()]
     doms = doms or DEFAULT_DOMAINS.get(t, [])
     ps = load()
+    if t == "1fichier":
+        # أكتر من حساب في نفس الخانة (مسافة/فاصلة/سطر). مفتاح الترافيك يبدأ بـ cdn:  أو ابعت cdn=true
+        keys = _fi_split(k) or [(k, False)]
+        base = (d.get("name") or "").strip()
+        for i, (kk, cdn) in enumerate(keys, 1):
+            cdn = cdn or bool(d.get("cdn"))
+            nm = base or ("1Fichier CDN" if cdn else "1Fichier")
+            if len(keys) > 1:
+                nm += " %d" % i
+            ps.append({"id": uuid.uuid4().hex[:8], "type": t, "name": nm,
+                       "key": kk, "cdn": cdn, "domains": doms})
+        save(ps)
+        return jsonify(ok=True, added=len(keys))
     ps.append({
         "id": uuid.uuid4().hex[:8], "type": t,
         "name": (d.get("name") or TYPES[t]).strip(),
@@ -3799,9 +3880,12 @@ def sitesearch():
 
 # ----------------- باقي المزوّدين (روابط فورية) -----------------
 
-def r_1fichier(k, u):
+def r_1fichier(k, u, cdn=False):
+    body = {"url": u}
+    if cdn:
+        body["cdn"] = 1     # حساب مجاني برصيد CDN: لازم نطلب استخدام الرصيد صراحة (البريميم بيتفعّل تلقائي)
     r = requests.post("https://api.1fichier.com/v1/download/get_token.cgi",
-                      json={"url": u},
+                      json=body,
                       headers={"Authorization": f"Bearer {k}"}, timeout=20)
     res = jj(r)
     if res.get("status") == "OK" and res.get("url"):
@@ -3902,12 +3986,18 @@ def _generate():
                     body, code = torbox_web(p, q)
                     body["tried"] = tried
                     return jsonify(body), code
-                url = INSTANT[p["type"]](p["key"], q)
+                if p["type"] == "1fichier":
+                    url = r_1fichier(p["key"], q, bool(p.get("cdn")))
+                    _FI_BAD.pop(p["id"], None)
+                else:
+                    url = INSTANT[p["type"]](p["key"], q)
                 name = unquote(url.split("?")[0].rsplit("/", 1)[-1]) or "ملف"
                 return jsonify(direct_link=url, name=name,
                                provider=p["name"], tried=tried)
             except Exception as e:
                 tried.append(f"{p['name']}: {e}")
+                if p["type"] == "1fichier":
+                    _fi_mark(p, e)
         return jsonify(error="فشل السحب من كل المزوّدين ❌", tried=tried), 400
     except requests.Timeout:
         return jsonify(error="السيرفرات بطيئة حالياً، جرب تاني"), 504
