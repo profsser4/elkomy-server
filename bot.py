@@ -5533,6 +5533,7 @@ def details():
         imdb = (a.get("external_ids") or {}).get("imdb_id") or a.get("imdb_id") or ""
         return jsonify(
             id=int(i), type=t, year=date_s[:4], runtime=rt,
+            lang=a.get("original_language") or "",
             title=a.get("title") or a.get("name") or "",
             search_title=lat[0] if lat else "",
             alt=lat, imdb=imdb,
