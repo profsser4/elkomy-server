@@ -8253,6 +8253,8 @@ def build_new():
 # ================= هيرو الرئيسية: ترند العالم + متاح أونلاين فقط، وبيتغيّر كل يوم =================
 HERO_ROTATE_DAYS = 1       # التشكيلة بتتغيّر كل كام يوم (1 = كل يوم، 2 = كل يومين)
 HERO_COUNT = 10            # عدد الشرايح
+HERO_EG_SLOTS = 2          # كام شريحة مصرية (فيلم/مسلسل) في الهيرو
+HERO_DUB_SLOTS = 2         # كام شريحة كرتون مدبلج مصري
 HERO_FIXED_TOP = 3         # أسخن كام عمل ثابتين في التشكيلة (الباقي بيتبدّل)
 HERO_MOVIE_MAX_AGE = 420   # الفيلم لازم يكون نزل في آخر كام يوم (يمنع إعادات العرض القديمة زي Endgame)
 HERO_TV_ACTIVE_DAYS = 45   # المسلسل لازم يكون عرض حلقة في آخر كام يوم
@@ -8345,13 +8347,86 @@ def build_hero():
                      "badge": _FLAGS.get(lg, ""), "cl": c["label"], "lv": c["lvl"], "lg": lg, "pop": sc,
                      "overview": ov[:220], "backdrop": img(x["backdrop_path"], "w1280")})
     pool.sort(key=lambda i: -i["pop"])
-    pool = pool[:26]
+    pool = [p for p in pool if p["lg"] != "ar"][:26]   # العربي بييجي من مصر بس (تحت)
     rng = random.Random(today.toordinal() // max(1, HERO_ROTATE_DAYS))
-    fixed = pool[:HERO_FIXED_TOP]
-    rest = pool[HERO_FIXED_TOP:]
-    pick = fixed + rng.sample(rest, min(len(rest), max(0, HERO_COUNT - len(fixed))))
+    eg = _hero_egypt(rng)
+    dub = _hero_dubbed(rng)
+    n_foreign = max(3, HERO_COUNT - len(eg) - len(dub))
+    fixed = pool[:min(HERO_FIXED_TOP, n_foreign)]
+    rest = pool[len(fixed):]
+    pick = fixed + rng.sample(rest, min(len(rest), max(0, n_foreign - len(fixed))))
+    pick += eg + dub
     rng.shuffle(pick)
     return pick
+
+
+def _hero_item(ty, x, ov="", badge=""):
+    c = cert_of(ty, x["id"])
+    d_s = x.get("release_date") or x.get("first_air_date") or ""
+    return {"id": x["id"], "type": ty, "year": d_s[:4], "title": x.get("title") or x.get("name") or "",
+            "rating": round(x.get("vote_average") or 0, 1), "poster": img(x.get("poster_path"), "w342"),
+            "badge": badge, "cl": c["label"], "lv": c["lvl"], "lg": x.get("original_language") or "", "pop": x.get("popularity") or 0,
+            "overview": (ov or x.get("overview") or "")[:220], "backdrop": img(x["backdrop_path"], "w1280"), "_ok": c["ok"]}
+
+
+def _hero_egypt(rng):
+    """أعمال مصرية فقط (أفلام ومسلسلات) نزلت قريب: الفيلم بعد نزوله بـ 30-400 يوم (بعد السينما) أو له نزول ديجيتال، والمسلسل عرض حلقة في آخر 45 يوم."""
+    if not HERO_EG_SLOTS:
+        return []
+    today = date.today()
+    out = []
+    try:
+        mv = tmdb_get("/discover/movie", language="ar", include_adult="false", sort_by="popularity.desc",
+                      with_origin_country="EG", with_original_language="ar", without_genres="99",
+                      **{"primary_release_date.gte": (today - timedelta(days=400)).isoformat(),
+                         "primary_release_date.lte": (today - timedelta(days=30)).isoformat()}).get("results", [])
+        tv = tmdb_get("/discover/tv", language="ar", include_adult="false", sort_by="popularity.desc",
+                      with_origin_country="EG", with_original_language="ar",
+                      **{"air_date.gte": (today - timedelta(days=HERO_TV_ACTIVE_DAYS)).isoformat(),
+                         "air_date.lte": today.isoformat()}).get("results", [])
+    except Exception:
+        return []
+    cands = [("movie", x) for x in mv[:12]] + [("tv", x) for x in tv[:12]]
+    cands = [(t, x) for t, x in cands if x.get("backdrop_path") and x.get("poster_path") and (x.get("overview") or "").strip()]
+    items = []
+    for t, x in cands:
+        try:
+            it = _hero_item(t, x, badge="🇪🇬")
+        except Exception:
+            continue
+        if it.pop("_ok", False):
+            items.append(it)
+    return rng.sample(items, min(len(items), HERO_EG_SLOTS))
+
+
+def _hero_dubbed(rng):
+    """كرتون/عائلي مدبلج بالمصري فقط: من قايمة المدبلج المتأكَّد منها في إضافاتك (dub_items)."""
+    if not HERO_DUB_SLOTS:
+        return []
+    try:
+        base = list(dub_items())
+    except Exception:
+        return []
+    rng.shuffle(base)
+    out = []
+    for b in base:
+        if len(out) >= HERO_DUB_SLOTS:
+            break
+        try:
+            x = tmdb_get(f"/movie/{b['id']}", language="ar")
+            if not x.get("backdrop_path"):
+                continue
+            ov = (x.get("overview") or "").strip()
+            if not ov:
+                ov = (tmdb_get(f"/movie/{b['id']}", language="en-US").get("overview") or "").strip()
+            if not ov:
+                continue
+            it = _hero_item("movie", x, ov=ov, badge="🎙 مدبلج مصري")
+        except Exception:
+            continue
+        if it.pop("_ok", False):
+            out.append(it)
+    return out
 
 
 def hero_cached():
