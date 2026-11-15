@@ -177,13 +177,16 @@ def _load_secret():
         with open(p, "w", encoding="utf-8") as f:
             f.write(v)
     except OSError:
-        return APP_PASS
+        # مفيش مكان نحفظ فيه سر عشوائي: نشتق سر ثابت (مش هو الباسورد نفسه) عشان كل النسخ تتفق
+        return hashlib.sha256(("elkomy-secret-v2|" + APP_PASS).encode()).hexdigest()
     return v
 
 
 SECRET = _load_secret()
-if APP_PASS == "admin":
-    print("WARNING: APP_PASS الافتراضي (admin). غيّره من Variables فوراً.")
+# دخول الأدمن بيتقفل لو APP_PASS مش متحدد أو لسه "admin" (أي حد كان هيدخل بيه)
+ADMIN_OK = bool(APP_PASS) and APP_PASS.lower() not in ("admin", "password", "123456", "12345678")
+if not ADMIN_OK:
+    print("SECURITY: دخول الأدمن متقفل لأن APP_PASS مش متحدد أو ضعيف. حدّده من Variables بباسورد قوي.")
 REFS = {}
 FAILS = {}
 USER_RX = re.compile(r"[a-z0-9_.-]{3,20}")
@@ -459,6 +462,11 @@ def sign(body):
     return hmac.new(SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
+def admin_fp():
+    """بصمة الأدمن داخل التوكن: HMAC بالسر (مش SHA256 للباسورد) عشان محدّش يقدر يخمّن الباسورد من التوكن."""
+    return hmac.new(SECRET.encode(), ("afp:" + APP_PASS).encode(), hashlib.sha256).hexdigest()[:16]
+
+
 # ----------------- حد الأجهزة لكل عضو (شاشة / موبايل / متصفح) -----------------
 SESS_ACTIVE = 180      # ثواني: الجهاز اللي اتحرك في آخر 3 دقايق يعتبر شغّال دلوقتي
 MAX_STRIKES = 3
@@ -629,7 +637,7 @@ def read_token_ex(tok):
         if int(exp) < time.time():
             return None, "bad", None, ""
         if role == "admin":
-            if user != APP_USER.lower() or not hmac.compare_digest(fp.encode(), fp_of(APP_PASS).encode()):
+            if not ADMIN_OK or user != APP_USER.lower() or not hmac.compare_digest(fp.encode(), admin_fp().encode()):
                 return None, "bad", None, ""
             return (user, role), "", None, ""
         rec = users_load().get(user)
@@ -651,7 +659,7 @@ def read_token(tok):
 
 _ADMIN_PREFIXES = ("/users", "/iptv/admin")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
-_ADMIN_ANY = ("/home/dub-refresh", "/providers/export", "/play/diag", "/play/reports")
+_ADMIN_ANY = ("/home/dub-refresh", "/providers", "/providers/export", "/play/diag", "/play/reports")
 # مسارات ستريميو بتغيّر إعداد مشترك للموقع كله (حساب + إضافات + مفاتيح مزوّدين): للأدمن بس
 _ADMIN_POST_EXACT = ("/stremio/login", "/stremio/sync", "/stremio/logout", "/stremio/addon")
 
@@ -672,7 +680,7 @@ def needs_admin(path, method):
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
-    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith(("/subx/", "/auth/")):
+    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith(("/subx/", "/auth/", "/px/")):
         return None
     who, why, _rec, _sid = read_token_ex(request.headers.get("X-Token", ""))
     if not who:
@@ -719,10 +727,29 @@ def home():
 
 
 def too_many(ip, limit=10):
+    if KV_ON:
+        try:
+            v = _kv_cmd("GET", KV_PREFIX + "fail:" + ip)
+            return int(v or 0) >= limit
+        except Exception:
+            pass
     now = time.time()
     lst = [t for t in FAILS.get(ip, []) if now - t < 600]
     FAILS[ip] = lst
     return len(lst) >= limit
+
+
+def fail_add(key, window=600):
+    """بيسجّل محاولة فاشلة (Redis لو متاح عشان تتشارك بين كل نسخ السيرفر)."""
+    if KV_ON:
+        try:
+            k = KV_PREFIX + "fail:" + key
+            if int(_kv_cmd("INCR", k)) == 1:
+                _kv_cmd("EXPIRE", k, int(window))
+            return
+        except Exception:
+            pass
+    FAILS.setdefault(key, []).append(time.time())
 
 
 def _login_user(u, rec, d, ip):
@@ -785,10 +812,12 @@ def _login_user(u, rec, d, ip):
                    token=make_token(u, "user", fp_of(rec["h"]), sid))
 
 
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(12))
+
+
 @app.post("/auth")
 def auth():
-    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-          or request.remote_addr or "")
+    ip = client_ip()
     if too_many(ip):
         return jsonify(ok=False, error="محاولات كتير"), 429
     d = request.get_json(silent=True) or {}
@@ -798,16 +827,21 @@ def auth():
         return jsonify(ok=False), 400
     if too_many("u:" + u, 20):
         return jsonify(ok=False, error="محاولات كتير"), 429
-    if u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
+    if ADMIN_OK and u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
         return jsonify(ok=True, role="admin", user=u,
-                       token=make_token(u, "admin", fp_of(APP_PASS)))
+                       token=make_token(u, "admin", admin_fp()))
     if "@" in u:
         u = find_by_email(users_load(), u) or u
     rec = users_load().get(u)
-    if rec and check_password_hash(rec["h"], p):
+    if rec:
+        good = check_password_hash(rec["h"], p)
+    else:
+        check_password_hash(_DUMMY_HASH, p)      # نفس الزمن سواء الاسم موجود أو لأ (منع تخمين الأسماء)
+        good = False
+    if good:
         return _login_user(u, rec, d, ip)
-    FAILS.setdefault(ip, []).append(time.time())
-    FAILS.setdefault("u:" + u, []).append(time.time())
+    fail_add(ip)
+    fail_add("u:" + u)
     time.sleep(0.5)
     return jsonify(ok=False), 401
 
@@ -827,7 +861,16 @@ RL = {}
 
 
 def rl_hit(key, limit, window):
-    """True لو الحد اتعدّى. بيسجّل المحاولة لو لسه تحت الحد."""
+    """True لو الحد اتعدّى. بيسجّل المحاولة لو لسه تحت الحد. (Redis لو متاح، وإلا الذاكرة)"""
+    if KV_ON:
+        try:
+            k = KV_PREFIX + "rl:" + key
+            n = int(_kv_cmd("INCR", k))
+            if n == 1:
+                _kv_cmd("EXPIRE", k, int(window))
+            return n > limit
+        except Exception:
+            pass
     now = time.time()
     lst = [t for t in RL.get(key, []) if now - t < window]
     if len(lst) >= limit:
@@ -839,8 +882,9 @@ def rl_hit(key, limit, window):
 
 
 def client_ip():
-    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.remote_addr or "")
+    h = request.headers
+    v = h.get("X-Vercel-Forwarded-For", "") or h.get("X-Forwarded-For", "")
+    return (v.split(",")[0].strip() or request.remote_addr or "")[:64]
 
 
 def mail_on():
@@ -1010,7 +1054,7 @@ def auth_email_start():
     em = norm_email(d.get("email"))
     if not em:
         return jsonify(error="الإيميل مش مكتوب صح"), 400
-    if rl_hit("otp-ip:" + ip, 10, 3600):
+    if rl_hit("otp-ip:" + ip, 10, 3600) or rl_hit("otp-em:" + em, 6, 3600):
         return jsonify(error="طلبات كتير. جرّب بعد شوية."), 429
     exists = bool(find_by_email(users_load(), em))
     if not exists and not reg_open():
@@ -1047,7 +1091,7 @@ def auth_email_verify():
     code = re.sub(r"\D", "", str(d.get("code", "")))[:6]
     if not em or len(code) != 6:
         return jsonify(error="اكتب الإيميل وكود من 6 أرقام"), 400
-    if rl_hit("otpv:" + ip, 30, 3600):
+    if rl_hit("otpv:" + ip, 30, 3600) or rl_hit("otpv-em:" + em, 15, 3600):
         return jsonify(error="محاولات كتير. جرّب بعد شوية."), 429
     k = otp_key(em)
     with OTP_LOCK:
@@ -1175,7 +1219,8 @@ def prov_ok(v):
     return any(p["id"] == v for p in load())
 
 
-_PROV_WORDS = re.compile(r"(?i)(torbox|all-?debrid|real-?debrid|debrid-?link|stremio|aradeb|1fichier)")
+_PROV_WORDS = re.compile(r"(?i)(torbox|all-?debrid|real-?debrid|debrid-?link|premiumize|stremio|aradeb|1fichier|debrid)")
+_MASK_KEYS = ("error", "status", "detail", "message", "msg", "note", "reason", "text")
 
 
 def _hide_accounts(o, names):
@@ -1185,7 +1230,9 @@ def _hide_accounts(o, names):
             v = o[k]
             if k in ("provider", "stream_note", "stream_notes", "diag"):
                 o[k] = "" if isinstance(v, str) else v
-            elif k in ("error", "status", "detail", "message") and isinstance(v, str):
+            elif k == "tried":
+                o[k] = []                                   # قايمة محاولات المزوّدين: للأدمن بس
+            elif k in _MASK_KEYS and isinstance(v, str):
                 for n in names:
                     v = v.replace(n, "السيرفر")
                 o[k] = _PROV_WORDS.sub("السيرفر", v)
@@ -1211,11 +1258,145 @@ def sec_headers(resp):
     resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     try:
-        if request.path.startswith(("/me", "/users", "/iptv", "/auth", "/settings", "/providers", "/activity")):
+        if request.path.startswith(("/me", "/users", "/iptv", "/auth", "/settings", "/providers", "/activity", "/ad", "/stremio", "/push")):
             resp.headers["Cache-Control"] = "no-store"
     except Exception:
         pass
     return resp
+
+
+# ===================== تعتيم روابط المشاهدة/التحميل للأعضاء =====================
+# الأدمن بيشوف الروابط الأصلية. العضو بياخد رابط على سيرفرك (/px/...) والسيرفر هو اللي بيجيب الملف.
+# HIDE_HOSTS=0 في Variables بيوقّف التعتيم (لو السيرفر ما بيستحملش بث الفيديو).
+HIDE_HOSTS = os.environ.get("HIDE_HOSTS", "1").strip() not in ("0", "false", "no")
+PX_TTL = 8 * 3600
+_PX_KEYS = ("direct_link", "url", "hls", "link", "stream", "direct")
+_PX_PATHS = ("/generate", "/tb/stream", "/stremio/resolve", "/play/")
+_PX_FWD = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag")
+
+
+def _px_ks(nonce, n):
+    out, i = b"", 0
+    while len(out) < n:
+        out += hmac.new(SECRET.encode(), b"pxk|" + nonce + i.to_bytes(4, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def _px_enc(b):
+    """تشفير الرابط الأصلي جوه التوكن (عشان العضو ما يفكّش base64 ويشوف دومين المزوّد)."""
+    nonce = os.urandom(9)
+    return nonce + bytes(x ^ y for x, y in zip(b, _px_ks(nonce, len(b))))
+
+
+def _px_dec(b):
+    nonce, ct = b[:9], b[9:]
+    return bytes(x ^ y for x, y in zip(ct, _px_ks(nonce, len(ct))))
+
+
+def px_make(u, base=None):
+    p = {"u": u, "exp": int(time.time()) + PX_TTL}
+    tok = _b64e(_px_enc(json.dumps(p, separators=(",", ":")).encode()))
+    path = unquote(urlparse(u).path)
+    fn = re.sub(r"[^\w.\-]+", "_", path.rsplit("/", 1)[-1])[:60]
+    if ".m3u8" in path.lower():
+        fn = "stream.m3u8"
+    elif not re.search(r"\.[A-Za-z0-9]{2,5}$", fn):
+        fn = "video.mp4"
+    b = (base or _public_base()).rstrip("/")
+    return f"{b}/px/{tok}.{sign('px|' + tok)[:40]}/{fn}"
+
+
+def _px_rewrite(o):
+    if isinstance(o, dict):
+        if "probe_failed" in o:          # AllDebrid بيرفض IP السيرفر: الجهاز لازم يفتحه بنفسه
+            return
+        mine = {request.host.lower(), urlparse(_public_base()).netloc.lower()}
+        for k, v in list(o.items()):
+            if k in _PX_KEYS and isinstance(v, str) and re.match(r"https?://", v, re.I):
+                h = urlparse(v).netloc.lower()
+                if h and h not in mine and "/px/" not in v:
+                    o[k] = px_make(v)
+            else:
+                _px_rewrite(v)
+    elif isinstance(o, list):
+        for x in o:
+            _px_rewrite(x)
+
+
+def _px_m3u8(txt, base):
+    out = []
+    for ln in txt.splitlines():
+        s = ln.strip()
+        if not s:
+            out.append(ln)
+        elif s.startswith("#"):
+            out.append(re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % px_make(urljoin(base, m.group(1))), ln))
+        else:
+            out.append(px_make(urljoin(base, s)))
+    return "\n".join(out) + "\n"
+
+
+@app.route("/px/<tk>/<path:fname>", methods=["GET", "HEAD"])
+def px_get(tk, fname):
+    try:
+        tok, sig = tk.rsplit(".", 1)
+        if not hmac.compare_digest(sig, sign("px|" + tok)[:40]):
+            raise ValueError
+        p = json.loads(_px_dec(_b64d(tok)))
+        if int(p["exp"]) < time.time():
+            raise ValueError
+        cur = str(p["u"])
+    except Exception:
+        return Response("forbidden", status=403, mimetype="text/plain")
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    if request.headers.get("Range"):
+        hdr["Range"] = request.headers["Range"][:100]
+    r = None
+    try:
+        for _ in range(6):
+            if not _public_url(cur):
+                return Response("forbidden", status=403, mimetype="text/plain")
+            r = requests.get(cur, headers=hdr, stream=True, allow_redirects=False, timeout=(10, 60))
+            loc = r.headers.get("Location")
+            if r.status_code in (301, 302, 303, 307, 308) and loc:
+                cur = urljoin(cur, loc)
+                r.close()
+                continue
+            break
+    except Exception:
+        return Response("unavailable", status=502, mimetype="text/plain")
+    if r is None or r.status_code >= 400:
+        code = r.status_code if r is not None and r.status_code in (404, 416) else 502
+        if r is not None:
+            r.close()
+        return Response("unavailable", status=code, mimetype="text/plain")
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "mpegurl" in ct or urlparse(cur).path.lower().endswith(".m3u8"):
+        try:
+            raw = b""
+            for ch in r.iter_content(65536):
+                raw += ch
+                if len(raw) > 3_000_000:
+                    break
+        finally:
+            r.close()
+        txt = _px_m3u8(raw.decode("utf-8", "ignore"), cur)
+        return Response(txt, content_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+    heads = {k: r.headers[k] for k in _PX_FWD if r.headers.get(k)}
+    heads["Cache-Control"] = "no-store"
+    if request.method == "HEAD":
+        r.close()
+        return Response(status=r.status_code, headers=heads)
+
+    def gen():
+        try:
+            for chunk in r.iter_content(65536):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
+    return Response(gen(), status=r.status_code, headers=heads, direct_passthrough=True)
 
 
 @app.after_request
@@ -1226,6 +1407,8 @@ def mask_for_members(resp):
         if resp.mimetype != "application/json" or resp.direct_passthrough:
             return resp
         o = json.loads(resp.get_data(as_text=True))
+        if HIDE_HOSTS and request.path.startswith(_PX_PATHS):
+            _px_rewrite(o)
         names = sorted({str(p.get("name") or "") for p in load() if p.get("name")}, key=len, reverse=True)
         _hide_accounts(o, names)
         resp.set_data(json.dumps(o, ensure_ascii=False))
@@ -1771,6 +1954,12 @@ def iptv_stat():
         if not accs:
             return jsonify(error="مفيش اشتراك IPTV لحسابك"), 404
         acc = rec
+        if g.role != "admin":
+            old = acc.get("stat") or {}
+            if owner == IPTV_ALL and time.time() - float(old.get("t", 0) or 0) < 300:
+                return jsonify(ok=True)                      # الحساب المشترك: تحديث واحد كل 5 دقايق بس
+            if num("maxc") > 50 or num("active") > 100 or num("exp") > time.time() + 10 * 365 * 86400:
+                return jsonify(error="قيم غير منطقية"), 400
         acc["stat"] = {"exp": num("exp"), "maxc": num("maxc"), "active": num("active"),
                        "status": str(d.get("status") or "")[:30],
                        "trial": bool(d.get("trial")), "t": int(time.time())}
@@ -4766,6 +4955,32 @@ def st_streams():
     return jsonify(results=res[:150], notes=notes)
 
 
+def _all_secret_keys():
+    """كل الأسرار اللي ممنوع تظهر لعضو: مفاتيح/باسوردات المزوّدين + المفاتيح اللي جوه روابط الإضافات + authKey بتاع ستريميو."""
+    ks = set()
+    try:
+        for p in load():
+            for f in ("key", "pw"):
+                if p.get(f):
+                    ks.add(str(p[f]))
+    except Exception:
+        pass
+    try:
+        d = st_load()
+        if d.get("authKey"):
+            ks.add(str(d["authKey"]))
+        for a_ in d.get("addons", []):
+            ks |= {m.group(2) for m in DEBRID_RX.finditer(unquote(urlparse(a_["base"]).path))}
+    except Exception:
+        pass
+    return {k for k in ks if len(k) >= 8}
+
+
+def _url_has_secret(u):
+    dec = unquote(str(u or ""))
+    return any(k in dec or k in str(u or "") for k in _all_secret_keys())
+
+
 @app.post("/stremio/resolve")
 def st_resolve():
     req = request.get_json(silent=True) or {}
@@ -4794,6 +5009,8 @@ def st_resolve():
                 # AllDebrid بيرفض فحص السيرفر للرابط (IP سيرفر)، لكن الموبايل بيشغّله عادي.
                 # فنسيب المتصفح هو اللي يجرّب الرابط من IP صاحبه بدل ما نفشل هنا.
                 if code >= 500 and "alldebrid" in body.lower() and cur != url:
+                    if g.role != "admin" and _url_has_secret(cur):
+                        return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
                     return jsonify(url=cur, probe_failed=code)
                 msg = f"المصدر رد {code}"
                 if g.role == "admin" and body.strip():
@@ -4809,7 +5026,7 @@ def st_resolve():
                         msg += " (" + urlparse(cur).netloc + "): " + txt[:200]
                 return jsonify(error=msg), 502
             break
-        if g.role != "admin" and not SHARE_KEYS and any(p.get("key") and p["key"] in cur for p in load()):
+        if g.role != "admin" and _url_has_secret(cur):      # مهما كان SHARE_KEYS: العضو ما ياخدش رابط فيه مفتاح
             return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
         act_log(g.user, "stremio", req.get("name"), req.get("size"), "Stremio")
         return jsonify(url=cur)
