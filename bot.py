@@ -8033,6 +8033,9 @@ def x_browse_impl():
 def x_hero_impl():
     if not TMDB_KEY:
         return jsonify(items=[])
+    _h = hero_cached()
+    if _h:
+        return jsonify(items=_h)
     out = []
     try:
         for x in tmdb_get("/trending/all/week", language="ar").get("results", []):
@@ -8247,13 +8250,131 @@ def build_new():
     return {"rows": rows, "hero": hero[:10]}
 
 
+# ================= هيرو الرئيسية: ترند العالم + متاح أونلاين فقط، وبيتغيّر كل يوم =================
+HERO_ROTATE_DAYS = 1       # التشكيلة بتتغيّر كل كام يوم (1 = كل يوم، 2 = كل يومين)
+HERO_COUNT = 10            # عدد الشرايح
+HERO_FIXED_TOP = 3         # أسخن كام عمل ثابتين في التشكيلة (الباقي بيتبدّل)
+HERO_MOVIE_MAX_AGE = 420   # الفيلم لازم يكون نزل في آخر كام يوم (يمنع إعادات العرض القديمة زي Endgame)
+HERO_TV_ACTIVE_DAYS = 45   # المسلسل لازم يكون عرض حلقة في آخر كام يوم
+_HERO_CACHE = {"key": None, "d": None}
+_AVAIL_CACHE = {}
+
+
+def _hero_avail(ty, tid, ar_overview=""):
+    """بيرجّع (متاح_أونلاين, overview). الفيلم لازم له نزول ديجيتال/DVD/TV قبل النهاردة (مش سينما بس)."""
+    k = (ty, tid)
+    h = _AVAIL_CACHE.get(k)
+    ttl = 7 * 86400 if (h and h[1]) else 86400
+    if h and time.time() - h[0] < ttl:
+        return h[1], h[2]
+    today = date.today()
+    ok, ov = False, ar_overview or ""
+    try:
+        if ty == "movie":
+            d = tmdb_get(f"/movie/{tid}", language="en-US", append_to_response="release_dates")
+            ov = ov or (d.get("overview") or "")
+            prim = (d.get("release_date") or "")[:10]
+            fresh = bool(prim) and 0 <= (today - date.fromisoformat(prim)).days <= HERO_MOVIE_MAX_AGE
+            if fresh:
+                for r in (d.get("release_dates") or {}).get("results", []):
+                    for x in r.get("release_dates", []):
+                        if x.get("type") in (4, 5, 6) and (x.get("release_date") or "")[:10] and (x.get("release_date") or "")[:10] <= today.isoformat():
+                            ok = True
+                            break
+                    if ok:
+                        break
+        else:
+            d = tmdb_get(f"/tv/{tid}", language="en-US")
+            ov = ov or (d.get("overview") or "")
+            la = (d.get("last_air_date") or "")[:10]
+            ok = bool(la) and 0 <= (today - date.fromisoformat(la)).days <= HERO_TV_ACTIVE_DAYS
+    except Exception:
+        ok = False
+    _AVAIL_CACHE[k] = (time.time(), ok, ov)
+    return ok, ov
+
+
+def build_hero():
+    import random
+    today = date.today()
+    tdy = today.isoformat()
+    jobs = [
+        ("/trending/movie/day", {"page": 1}, "movie"), ("/trending/movie/day", {"page": 2}, "movie"),
+        ("/trending/tv/day", {"page": 1}, "tv"), ("/trending/tv/day", {"page": 2}, "tv"),
+        ("/trending/movie/week", {"page": 1}, "movie"), ("/trending/tv/week", {"page": 1}, "tv"),
+        ("/discover/movie", {"with_release_type": "4|5", "region": "US", "sort_by": "popularity.desc",
+                             "release_date.gte": (today - timedelta(days=30)).isoformat(), "release_date.lte": tdy,
+                             "primary_release_date.gte": (today - timedelta(days=HERO_MOVIE_MAX_AGE)).isoformat()}, "movie"),
+        ("/discover/tv", {"sort_by": "popularity.desc", "air_date.gte": (today - timedelta(days=10)).isoformat(),
+                          "air_date.lte": tdy}, "tv"),
+    ]
+
+    def run(j):
+        try:
+            return tmdb_get(j[0], language="ar", include_adult="false", **j[1]).get("results", [])
+        except Exception:
+            return []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(run, jobs))
+    cand = {}
+    for j, lst in zip(jobs, res):
+        for rank, x in enumerate(lst):
+            ty = j[2]
+            if x.get("media_type") in ("movie", "tv"):
+                ty = x["media_type"]
+            if not x.get("backdrop_path") or not x.get("poster_path"):
+                continue
+            k = (ty, x["id"])
+            sc = (x.get("popularity") or 0) + (25 if "/trending/" in j[0] and "/day" in j[0] else 8 if "/trending/" in j[0] else 0) + max(0, 10 - rank)
+            if k not in cand or sc > cand[k][1]:
+                cand[k] = (x, sc)
+    top = sorted(cand.items(), key=lambda kv: -kv[1][1])[:45]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        av = list(ex.map(lambda kv: _hero_avail(kv[0][0], kv[0][1], (kv[1][0].get("overview") or "").strip()), top))
+    pool = []
+    cands = [(kv, a) for kv, a in zip(top, av) if a[0] and a[1].strip()]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        certs = list(ex.map(lambda ca: cert_of(ca[0][0][0], ca[0][0][1]), cands))
+    for ((k, (x, sc)), (_, ov)), c in zip(cands, certs):
+        if not c["ok"]:
+            continue
+        d_s = x.get("release_date") or x.get("first_air_date") or ""
+        lg = x.get("original_language") or ""
+        pool.append({"id": k[1], "type": k[0], "year": d_s[:4], "title": x.get("title") or x.get("name") or "",
+                     "rating": round(x.get("vote_average") or 0, 1), "poster": img(x.get("poster_path"), "w342"),
+                     "badge": _FLAGS.get(lg, ""), "cl": c["label"], "lv": c["lvl"], "lg": lg, "pop": sc,
+                     "overview": ov[:220], "backdrop": img(x["backdrop_path"], "w1280")})
+    pool.sort(key=lambda i: -i["pop"])
+    pool = pool[:26]
+    rng = random.Random(today.toordinal() // max(1, HERO_ROTATE_DAYS))
+    fixed = pool[:HERO_FIXED_TOP]
+    rest = pool[HERO_FIXED_TOP:]
+    pick = fixed + rng.sample(rest, min(len(rest), max(0, HERO_COUNT - len(fixed))))
+    rng.shuffle(pick)
+    return pick
+
+
+def hero_cached():
+    key = date.today().toordinal() // max(1, HERO_ROTATE_DAYS)
+    if _HERO_CACHE["key"] == key and _HERO_CACHE["d"]:
+        return _HERO_CACHE["d"]
+    try:
+        d = build_hero()
+    except Exception:
+        d = []
+    if d:
+        _HERO_CACHE.update(key=key, d=d)
+        return d
+    return _HERO_CACHE["d"] or []
+
+
 @_add_get("/new")
 def x_new_impl():
     if not TMDB_KEY:
         return jsonify(rows=[], hero=[])
     now = time.time()
     if _NEW_CACHE["d"] is not None and now - _NEW_CACHE["t"] < 1800:
-        return jsonify(_NEW_CACHE["d"])
+        return jsonify(dict(_NEW_CACHE["d"], hero=hero_cached() or _NEW_CACHE["d"].get("hero", [])))
     try:
         d = build_new()
     except Exception as ex:
@@ -8261,7 +8382,7 @@ def x_new_impl():
             return jsonify(_NEW_CACHE["d"])
         return jsonify(rows=[], hero=[], error=str(ex))
     _NEW_CACHE.update(t=now, d=d)
-    return jsonify(d)
+    return jsonify(dict(d, hero=hero_cached() or d.get("hero", [])))
 
 
 # ================= المفضلة: منصات / لغات / أنواع / أنمي (كل واحد بيطلع له صفين: أفلام + مسلسلات) =================
