@@ -525,7 +525,7 @@ def ua_label(ua):
     if not ua:
         return ""
     low = ua.lower()
-    if "okhttp" in low or "elkomy" in low or "; wv)" in low:
+    if "okhttp" in low or "elkomy" in low or "torflix" in low or "; wv)" in low:
         br = "تطبيق أندرويد"
     elif "smart-tv" in low or "smarttv" in low or "tizen" in low or "webos" in low or "android tv" in low or "bravia" in low or " aft" in low:
         br = "تلفزيون"
@@ -723,7 +723,7 @@ def guard():
 
 @app.get("/")
 def home():
-    return "Elkomy Server is Active! 🚀"
+    return "TorFlix Server is Active! 🚀"
 
 
 def too_many(ip, limit=10):
@@ -848,7 +848,7 @@ def auth():
 
 # ----------------- التسجيل الذاتي (يوزر/باسورد، إيميل/باسورد، تسجيل سريع بكود) -----------------
 # إعداد الإيميل (واحد من الاتنين) على Vercel Environment Variables:
-#   Resend:  RESEND_API_KEY  (+ MAIL_FROM مثلاً  Elkomy <no-reply@yourdomain.com>)
+#   Resend:  RESEND_API_KEY  (+ MAIL_FROM مثلاً  TorFlix <no-reply@yourdomain.com>)
 #   SMTP:    SMTP_HOST, SMTP_PORT (465 أو 587), SMTP_USER, SMTP_PASS (+ MAIL_FROM)
 # REG_OPEN=0 بيقفل التسجيل نهائيًا من الإعدادات؛ وإلا الأدمن يفتحه ويقفله من جوه الموقع.
 EMAIL_RX = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s.]{2,24}$")
@@ -917,7 +917,7 @@ def send_mail(to, subject, text, html):
     if key:
         r = requests.post("https://api.resend.com/emails",
                           headers={"Authorization": "Bearer " + key},
-                          json={"from": frm or "Elkomy <onboarding@resend.dev>", "to": [to],
+                          json={"from": frm or "TorFlix <onboarding@resend.dev>", "to": [to],
                                 "subject": subject, "text": text, "html": html}, timeout=15)
         if r.status_code >= 300:
             raise Exception("mail " + str(r.status_code))
@@ -953,7 +953,7 @@ def send_mail(to, subject, text, html):
 def _mail_html(code):
     return ('<div dir="rtl" style="font-family:Tahoma,Arial,sans-serif;background:#0f172a;padding:32px">'
             '<div style="max-width:420px;margin:auto;background:#111c33;border-radius:16px;padding:28px;text-align:center;color:#e5ecff">'
-            '<h2 style="margin:0 0 6px;color:#38bdf8">Elkomy VIP</h2>'
+            '<h2 style="margin:0 0 6px;color:#38bdf8">TorFlix</h2>'
             '<p style="color:#9fb0d3;margin:0 0 18px">كود التحقق بتاعك</p>'
             '<div style="font-size:38px;letter-spacing:10px;font-weight:bold;direction:ltr;background:#0b1224;border-radius:12px;padding:14px">'
             + code + '</div>'
@@ -1070,7 +1070,7 @@ def auth_email_start():
         o[k] = {"h": otp_hash(em, code), "exp": int(time.time()) + OTP_TTL, "tries": 0, "last": int(time.time())}
         otp_save(o)
     try:
-        send_mail(em, "كود التحقق: " + code + " — Elkomy VIP",
+        send_mail(em, "كود التحقق: " + code + " — TorFlix",
                   "كود التحقق بتاعك: " + code + "\nصالح 10 دقايق. لو مش إنت اللي طلبته تجاهل الرسالة.",
                   _mail_html(code))
     except Exception:
@@ -1720,7 +1720,7 @@ def users_export():
     data = {"users": us, "activity": act_load(), "at": int(time.time())}
     resp = make_response(json.dumps(data, ensure_ascii=False))
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
-    resp.headers["Content-Disposition"] = "attachment; filename=elkomy-members-backup.json"
+    resp.headers["Content-Disposition"] = "attachment; filename=torflix-members-backup.json"
     return resp
 
 
@@ -1732,7 +1732,7 @@ def users_backup():
     data = {"users": users_load(), "at": int(time.time())}
     resp = make_response(json.dumps(data, ensure_ascii=False))
     resp.headers["Content-Type"] = "application/json; charset=utf-8"
-    resp.headers["Content-Disposition"] = "attachment; filename=elkomy-users-FULL-backup.json"
+    resp.headers["Content-Disposition"] = "attachment; filename=torflix-users-FULL-backup.json"
     return resp
 
 
