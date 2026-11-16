@@ -5209,6 +5209,165 @@ app.add_url_rule("/home/layout2", "layout2_get", home_layout_get, methods=["GET"
 app.add_url_rule("/home/layout2", "layout2_set", home_layout_set, methods=["POST"])
 
 
+# ================= أقسام الرئيسية القابلة للترتيب (للأدمن) — بتظهر في الموقع والأندرويد والتلفزيون =================
+HB_FILE = os.path.join(DATA_DIR, "homeblocks.json")
+HB_FIXED = {"feat": "المميّز (بانرات / مباريات)", "cw": "▶ كمّل المشاهدة", "pins": "المثبّت من IPTV",
+            "live": "📡 القنوات المباشرة", "ivsec": "أقسام IPTV (رمضان…)", "new-ar": "🇪🇬 جديد عربي",
+            "new-for": "🌍 جديد أجنبي", "new-toon": "🧸 كرتون وأنمي جديد", "tz": "على ذوقك (تعلّم تلقائي)",
+            "fav": "مفضلتي (المنصات والأنواع)", "ar": "صفوف الإضافات (Stremio)"}
+HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "new-ar", "new-for", "new-toon", "tz", "fav", "ar"]
+HB_SORTS = ("new", "old", "pop", "top")
+HB_CACHE = {}
+
+
+def _hb_year(v):
+    try:
+        v = int(v)
+        return v if 1900 <= v <= 2100 else 0
+    except Exception:
+        return 0
+
+
+def hb_clean(rows_in):
+    out, used = [], set()
+    for r in (rows_in or [])[:80]:
+        if not isinstance(r, dict):
+            continue
+        bid = str(r.get("id", ""))
+        if bid in used:
+            continue
+        if bid in HB_FIXED:
+            used.add(bid)
+            o = {"id": bid, "on": bool(r.get("on", True))}
+            t = str(r.get("t", "")).strip()[:60]
+            if t:
+                o["t"] = t
+            out.append(o)
+        elif re.fullmatch(r"c_[a-z0-9]{4,12}", bid):
+            used.add(bid)
+            lg = str(r.get("lg", "")).lower()
+            out.append({"id": bid, "on": bool(r.get("on", True)),
+                        "t": str(r.get("t", "")).strip()[:60] or "قسم جديد",
+                        "ty": r.get("ty") if r.get("ty") in ("movie", "tv", "all") else "all",
+                        "lg": lg if re.fullmatch(r"[a-z]{2}", lg) else "",
+                        "g": r.get("g") if r.get("g") in _GENRE_KEYS else "",
+                        "y1": _hb_year(r.get("y1")), "y2": _hb_year(r.get("y2")),
+                        "so": r.get("so") if r.get("so") in HB_SORTS else "new"})
+    return out
+
+
+def hb_view():
+    saved = None
+    try:
+        d = store_load(HB_FILE)
+        saved = d.get("blocks") if isinstance(d, dict) else None
+    except Exception:
+        saved = None
+    blocks = hb_clean(saved) if saved else []
+    have = {x["id"] for x in blocks}
+    for bid in HB_DEFAULT:
+        if bid not in have:
+            blocks.append({"id": bid, "on": True})
+    return blocks, bool(saved)
+
+
+@app.get("/home/layoutblocks")
+def hb_get():
+    blocks, saved = hb_view()
+    return jsonify(blocks=blocks, names=HB_FIXED, saved=saved, persist=KV_ON)
+
+
+@app.post("/home/layoutblocks")
+def hb_set():
+    rows_in = (request.get_json(silent=True) or {}).get("blocks")
+    if not isinstance(rows_in, list):
+        return jsonify(error="بيانات ناقصة"), 400
+    out = hb_clean(rows_in)
+    try:
+        store_save(HB_FILE, {"blocks": out, "t": int(time.time())})
+        back = store_load(HB_FILE)
+        if not isinstance(back, dict) or len(back.get("blocks") or []) != len(out):
+            return jsonify(error="التخزين رجّع بيانات مختلفة بعد الحفظ"), 500
+    except Exception as ex:
+        return jsonify(error="فشل الحفظ في التخزين: " + short_err(ex)), 500
+    HB_CACHE.clear()
+    return jsonify(ok=True, n=len(out), kv=KV_ON)
+
+
+def hb_page(b, skip):
+    today = date.today()
+    types = ["movie", "tv"] if b.get("ty") == "all" else [b.get("ty") or "movie"]
+    items, more = [], False
+    for t in types:
+        ex = {}
+        if b.get("lg"):
+            ex["with_original_language"] = b["lg"]
+        if b.get("g"):
+            ex["with_genres"] = 16 if b["g"] == "cartoon" else _GENRE_KEYS[b["g"]][1 if t == "movie" else 2]
+        df = "primary_release_date" if t == "movie" else "first_air_date"
+        so, y1, y2 = b.get("so", "new"), b.get("y1") or 0, b.get("y2") or 0
+        if so == "old" and not y2:
+            y2 = today.year - 10
+        if y1:
+            ex[df + ".gte"] = f"{y1}-01-01"
+        ex[df + ".lte"] = today.isoformat() if (not y2 or y2 >= today.year) else f"{y2}-12-31"
+        if so == "new":
+            ex["sort_by"] = df + ".desc"
+            ex["vote_count.gte"] = 1 if b.get("lg") else 15
+        elif so == "old":
+            ex["sort_by"] = "vote_count.desc"
+        elif so == "top":
+            ex["sort_by"] = "vote_average.desc"
+            ex["vote_count.gte"] = 200
+        else:
+            ex["sort_by"] = "popularity.desc"
+        it, mo = _discover_page(t, ex, skip)
+        items += it
+        more = more or mo
+    if len(types) == 2:
+        m_ = [x for x in items if x["type"] == "movie"]
+        t_ = [x for x in items if x["type"] == "tv"]
+        items = [y for pr in zip(m_, t_) for y in pr] + m_[len(t_):] + t_[len(m_):]
+    return items, more
+
+
+def hb_spec(bid):
+    if not str(bid).startswith("c_"):
+        return None
+    blocks, _ = hb_view()
+    return next((x for x in blocks if x["id"] == bid), None)
+
+
+def hb_browse(bid, skip):
+    b = hb_spec(bid)
+    if not b:
+        return jsonify(items=[], skip=skip, more=False)
+    try:
+        items, more = hb_page(b, skip)
+    except Exception as ex:
+        return jsonify(error=str(ex))
+    return jsonify(items=items, skip=skip + 20, more=more)
+
+
+@app.get("/home/blockitems")
+def hb_items():
+    bid = request.args.get("id", "")
+    b = hb_spec(bid)
+    if not b:
+        return jsonify(items=[])
+    ck = (bid, json.dumps(b, sort_keys=True, ensure_ascii=False))
+    hit = HB_CACHE.get(ck)
+    if hit and time.time() - hit[0] < 1800:
+        return jsonify(items=hit[1], title=b["t"])
+    try:
+        items, _more = hb_page(b, 0)
+    except Exception as ex:
+        return jsonify(items=[], error=str(ex))
+    HB_CACHE[ck] = (time.time(), items)
+    return jsonify(items=items, title=b["t"])
+
+
+
 def cat_items(a, e):
     key = (a["id"], e["ty"], e["c"], e.get("g", ""))
     hit = CAT_CACHE.get(key)
@@ -7975,6 +8134,8 @@ def x_browse_impl():
     except ValueError:
         skip = 0
     gk, lang, k, fresh = a.get("genre", ""), a.get("int", ""), a.get("k", ""), a.get("fresh", "")
+    if k.startswith("hb:"):
+        return hb_browse(k[3:], skip)
     if k.startswith("fav:"):
         try:
             fk, fty = k[4:].rsplit(":", 1)
