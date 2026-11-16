@@ -1299,6 +1299,11 @@ def px_make(u, base=None):
     tok = _b64e(_px_enc(json.dumps(p, separators=(",", ":")).encode()))
     path = unquote(urlparse(u).path)
     fn = re.sub(r"[^\w.\-]+", "_", path.rsplit("/", 1)[-1])[:60]
+    try:                                    # اسم الملف الظاهر في الرابط ما يحملش أي سر حتى لو المزوّد حطه في الـ path
+        if any(k in fn or k in path for k in _secret_keys_cached()):
+            fn = "video.mp4"
+    except Exception:
+        pass
     if ".m3u8" in path.lower():
         fn = "stream.m3u8"
     elif not re.search(r"\.[A-Za-z0-9]{2,5}$", fn):
@@ -1397,6 +1402,60 @@ def px_get(tk, fname):
         finally:
             r.close()
     return Response(gen(), status=r.status_code, headers=heads, direct_passthrough=True)
+
+
+_SK_CACHE = {"t": 0.0, "v": frozenset()}
+
+
+def _secret_keys_cached():
+    """كل الأسرار (بتتجدد كل 20 ثانية). لو التحميل فشل بنكمّل بآخر قايمة معروفة بدل ما نفتح الباب."""
+    now = time.time()
+    if now - _SK_CACHE["t"] > 20:
+        try:
+            _SK_CACHE["v"] = frozenset(_all_secret_keys())
+            _SK_CACHE["t"] = now
+        except Exception:
+            pass
+    return _SK_CACHE["v"]
+
+
+def _json_leaks(o, keys, urlkeys):
+    """True لو أي نص جوه الـ JSON فيه سر: الروابط بتتفحص بكل الأسرار، وباقي النصوص بالأسرار الطويلة (16+)."""
+    if isinstance(o, str):
+        if len(o) < 8:
+            return False
+        dec = unquote(o)
+        ks = keys if ("://" in o or "%" in o) else urlkeys
+        return any(k in o or k in dec for k in ks)
+    if isinstance(o, dict):
+        return any(_json_leaks(k, keys, urlkeys) or _json_leaks(v, keys, urlkeys) for k, v in o.items())
+    if isinstance(o, (list, tuple)):
+        return any(_json_leaks(x, keys, urlkeys) for x in o)
+    return False
+
+
+@app.after_request
+def leak_guard(resp):
+    """آخر خط دفاع: أي رد JSON رايح لعضو وفيه مفتاح مزوّد/باسورد/authKey بيتقفل 403 بدل ما يوصل.
+    مستقل عن HIDE_HOSTS وعن mask_for_members (اللي أي خطأ جواه كان بيعدّي الرد زي ما هو)."""
+    try:
+        if getattr(g, "role", None) == "admin" or request.method == "OPTIONS":
+            return resp
+        if resp.mimetype != "application/json" or resp.direct_passthrough:
+            return resp
+        keys = _secret_keys_cached()
+        if not keys:
+            return resp
+        urlkeys = {k for k in keys if len(k) >= 16}
+        if _json_leaks(json.loads(resp.get_data(as_text=True)), keys, urlkeys):
+            try:
+                print("[leak_guard] blocked response with secret on", request.path, flush=True)
+            except Exception:
+                pass
+            return jsonify(error="المصدر ده مش متاح دلوقتي، جرّب نسخة تانية"), 403
+    except Exception:
+        pass
+    return resp
 
 
 @app.after_request
@@ -4991,6 +5050,8 @@ def st_resolve():
     try:
         cur = url
         for _ in range(6):
+            if not _public_url(cur):
+                return jsonify(error="المصدر مش متاح"), 502
             r = requests.get(cur, allow_redirects=False, stream=True, timeout=25,
                              headers={"User-Agent": "Mozilla/5.0"})
             loc = r.headers.get("Location")
@@ -5010,7 +5071,8 @@ def st_resolve():
                 # فنسيب المتصفح هو اللي يجرّب الرابط من IP صاحبه بدل ما نفشل هنا.
                 if code >= 500 and "alldebrid" in body.lower() and cur != url:
                     if g.role != "admin" and _url_has_secret(cur):
-                        return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
+                        # السيرفر مش قادر يمرّر الملف (AllDebrid رافض IP السيرفر) والجهاز ممنوع ياخد رابط فيه مفتاح
+                        return jsonify(error="النسخة دي مش بتشتغل على الأعضاء، اختار «🔁 غيّر النسخة» (نسخة تانية)"), 409
                     return jsonify(url=cur, probe_failed=code)
                 msg = f"المصدر رد {code}"
                 if g.role == "admin" and body.strip():
@@ -5026,9 +5088,12 @@ def st_resolve():
                         msg += " (" + urlparse(cur).netloc + "): " + txt[:200]
                 return jsonify(error=msg), 502
             break
-        if g.role != "admin" and _url_has_secret(cur):      # مهما كان SHARE_KEYS: العضو ما ياخدش رابط فيه مفتاح
-            return jsonify(error="المصدر ده مش متاح للمستخدمين العاديين"), 403
         act_log(g.user, "stremio", req.get("name"), req.get("size"), "Stremio")
+        if g.role != "admin":
+            # العضو عمره ما ياخد الرابط الأصلي (فيه مفتاح أو دومين المزوّد): بياخد رابط /px/ مشفّر وموقّع
+            # والسيرفر هو اللي يجيب الفيديو بالمفتاح. بنعملها هنا صراحةً (مش بالاعتماد على after_request)
+            # وبعدها leak_guard بيتأكد إن مفيش أي سر في الرد.
+            return jsonify(url=px_make(cur))
         return jsonify(url=cur)
     except Exception as ex:
         return jsonify(error=f"فشل تجهيز الرابط: {short_err(ex)}"), 502
