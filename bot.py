@@ -555,7 +555,7 @@ def req_meta():
     try:
         city = unquote(request.headers.get("X-Vercel-IP-City", "") or "")
         ctry = request.headers.get("X-Vercel-IP-Country", "") or ""
-        ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "")
+        ip = client_ip()
         return {"ip": ip, "ua": (request.headers.get("User-Agent", "") or "")[:220],
                 "geo": ", ".join(x for x in (city, ctry) if x)}
     except Exception:
@@ -657,7 +657,7 @@ def read_token(tok):
     return read_token_ex(tok)[0]
 
 
-_ADMIN_PREFIXES = ("/users", "/iptv/admin")
+_ADMIN_PREFIXES = ("/users", "/iptv/admin", "/activity")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
 _ADMIN_ANY = ("/home/dub-refresh", "/providers", "/providers/export", "/play/diag", "/play/reports")
 # مسارات ستريميو بتغيّر إعداد مشترك للموقع كله (حساب + إضافات + مفاتيح مزوّدين): للأدمن بس
@@ -825,7 +825,7 @@ def auth():
     p = str(d.get("p", "")).strip()
     if len(u) > 254 or len(p) > 200:
         return jsonify(ok=False), 400
-    if too_many("u:" + u, 20):
+    if too_many("ui:" + ip + "|" + u, 8) or too_many("u:" + u, 60):
         return jsonify(ok=False, error="محاولات كتير"), 429
     if ADMIN_OK and u == APP_USER.lower() and hmac.compare_digest(p.encode(), APP_PASS.encode()):
         return jsonify(ok=True, role="admin", user=u,
@@ -842,6 +842,7 @@ def auth():
         return _login_user(u, rec, d, ip)
     fail_add(ip)
     fail_add("u:" + u)
+    fail_add("ui:" + ip + "|" + u)
     time.sleep(0.5)
     return jsonify(ok=False), 401
 
@@ -882,9 +883,22 @@ def rl_hit(key, limit, window):
 
 
 def client_ip():
+    """IP العميل الحقيقي. الهيدرات اللي العميل يقدر يكتبها ما بنثقش فيها (كان ممكن تزويرها لتخطّي حد المحاولات):
+    على Vercel بنستخدم X-Vercel-Forwarded-For (Vercel هو اللي بيكتبه). على أي استضافة تانية بناخد الـ IP من
+    آخر X-Forwarded-For اللي ضافه البروكسي بتاعك (TRUSTED_PROXIES = عدد البروكسيات قدامك، الافتراضي 1)."""
     h = request.headers
-    v = h.get("X-Vercel-Forwarded-For", "") or h.get("X-Forwarded-For", "")
-    return (v.split(",")[0].strip() or request.remote_addr or "")[:64]
+    if os.environ.get("VERCEL"):
+        v = h.get("X-Vercel-Forwarded-For", "")
+        if v.strip():
+            return v.split(",")[0].strip()[:64]
+    try:
+        n = max(1, int(os.environ.get("TRUSTED_PROXIES", "1") or 1))
+    except ValueError:
+        n = 1
+    xf = [x.strip() for x in h.get("X-Forwarded-For", "").split(",") if x.strip()]
+    if xf:
+        return (xf[-n] if len(xf) >= n else xf[0])[:64]
+    return (request.remote_addr or "")[:64]
 
 
 def mail_on():
@@ -1362,7 +1376,8 @@ def px_get(tk, fname):
         for _ in range(6):
             if not _public_url(cur):
                 return Response("forbidden", status=403, mimetype="text/plain")
-            r = requests.get(cur, headers=hdr, stream=True, allow_redirects=False, timeout=(10, 60))
+            with _guard_net():
+                r = requests.get(cur, headers=hdr, stream=True, allow_redirects=False, timeout=(10, 60))
             loc = r.headers.get("Location")
             if r.status_code in (301, 302, 303, 307, 308) and loc:
                 cur = urljoin(cur, loc)
@@ -3626,18 +3641,80 @@ def ws_hosts(force=False):
     return c
 
 
+def _ip_public(ip):
+    """عنوان عام فعلاً (مش داخلي / loopback / link-local / CGNAT / metadata / multicast، وبيفك IPv4-mapped IPv6)."""
+    try:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return bool(ip.is_global) and not ip.is_multicast
+    except Exception:
+        return False
+
+
 def _public_url(u):
     try:
         p = urlparse(u)
         if p.scheme not in ("http", "https") or not p.hostname:
             return False
-        for ai in socket.getaddrinfo(p.hostname, None):
-            ip = ipaddress.ip_address(ai[4][0])
-            if (ip.is_private or ip.is_loopback or ip.is_link_local
-                    or ip.is_reserved or ip.is_multicast):
+        infos = socket.getaddrinfo(p.hostname, None)
+        if not infos:
+            return False
+        for ai in infos:
+            if not _ip_public(ipaddress.ip_address(ai[4][0].split("%")[0])):
                 return False
         return True
     except Exception:
+        return False
+
+
+# فحص العنوان وقت الاتصال نفسه (بيقفل ثغرة DNS rebinding: الدومين يرجّع IP عام وقت الفحص وبعدها داخلي وقت الاتصال).
+# بيشتغل بس جوه `with _guard_net():` عشان ما يأثرش على اتصالات السيرفر العادية (Redis / Prowlarr على شبكة داخلية).
+_GUARD = threading.local()
+try:
+    import urllib3.util.connection as _u3c
+    _orig_cc = _u3c.create_connection
+
+    def _guarded_cc(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, socket_options=None):
+        if not getattr(_GUARD, "on", False):
+            return _orig_cc(address, timeout, source_address, socket_options)
+        host, port = address
+        host = host.strip("[]")
+        err = None
+        for af, st, proto, _cn, sa in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+            try:
+                if not _ip_public(ipaddress.ip_address(sa[0].split("%")[0])):
+                    err = OSError("blocked non-public address")
+                    continue
+            except ValueError:
+                continue
+            sock = None
+            try:
+                sock = socket.socket(af, st, proto)
+                for o in (socket_options or []):
+                    sock.setsockopt(*o)
+                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                    sock.settimeout(timeout)
+                if source_address:
+                    sock.bind(source_address)
+                sock.connect(sa)
+                return sock
+            except OSError as e:
+                err = e
+                if sock is not None:
+                    sock.close()
+        raise err or OSError("no usable address")
+
+    _u3c.create_connection = _guarded_cc
+except Exception:
+    pass
+
+
+class _guard_net:
+    def __enter__(self):
+        _GUARD.on = True
+
+    def __exit__(self, *a):
+        _GUARD.on = False
         return False
 
 
@@ -3659,7 +3736,8 @@ def _fetch_html(u, limit=1_500_000):
     for _ in range(4):
         if not _public_url(u):
             return None, u
-        r = requests.get(u, headers=hd, timeout=7, allow_redirects=False, stream=True)
+        with _guard_net():
+            r = requests.get(u, headers=hd, timeout=7, allow_redirects=False, stream=True)
         loc = r.headers.get("Location")
         if r.status_code in (301, 302, 303, 307, 308) and loc:
             r.close()
@@ -5052,8 +5130,9 @@ def st_resolve():
         for _ in range(6):
             if not _public_url(cur):
                 return jsonify(error="المصدر مش متاح"), 502
-            r = requests.get(cur, allow_redirects=False, stream=True, timeout=25,
-                             headers={"User-Agent": "Mozilla/5.0"})
+            with _guard_net():
+                r = requests.get(cur, allow_redirects=False, stream=True, timeout=25,
+                                 headers={"User-Agent": "Mozilla/5.0"})
             loc = r.headers.get("Location")
             code = r.status_code
             body = ""
@@ -6975,7 +7054,7 @@ def _as_safe_url(u):
             return False
         port = p.port or (443 if p.scheme == "https" else 80)
         for i in socket.getaddrinfo(p.hostname, port, proto=socket.IPPROTO_TCP):
-            if not ipaddress.ip_address(i[4][0]).is_global:
+            if not _ip_public(ipaddress.ip_address(i[4][0].split("%")[0])):
                 return False
         return True
     except Exception:
