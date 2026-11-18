@@ -5953,7 +5953,7 @@ def _aif_call(text, img_b64, mime):
             parts.append({"inlineData": {"mimeType": mime, "data": img_b64}})
         parts.append({"text": text})
         gc = {"temperature": 0.2, "maxOutputTokens": 3000, "responseMimeType": "application/json"}
-        if "flash" in AI_MODEL:
+        if "2.5" in AI_MODEL and "flash" in AI_MODEL:
             gc["thinkingConfig"] = {"thinkingBudget": 1024}
         r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % AI_MODEL,
                           timeout=60, headers={"x-goog-api-key": AI_KEY, "content-type": "application/json"},
@@ -7766,7 +7766,7 @@ AI_KEY = (os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or _GE
 AI_GEMINI = (os.environ.get("AI_PROVIDER", "").strip().lower() in ("gemini", "google")
              or AI_KEY.startswith(("AIza", "AQ.")) or (bool(_GEM_ENV) and AI_KEY == _GEM_ENV)
              or (bool(AI_KEY) and not AI_KEY.startswith("sk-ant")))   # مفاتيح Anthropic كلها بتبدأ بـ sk-ant
-AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-2.5-flash" if AI_GEMINI else "claude-sonnet-5-5")
+AI_MODEL = (os.environ.get("AI_MODEL") or "").strip() or ("gemini-3.8-flash" if AI_GEMINI else "claude-sonnet-5-5")
 AI_BATCH = 50
 AI_RUN = {}
 AI_SEM = threading.BoundedSemaphore(2)
@@ -7819,7 +7819,7 @@ def _ai_call_gemini(user):
                             "contents": [{"role": "user", "parts": [{"text": user}]}],
                             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000,
                                                  "responseMimeType": "application/json",
-                                                 "thinkingConfig": {"thinkingBudget": 0}}})
+                                                 **({"thinkingConfig": {"thinkingBudget": 0}} if "2.5" in AI_MODEL else {})}})
     d = r.json()
     if r.status_code != 200:
         raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
