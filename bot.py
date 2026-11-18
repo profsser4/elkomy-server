@@ -5952,19 +5952,32 @@ def _aif_call(text, img_b64, mime):
         if img_b64:
             parts.append({"inlineData": {"mimeType": mime, "data": img_b64}})
         parts.append({"text": text})
-        gc = {"temperature": 0.2, "maxOutputTokens": 3000, "responseMimeType": "application/json"}
-        if "2.5" in AI_MODEL and "flash" in AI_MODEL:
-            gc["thinkingConfig"] = {"thinkingBudget": 1024}
-        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % AI_MODEL,
-                          timeout=60, headers={"x-goog-api-key": AI_KEY, "content-type": "application/json"},
-                          json={"systemInstruction": {"parts": [{"text": AIF_SYS}]},
-                                "contents": [{"role": "user", "parts": parts}],
-                                "generationConfig": gc})
-        d = r.json()
-        if r.status_code != 200:
-            raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
-        cs = d.get("candidates") or [{}]
-        return "".join(x.get("text", "") for x in ((cs[0].get("content") or {}).get("parts") or []))
+        fb = [x.strip() for x in (os.environ.get("AI_MODEL_FALLBACK") or "gemini-3.8-flash-lite,gemini-2.5-flash-lite").split(",") if x.strip()]
+        chain = [AI_MODEL, AI_MODEL] + [m for m in fb if m != AI_MODEL]
+        last = "فشل الاتصال بالذكاء الاصطناعي"
+        for n, mdl in enumerate(chain):
+            gc = {"temperature": 0.2, "maxOutputTokens": 3000, "responseMimeType": "application/json"}
+            if "2.5" in mdl and "flash" in mdl and "lite" not in mdl:
+                gc["thinkingConfig"] = {"thinkingBudget": 1024}
+            try:
+                r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % mdl,
+                                  timeout=25, headers={"x-goog-api-key": AI_KEY, "content-type": "application/json"},
+                                  json={"systemInstruction": {"parts": [{"text": AIF_SYS}]},
+                                        "contents": [{"role": "user", "parts": parts}],
+                                        "generationConfig": gc})
+                d = r.json()
+            except Exception as e:
+                last = str(e)[:160]
+                continue
+            if r.status_code == 200:
+                cs = d.get("candidates") or [{}]
+                return "".join(x.get("text", "") for x in ((cs[0].get("content") or {}).get("parts") or []))
+            last = str((d.get("error") or {}).get("message") or r.status_code)[:160]
+            if r.status_code in (400, 401, 403) and "model" not in last.lower():
+                break                      # مفتاح/طلب غلط: مفيش فايدة من إعادة المحاولة
+            if n == 0:
+                time.sleep(1.5)
+        raise Exception(last)
     content = []
     if img_b64:
         content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": img_b64}})
