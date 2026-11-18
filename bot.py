@@ -5928,6 +5928,163 @@ def tmdb():
         return jsonify(error=str(e)), 500
 
 
+# ----------------- بحث ذكي: وصف مشهد / موضوع / صورة من فيلم -----------------
+# بيستخدم نفس AI_KEY بتاع الترجمة (Gemini أو Claude) ويحوّل التخمينات لأعمال حقيقية من TMDB
+AIF_SYS = (
+    "You are an expert film and TV historian helping people identify movies and series. "
+    "The user either describes a scene, plot, character, quote or topic (Arabic, Egyptian dialect or English), "
+    "or sends a still frame from a film or show. Identify the work(s). "
+    "For an image, rely on the scene, setting, props, costumes, composition, visible text and art style; "
+    "never name real people from their faces. "
+    "Return ONLY JSON: {\"guesses\":[{\"title\":\"English/international title as listed on TMDB\","
+    "\"title_ar\":\"Arabic title if it is an Arabic work or you know it, else empty\","
+    "\"year\":2010,\"type\":\"movie or tv\",\"why\":\"very short Arabic reason, max 14 words\"}]}. "
+    "Order by confidence, best first, 1 to 6 guesses. "
+    "If the user asks about a topic or genre (e.g. films about time travel) return the 6 best-matching well-known works. "
+    "Never invent titles. If you cannot identify anything return {\"guesses\":[]}. No markdown, no explanations."
+)
+
+
+def _aif_call(text, img_b64, mime):
+    text = text or "حدد العمل اللي في الصورة دي."
+    if AI_GEMINI:
+        parts = []
+        if img_b64:
+            parts.append({"inlineData": {"mimeType": mime, "data": img_b64}})
+        parts.append({"text": text})
+        gc = {"temperature": 0.2, "maxOutputTokens": 3000, "responseMimeType": "application/json"}
+        if "flash" in AI_MODEL:
+            gc["thinkingConfig"] = {"thinkingBudget": 1024}
+        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % AI_MODEL,
+                          timeout=60, headers={"x-goog-api-key": AI_KEY, "content-type": "application/json"},
+                          json={"systemInstruction": {"parts": [{"text": AIF_SYS}]},
+                                "contents": [{"role": "user", "parts": parts}],
+                                "generationConfig": gc})
+        d = r.json()
+        if r.status_code != 200:
+            raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
+        cs = d.get("candidates") or [{}]
+        return "".join(x.get("text", "") for x in ((cs[0].get("content") or {}).get("parts") or []))
+    content = []
+    if img_b64:
+        content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": img_b64}})
+    content.append({"type": "text", "text": text})
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=60,
+                      headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
+                               "content-type": "application/json"},
+                      json={"model": AI_MODEL, "max_tokens": 900, "temperature": 0.2,
+                            "system": AIF_SYS, "messages": [{"role": "user", "content": content}]})
+    d = r.json()
+    if r.status_code != 200:
+        raise Exception(str((d.get("error") or {}).get("message") or r.status_code)[:160])
+    return "".join(x.get("text", "") for x in d.get("content", []) if x.get("type") == "text")
+
+
+def _aif_n(t):
+    return re.sub(r"[\W_]+", "", (t or "").lower())
+
+
+def _aif_resolve(gs):
+    """تخمين من الذكاء الاصطناعي -> عمل حقيقي على TMDB (id + بوستر + اسم عربي)"""
+    t = str(gs.get("title") or "").strip()
+    ta = str(gs.get("title_ar") or "").strip()
+    typ = gs.get("type") if gs.get("type") in ("movie", "tv") else ""
+    try:
+        yr = int(str(gs.get("year") or "")[:4])
+    except Exception:
+        yr = 0
+    cands = []
+    for qq, lang in ((t, "en-US"), (ta, "ar")):
+        if not qq:
+            continue
+        try:
+            cands = _tmdb_multi(qq, lang)
+        except Exception:
+            cands = []
+        if cands:
+            break
+    if not cands:
+        return None
+
+    def score(x):
+        sc = 0.0
+        if typ and x.get("media_type") == typ:
+            sc += 3
+        d = (x.get("release_date") or x.get("first_air_date") or "")[:4]
+        if yr and d.isdigit():
+            diff = abs(int(d) - yr)
+            sc += 4 if diff == 0 else (2 if diff == 1 else 0)
+        nm = _aif_n(x.get("title") or x.get("name") or "")
+        nm2 = _aif_n(x.get("original_title") or x.get("original_name") or "")
+        if _aif_n(t) and _aif_n(t) in (nm, nm2):
+            sc += 2
+        sc += min(float(x.get("popularity") or 0), 60) / 100.0
+        return sc
+    best = max(cands[:8], key=score)
+    date_s = best.get("release_date") or best.get("first_air_date") or ""
+    row = {"id": best["id"], "type": best["media_type"], "year": date_s[:4],
+           "title": best.get("title") or best.get("name") or t,
+           "title_en": best.get("title") or best.get("name") or t,
+           "poster": img(best.get("poster_path"), "w342"),
+           "why": str(gs.get("why") or "")[:140]}
+    try:
+        a = tmdb_get("/%s/%s" % (best["media_type"], best["id"]), language="ar")
+        at = (a.get("title") or a.get("name") or "").strip()
+        if at:
+            row["title"] = at
+        if not row["poster"]:
+            row["poster"] = img(a.get("poster_path"), "w342")
+    except Exception:
+        pass
+    return row
+
+
+@app.post("/ai/find")
+def ai_find():
+    if not AI_KEY:
+        return jsonify(error="البحث الذكي محتاج AI_KEY على السيرفر (مفتاح Gemini أو Claude)"), 400
+    if not TMDB_KEY:
+        return jsonify(error="TMDB_KEY مش متضاف على السيرفر"), 500
+    if g.role != "admin" and rl_hit("aif:" + g.user, 40, 3600):
+        return jsonify(error="كتر البحث الذكي شوية. جرب بعد شوية."), 429
+    b = request.get_json(silent=True) or {}
+    q = str(b.get("q") or "").strip()[:700]
+    im = str(b.get("image") or "")
+    img_b64, mime = "", ""
+    if im:
+        m = re.match(r"^data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$", im)
+        if not m or len(im) > 7_000_000:
+            return jsonify(error="الصورة مش مقبولة (jpg/png/webp وأقل من 5 ميجا)"), 400
+        mime, img_b64 = m.group(1), m.group(2)
+    if not q and not img_b64:
+        return jsonify(error="اكتب وصف المشهد أو ارفع صورة"), 400
+    try:
+        raw = _aif_call(q, img_b64, mime)
+    except Exception as e:
+        return jsonify(error="الذكاء الاصطناعي رفض الطلب: %s" % e), 502
+    raw = re.sub(r"^```(?:json)?|```$", "", (raw or "").strip(), flags=re.M).strip()
+    try:
+        gl = (json.loads(raw) or {}).get("guesses") or []
+    except Exception:
+        mm = re.search(r"\{.*\}", raw, re.S)
+        try:
+            gl = (json.loads(mm.group(0)) or {}).get("guesses") if mm else []
+        except Exception:
+            gl = []
+    gl = [x for x in gl if isinstance(x, dict)][:6]
+    out, seen = [], set()
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for r in ex.map(_aif_resolve, gl):
+            if not r:
+                continue
+            k = (r["type"], r["id"])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+    return jsonify(results=out, guessed=[str(x.get("title") or "") for x in gl])
+
+
 # ----------------- صفوف الجديد (من TMDB) -----------------
 
 ROWS_CACHE = {"t": 0, "data": None}
