@@ -7764,7 +7764,8 @@ _GEM_ENV = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GEMINI_KEY")
 AI_KEY = (os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or _GEM_ENV or "").strip().strip("\"'")
 # لو المفتاح بتاع Gemini (بيبدأ بـ AIza) أو AI_PROVIDER=gemini أو المفتاح جاي من GEMINI_API_KEY بيشتغل بـ Gemini، غير كده Claude
 AI_GEMINI = (os.environ.get("AI_PROVIDER", "").strip().lower() in ("gemini", "google")
-             or AI_KEY.startswith("AIza") or (bool(_GEM_ENV) and AI_KEY == _GEM_ENV))
+             or AI_KEY.startswith(("AIza", "AQ.")) or (bool(_GEM_ENV) and AI_KEY == _GEM_ENV)
+             or (bool(AI_KEY) and not AI_KEY.startswith("sk-ant")))   # مفاتيح Anthropic كلها بتبدأ بـ sk-ant
 AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-2.5-flash" if AI_GEMINI else "claude-sonnet-5-5")
 AI_BATCH = 50
 AI_RUN = {}
