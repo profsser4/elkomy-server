@@ -7734,9 +7734,12 @@ def subx_fix():
 # بياخد أحسن ترجمة إنجليزي مطابقة للفيلم من SubDL ويترجمها عربي بـ Claude، سطر مقابل سطر وبنفس التوقيت،
 # وبعدها بتعدّي على الضبط التلقائي بالصوت زي أي ترجمة. محتاج متغيّر AI_KEY (مفتاح Anthropic) على السيرفر.
 # اختياري: AI_MODEL (الافتراضي claude-sonnet-5-5).
-AI_KEY = os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or ""
-# لو المفتاح بتاع Gemini (بيبدأ بـ AIza) أو AI_PROVIDER=gemini بيشتغل بـ Gemini، غير كده Claude
-AI_GEMINI = os.environ.get("AI_PROVIDER", "").lower() == "gemini" or AI_KEY.startswith("AIza")
+_GEM_ENV = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GEMINI_KEY")
+            or os.environ.get("GOOGLE_API_KEY") or "").strip().strip("\"'")
+AI_KEY = (os.environ.get("AI_KEY") or os.environ.get("ANTHROPIC_API_KEY") or _GEM_ENV or "").strip().strip("\"'")
+# لو المفتاح بتاع Gemini (بيبدأ بـ AIza) أو AI_PROVIDER=gemini أو المفتاح جاي من GEMINI_API_KEY بيشتغل بـ Gemini، غير كده Claude
+AI_GEMINI = (os.environ.get("AI_PROVIDER", "").strip().lower() in ("gemini", "google")
+             or AI_KEY.startswith("AIza") or (bool(_GEM_ENV) and AI_KEY == _GEM_ENV))
 AI_MODEL = os.environ.get("AI_MODEL") or ("gemini-2.5-flash" if AI_GEMINI else "claude-sonnet-5-5")
 AI_BATCH = 50
 AI_RUN = {}
