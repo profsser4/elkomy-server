@@ -6039,6 +6039,31 @@ def _aif_resolve(gs):
     return row
 
 
+@app.get("/ai/test")
+def ai_test():
+    if g.role != "admin":
+        return jsonify(error="للأدمن بس"), 403
+    k = AI_KEY or ""
+    info = {"provider": "gemini" if AI_GEMINI else "claude", "model": AI_MODEL,
+            "key_set": bool(k), "key_len": len(k),
+            "key_mask": (k[:4] + "…" + k[-2:]) if len(k) > 8 else "",
+            "ai_provider_env": os.environ.get("AI_PROVIDER", ""),
+            "tmdb": bool(TMDB_KEY)}
+    if not k:
+        info["ok"] = False
+        info["msg"] = "مفيش مفتاح على السيرفر (AI_KEY فاضي)"
+        return jsonify(info)
+    try:
+        t = _aif_call("ping: reply with {\"guesses\":[]}", "", "")
+        info["ok"] = True
+        info["msg"] = "المفتاح شغال ✅"
+        info["reply"] = (t or "")[:80]
+    except Exception as e:
+        info["ok"] = False
+        info["msg"] = str(e)[:200]
+    return jsonify(info)
+
+
 @app.post("/ai/find")
 def ai_find():
     if not AI_KEY:
