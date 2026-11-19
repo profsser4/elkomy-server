@@ -5367,8 +5367,8 @@ HB_FIXED = {"feat": "المميّز (بانرات / مباريات)", "cw": "▶
             "live": "📡 القنوات المباشرة", "ivsec": "أقسام IPTV (رمضان…)", "new-ar": "🇪🇬 جديد عربي",
             "new-for": "🌍 جديد أجنبي", "new-toon": "🧸 كرتون وأنمي جديد", "tz": "على ذوقك (تعلّم تلقائي)",
             "fav": "مفضلتي (المنصات والأنواع)", "ar": "صفوف الإضافات (Stremio)"}
-HB_DEFAULT = ["feat", "cw", "pins", "tz"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت + على ذوقك
-HB_HEAVY = {"live", "ivsec", "new-ar", "new-for", "new-toon", "ar", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
+HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
+HB_HEAVY = {"new-ar", "new-for", "new-toon", "ar", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
 HB_SORTS = ("new", "old", "pop", "top")
 HB_CACHE = {}
 
@@ -5644,6 +5644,16 @@ def dub_items():
 @app.post("/home/dub-refresh")
 def dub_refresh():
     return jsonify(started=start_dub_scan(), running=DUB_STATE["running"])
+
+
+@app.get("/rows/meta")
+def rows_meta():
+    """أسماء صفوف الإضافات بس (من غير ما نجيب الأفلام) — لوحة «مفضلتي» كانت بتستنى /rows الكامل وده بطيء جدًا."""
+    d = ensure_catalogs()
+    amap = {a["id"] for a in d["addons"]}
+    out = [{"id": e["k"], "title": e["t"]} for e in home_layout(d)
+           if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
+    return jsonify(rows=out)
 
 
 @app.get("/rows")
