@@ -2154,17 +2154,17 @@ def feat_clean(d):
                                    "until": _fdate(m.get("until"))})
     for b in (d.get("banners") or [])[:10]:
         if isinstance(b, dict) and _fs(b.get("title"), 80):
-            k = b.get("k") if b.get("k") in ("vod", "series") else ""
+            k = b.get("k") if b.get("k") in ("vod", "series", "lib") else ""
             out["banners"].append({"id": _fs(b.get("id"), 20) or uuid.uuid4().hex[:8], "k": k,
-                                   "sid": _fs(b.get("sid"), 20) if k else "", "title": _fs(b.get("title"), 80),
+                                   "sid": _fs(b.get("sid"), 40) if k else "", "title": _fs(b.get("title"), 80),
                                    "sub": _fs(b.get("sub"), 160), "img": _furl(b.get("img")),
                                    "tag": _fs(b.get("tag"), 30), "nm": _fs(b.get("nm"), 80), "until": _fdate(b.get("until"))})
     p = d.get("popup")
     if isinstance(p, dict):
-        k = p.get("k") if p.get("k") in ("vod", "series") else ""
+        k = p.get("k") if p.get("k") in ("vod", "series", "lib") else ""
         out["popup"] = {"on": bool(p.get("on")), "id": _fs(p.get("id"), 20), "title": _fs(p.get("title"), 80),
                         "text": _fs(p.get("text"), 300), "img": _furl(p.get("img")), "k": k,
-                        "sid": _fs(p.get("sid"), 20) if k else "", "nm": _fs(p.get("nm"), 80), "until": _fdate(p.get("until"))}
+                        "sid": _fs(p.get("sid"), 40) if k else "", "nm": _fs(p.get("nm"), 80), "until": _fdate(p.get("until"))}
     return out
 
 
