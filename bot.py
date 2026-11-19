@@ -5367,8 +5367,8 @@ HB_FIXED = {"feat": "المميّز (بانرات / مباريات)", "cw": "▶
             "live": "📡 القنوات المباشرة", "ivsec": "أقسام IPTV (رمضان…)", "new-ar": "🇪🇬 جديد عربي",
             "new-for": "🌍 جديد أجنبي", "new-toon": "🧸 كرتون وأنمي جديد", "tz": "على ذوقك (تعلّم تلقائي)",
             "fav": "مفضلتي (المنصات والأنواع)", "ar": "صفوف الإضافات (Stremio)"}
-HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
-HB_HEAVY = {"new-ar", "new-for", "new-toon", "ar", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
+HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz", "ar"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
+HB_HEAVY = {"new-ar", "new-for", "new-toon", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
 HB_SORTS = ("new", "old", "pop", "top")
 HB_CACHE = {}
 
@@ -5653,6 +5653,13 @@ def rows_meta():
     amap = {a["id"] for a in d["addons"]}
     out = [{"id": e["k"], "title": e["t"]} for e in home_layout(d)
            if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
+    if not out:                       # مفيش صفوف إضافات متفعّلة: نفس الصفوف العامة اللي كانت بتظهر قبل كده
+        try:
+            r = tmdb_rows()
+            r = r[0] if isinstance(r, tuple) else r
+            out = [{"id": x.get("id"), "title": x.get("title")} for x in ((r.get_json(silent=True) or {}).get("rows") or [])]
+        except Exception:
+            out = []
     return jsonify(rows=out)
 
 
@@ -5664,6 +5671,11 @@ def rows():
             if e.get("on") and (e.get("a") in amap or e.get("a") == "_dub")]
     if not ents:
         return tmdb_rows()
+    want = {x for x in (request.args.get("ids") or "").split(",") if x}
+    if want:                          # الصفحة بتطلب الصفوف اللي العضو علّمها بس
+        ents = [e for e in ents if e["k"] in want]
+        if not ents:
+            return jsonify(rows=[])
 
     def one(e):
         if e["a"] == "_dub":
