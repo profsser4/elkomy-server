@@ -5367,8 +5367,8 @@ HB_FIXED = {"feat": "المميّز (بانرات / مباريات)", "cw": "▶
             "live": "📡 القنوات المباشرة", "ivsec": "أقسام IPTV (رمضان…)", "new-ar": "🇪🇬 جديد عربي",
             "new-for": "🌍 جديد أجنبي", "new-toon": "🧸 كرتون وأنمي جديد", "tz": "على ذوقك (تعلّم تلقائي)",
             "fav": "مفضلتي (المنصات والأنواع)", "ar": "صفوف الإضافات (Stremio)"}
-HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz", "ar"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
-HB_HEAVY = {"new-ar", "new-for", "new-toon", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
+HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
+HB_HEAVY = {"new-ar", "new-for", "new-toon", "ar", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
 HB_SORTS = ("new", "old", "pop", "top")
 HB_CACHE = {}
 
@@ -5415,7 +5415,7 @@ def hb_view():
         d = store_load(HB_FILE)
         if isinstance(d, dict):
             saved = d.get("blocks")
-            lite = bool(d.get("lite"))
+            lite = d.get("lite") == 2
     except Exception:
         saved = None
     blocks = hb_clean(saved) if saved else []
@@ -5443,7 +5443,7 @@ def hb_set():
         return jsonify(error="بيانات ناقصة"), 400
     out = hb_clean(rows_in)
     try:
-        store_save(HB_FILE, {"blocks": out, "t": int(time.time()), "lite": True})
+        store_save(HB_FILE, {"blocks": out, "t": int(time.time()), "lite": 2})
         back = store_load(HB_FILE)
         if not isinstance(back, dict) or len(back.get("blocks") or []) != len(out):
             return jsonify(error="التخزين رجّع بيانات مختلفة بعد الحفظ"), 500
