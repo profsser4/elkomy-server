@@ -506,7 +506,7 @@ def sess_of(rec):
 
 LASTP = {}                  # {(user, sid): (path, time)} آخر حاجة العضو عملها (من غير الطلبات الدورية)
 ADMIN_META = {}             # {user: {ip, ua, geo, t}} الأدمن مالوش جلسات فبنحفظ بياناته في الذاكرة
-_POLL_PATHS = ("/me", "/usage", "/users", "/activity", "/ud/", "/settings", "/auth")
+_POLL_PATHS = ("/me", "/usage", "/users", "/activity", "/ud/", "/settings", "/auth", "/home/rev")
 _PATH_AR = (("/play", "تشغيل/مشاهدة"), ("/generate", "سحب ملفات"), ("/tb/", "TorBox"), ("/stremio", "Stremio"),
             ("/iptv", "IPTV"), ("/search", "بحث"), ("/tmdb", "تصفح"), ("/home", "الرئيسية"), ("/sub", "ترجمة"),
             ("/dl", "تحميل"), ("/download", "تحميل"))
@@ -5349,7 +5349,35 @@ def home_layout_set():
             return jsonify(error="التخزين رجّع بيانات مختلفة بعد الحفظ"), 500
     except Exception as ex:
         return jsonify(error="فشل الحفظ في التخزين: " + short_err(ex)), 500
+    rev_bump()
     return jsonify(ok=True, n=len(out), kv=KV_ON)
+
+
+# ---- رقم نسخة الرئيسية: أي حفظ من الأدمن بيغيّره، والشاشات بتسأل عنه كل ~15 ثانية وتتحدّث لوحدها ----
+REV_FILE = os.path.join(DATA_DIR, "homerev.json")
+_REV_MEM = {"t": 0.0, "v": 0}
+
+
+def rev_bump():
+    v = int(time.time() * 1000)
+    try:
+        store_save(REV_FILE, {"v": v})
+    except Exception:
+        pass
+    _REV_MEM["t"], _REV_MEM["v"] = time.time(), v
+
+
+@app.get("/home/rev")
+def home_rev():
+    if time.time() - _REV_MEM["t"] > 3:       # كاش 3 ثواني عشان ما نضغطش على Redis
+        try:
+            v = int((store_load(REV_FILE) or {}).get("v", 0))
+        except Exception:
+            v = _REV_MEM["v"]
+        _REV_MEM["t"], _REV_MEM["v"] = time.time(), v
+    r = jsonify(v=_REV_MEM["v"])
+    r.headers["Cache-Control"] = "no-store"
+    return r
 
 
 @app.get("/home/ping")
@@ -5450,6 +5478,7 @@ def hb_set():
     except Exception as ex:
         return jsonify(error="فشل الحفظ في التخزين: " + short_err(ex)), 500
     HB_CACHE.clear()
+    rev_bump()
     return jsonify(ok=True, n=len(out), kv=KV_ON)
 
 
