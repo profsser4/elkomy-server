@@ -4217,14 +4217,204 @@ def _title_guard(q, items, notes):
         notes.append("استبعدت %d صفحة اسمها مش مطابق لـ «%s»" % (len(items) - len(keep), q))
     return keep
 
+# ----------------- بحث مباشر في موقع Yoyo Cinema (روابط التحميل المدعومة بس) -----------------
+YOYO = "https://yoyo-cinema.vip"
+_YY_SESS = requests.Session()
+_YY_HD = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Referer": YOYO + "/",
+    "Upgrade-Insecure-Requests": "1",
+}
+_YY_ERR = {"last": ""}
+_YY_EP = re.compile(r"/(?:download|watch)/series/([0-9a-fA-F\-]{36})/season/(\d+)/episode/(\d+)")
+_YY_MV = re.compile(r"/(?:download|watch)/movies?/([0-9a-fA-F\-]{36})")
+_YY_DET = re.compile(r"^/(?:movies|series)/[^/?#]+/?$")
+
+
+def _yy_get(u):
+    """بهيدرز متصفح وكوكيز، وبيسجّل سبب الفشل. بيدعم بروكسي من YOYO_PROXY (أو CIMA_PROXY)."""
+    try:
+        px = (os.environ.get("YOYO_PROXY") or os.environ.get("CIMA_PROXY") or "").strip()
+        r = _YY_SESS.get(u, headers=_YY_HD, timeout=20, allow_redirects=True,
+                         proxies=({"http": px, "https": px} if px else None))
+        if r.status_code != 200:
+            _YY_ERR["last"] = "كود %d" % r.status_code
+            return None
+        t = r.content.decode("utf-8", "ignore")
+        if len(t) < 500 or "cf-browser-verification" in t or "Just a moment" in t[:3000]:
+            _YY_ERR["last"] = "صفحة تحقق (Cloudflare)"
+            return None
+        return t
+    except requests.Timeout:
+        _YY_ERR["last"] = "انتهى الوقت (Timeout)"
+    except Exception as e:
+        _YY_ERR["last"] = str(e)[:80]
+    return None
+
+
+def _yy_anchors(page, base):
+    """(رابط كامل، نص) لكل لينك داخل الموقع نفسه."""
+    res = []
+    for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", page or "", re.S | re.I):
+        hm = re.search(r'href="([^"]+)"', m.group(1))
+        if not hm:
+            continue
+        u = urljoin(base, _html.unescape(hm.group(1))).split("#")[0]
+        if not u.startswith(YOYO + "/"):
+            continue
+        txt = _mz_clean(m.group(2)) + " " + " ".join(re.findall(r'(?:alt|title)="([^"]*)"', m.group(0)))
+        res.append((u, txt))
+    return res
+
+
+def _yy_title(page):
+    m = re.search(r"<h1[^>]*>(.*?)</h1>\s*(?:<p[^>]*>(.*?)</p>)?", page or "", re.S)
+    if not m:
+        return ws_title(page)
+    t = re.sub(r"^\s*سيرفرات\s+تحميل\s*:?\s*", "", _mz_clean(m.group(1)))
+    sub = _mz_clean(m.group(2)) if m.group(2) else ""
+    return (t + (" · " + sub if sub else "")).strip()
+
+
+def yoyo_links(page, hosts):
+    """روابط السيرفرات من صفحة /download/ (أزرار data-ad-placement=download)."""
+    out, seen = [], set()
+    for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", page or "", re.S | re.I):
+        at = m.group(1)
+        if 'data-ad-placement="download"' not in at:
+            continue
+        hm = re.search(r'href="([^"]+)"', at)
+        if not hm:
+            continue
+        u = _html.unescape(hm.group(1)).strip()
+        if not u.startswith("http") or u in seen:
+            continue
+        seen.add(u)
+        h = urlparse(u).netloc.lower().replace("www.", "")
+        d = _host_ok(h, hosts)
+        inner = _mz_clean(m.group(2))
+        out.append({"url": u, "host": d or h, "quality": _q_guess(inner, u),
+                    "size": _size_txt(inner), "ok": bool(d)})
+    return out
+
+
+def _yy_norm(u):
+    """أي رابط حلقة/فيلم (watch أو download) → رابط صفحة التحميل."""
+    m = _YY_EP.search(u)
+    if m:
+        return "%s/download/series/%s/season/%s/episode/%s" % (YOYO, m.group(1), m.group(2), m.group(3))
+    m = _YY_MV.search(u)
+    if m:
+        return "%s/download/movie/%s" % (YOYO, m.group(1))
+    return None
+
+
+def _yy_expand(url, want):
+    """رابط (حلقة / فيلم / صفحة مسلسل) → قايمة صفحات تحميل مطلوبة."""
+    dl = _yy_norm(url)
+    page = _yy_get(dl or url)
+    if not page and dl and "/download/movie/" in dl:
+        page = _yy_get(dl.replace("/download/movie/", "/download/movies/"))
+    if not page:
+        return [dl] if dl else []
+    txt = page.replace("\\/", "/")
+    eps = {}
+    for m in _YY_EP.finditer(txt):
+        eps.setdefault((int(m.group(2)), int(m.group(3))),
+                       "%s/download/series/%s/season/%s/episode/%s" % (YOYO, m.group(1), m.group(2), m.group(3)))
+    if eps:
+        keys = sorted(eps)
+        if want:
+            sel = [k for k in keys if k[1] in want]
+            if not sel and dl:
+                return [dl]
+            keys = sel or keys
+        elif dl:
+            return [dl]
+        return [eps[k] for k in keys[:8 if want else 10]]
+    if dl:
+        return [dl]
+    mv = _YY_MV.search(txt)
+    return ["%s/download/movie/%s" % (YOYO, mv.group(1))] if mv else []
+
+
+def _yoyo_search(q):
+    hosts = ws_hosts()["hosts"]
+    notes = []
+    nums = {int(x) for x in re.findall(r"\d+", q.translate(_AR_DIG)) if len(x) <= 4}
+    sq = re.sub(r"\d+", " ", _CL_STOP.sub(" ", q.translate(_AR_DIG))).strip() or q
+    cands, seen, got = [], set(), 0
+    for key in ("q", "query", "search", "s", "keyword"):
+        su = YOYO + "/search?%s=%s" % (key, quote(sq))
+        sres = _yy_get(su)
+        if not sres:
+            continue
+        got += 1
+        for au, txt in _yy_anchors(sres, su):
+            p = urlparse(au).path
+            if not (_YY_EP.search(p) or _YY_MV.search(p) or _YY_DET.match(p)) or len(txt) > 600:
+                continue
+            k = _yy_norm(au) or au.split("?")[0].rstrip("/")
+            if k in seen:
+                continue
+            rel = ws_rel(sq, txt + " " + unquote(au))
+            if rel > 0:
+                seen.add(k)
+                em = _YY_EP.search(p)
+                bonus = 0.5 if (nums and em and int(em.group(3)) in nums) else 0
+                cands.append((rel + bonus, au))
+        if cands:
+            break
+    if not got:
+        return jsonify(error="موقع Yoyo رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي (YOYO_PROXY)." % (_YY_ERR["last"] or "مجهول")), 502
+    cands.sort(key=lambda x: -x[0])
+    cands = cands[:5]
+    if not cands:
+        return jsonify(items=[], found=0, notes=[
+            "مفيش نتايج ليها علاقة بالاسم في Yoyo (أو صفحة البحث بتحمّل النتايج بالجافاسكريبت ومش ظاهرة للسيرفر)"])
+
+    targets = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for lst in ex.map(lambda c: _yy_expand(c[1], nums), cands):
+            for u in lst:
+                if u not in targets:
+                    targets.append(u)
+    targets = targets[:20]
+
+    def work(u):
+        page = _yy_get(u)
+        if not page and "/download/movie/" in u:
+            page = _yy_get(u.replace("/download/movie/", "/download/movies/"))
+        if not page:
+            return None
+        return {"title": _yy_title(page), "page": u, "links": yoyo_links(page, hosts) or _cl_loose_links(page, u, hosts)}
+
+    items, skipped = [], 0
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for r in ex.map(work, targets):
+            if not r:
+                continue
+            good = [l for l in r["links"] if l["ok"]]
+            skipped += len(r["links"]) - len(good)
+            if good:
+                r["links"] = good
+                items.append(r)
+    if skipped:
+        notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
+    items = _title_guard(sq, items, notes)
+    return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
+
+
 @app.post("/sitesearch")
 def sitesearch():
     b = request.get_json(silent=True) or {}
     q = str(b.get("q") or "").strip()[:120]
     if not q:
         return jsonify(error="اكتب اسم العمل"), 400
-    if str(b.get("site") or "") in ("ahwak", "cimalight", "cima"):
-        return _cima_search(q)
+    if str(b.get("site") or "") in ("yoyo", "yoyo-cinema", "ahwak", "cimalight", "cima"):
+        return _yoyo_search(q)
     hosts = ws_hosts()["hosts"]
     notes = []
     sres = _mz_get(MOVIZ + "/?s=" + quote(q))
