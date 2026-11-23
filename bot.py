@@ -4340,6 +4340,41 @@ def _yy_expand(url, want):
     return ["%s/download/movie/%s" % (YOYO, mv.group(1))] if mv else []
 
 
+def _yy_diag(sq):
+    """تشخيص لما البحث يرجع فاضي: هل النتايج ظاهرة في HTML ولا بتتحمّل من قاعدة بيانات بالجافاسكريبت؟"""
+    su = YOYO + "/search?q=" + quote(sq)
+    pg = _yy_get(su)
+    if not pg:
+        return ["تشخيص: مقدرتش أفتح صفحة البحث (%s)" % (_YY_ERR["last"] or "؟")]
+    nl = sum(1 for u, _ in _yy_anchors(pg, su)
+             if _YY_EP.search(u) or _YY_MV.search(u) or _YY_DET.match(urlparse(u).path))
+    out = ["تشخيص: الصفحة %d حرف · الكلمة ظهرت %d مرة · روابط أعمال %d" % (len(pg), pg.count(sq), nl)]
+    srcs = []
+    for m in re.finditer(r'(?:src|href)="([^"]+\.js)"', pg):
+        u = urljoin(YOYO + "/", m.group(1))
+        if u.startswith(YOYO + "/") and u not in srcs:
+            srcs.append(u)
+    found = {"pid": set(), "key": set(), "col": set(), "fn": set()}
+
+    def scan(u):
+        t = _yy_get(u)
+        if not t:
+            return
+        t = t.replace("\\/", "/")
+        found["pid"].update(re.findall(r'projectId\W{1,3}([a-z0-9\-]{4,40})', t))
+        found["key"].update(re.findall(r'AIza[0-9A-Za-z_\-]{35}', t))
+        found["fn"].update(re.findall(r'/_serverFn/[A-Za-z0-9_\-%.]+', t))
+        if re.search(r"ext-db|servers-db|catalog|firebase", u):
+            found["col"].update(re.findall(r'\(\s*[A-Za-z_$][\w$]*\s*,\s*"([a-z][A-Za-z0-9_]{2,25})"\s*[,)]', t))
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(scan, srcs[:30]))
+    for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn")):
+        if found[k]:
+            out.append("تشخيص %s: %s" % (lab, " | ".join(sorted(found[k])[:25])))
+    return out
+
+
 def _yoyo_search(q):
     hosts = ws_hosts()["hosts"]
     notes = []
@@ -4373,7 +4408,7 @@ def _yoyo_search(q):
     cands = cands[:5]
     if not cands:
         return jsonify(items=[], found=0, notes=[
-            "مفيش نتايج ليها علاقة بالاسم في Yoyo (أو صفحة البحث بتحمّل النتايج بالجافاسكريبت ومش ظاهرة للسيرفر)"])
+            "مفيش نتايج ليها علاقة بالاسم في Yoyo (أو صفحة البحث بتحمّل النتايج بالجافاسكريبت ومش ظاهرة للسيرفر)"] + _yy_diag(sq))
 
     targets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
@@ -4404,6 +4439,9 @@ def _yoyo_search(q):
     if skipped:
         notes.append("استبعدت %d رابط على مواقع مش مدعومة عندك" % skipped)
     items = _title_guard(sq, items, notes)
+    if not items and targets:
+        notes.append("لقيت %d صفحة تحميل بس مفيهاش روابط ظاهرة في HTML (الروابط بتتحمّل بالجافاسكريبت)" % len(targets))
+        notes += _yy_diag(sq)
     return jsonify(items=items, notes=notes, found=sum(len(i["links"]) for i in items))
 
 
