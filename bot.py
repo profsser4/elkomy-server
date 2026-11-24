@@ -4439,10 +4439,117 @@ def _yy_diag(sq):
     scan(su, pg)
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(scan, srcs[:30]))
+    try:
+        sch = _sb_schema()
+        out.append("تشخيص Supabase جداول: " + " | ".join("%s(%s)" % (t, ",".join(c[:14] for c in cols[:12])) for t, cols in list(sch.items())[:12]))
+    except Exception as e:
+        out.append("تشخيص Supabase: %s" % str(e)[:120])
     for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn"), ("api", "api"), ("ext", "ext")):
         if found[k]:
             out.append("تشخيص %s: %s" % (lab, " | ".join(sorted(found[k])[:25])))
     return out
+
+
+SB_URL = "https://jfibkncnpwuuvbkelcfr.supabase.co"
+SB_KEY = "sb_publishable_7taQr1nZvktj0smOaghYUg_sYeqBpos"   # مفتاح عام (publishable) مدمج في كود موقع Yoyo نفسه
+_SB_CACHE = {"schema": None}
+_TITLE_COLS = ("title", "name", "title_ar", "name_ar", "arabic_title", "original_title", "slug")
+
+
+def _sb_get(path, params=None):
+    px = (os.environ.get("YOYO_PROXY") or os.environ.get("CIMA_PROXY") or "").strip()
+    r = requests.get(SB_URL + path, params=params, headers={"apikey": SB_KEY}, timeout=15,
+                     proxies=({"http": px, "https": px} if px else None))
+    if r.status_code != 200:
+        raise Exception("Supabase كود %d: %s" % (r.status_code, r.text[:80]))
+    return r.json()
+
+
+def _sb_schema():
+    """جداول وأعمدة قاعدة Yoyo من OpenAPI (لو مسموحة بالمفتاح العام)."""
+    if _SB_CACHE["schema"] is None:
+        d = _sb_get("/rest/v1/")
+        _SB_CACHE["schema"] = {t: list((v.get("properties") or {}).keys())
+                               for t, v in (d.get("definitions") or {}).items()}
+    return _SB_CACHE["schema"]
+
+
+def _yy_supabase(sq):
+    """بحث مباشر في قاعدة بيانات Yoyo (نفس اللي الموقع بيستخدمه). بيرجّع [(rel, رابط)]."""
+    sch = _sb_schema()
+    toks = sorted({re.sub(r"[^\w]", "", w) for w in re.split(r"\s+", sq) if len(w) >= 3}, key=len, reverse=True)
+    if not toks:
+        return []
+    tok = toks[0]
+    out = {}
+    for tb, cols in sch.items():
+        tc = [c for c in _TITLE_COLS if c in cols]
+        if not tc:
+            continue
+        try:
+            rows = _sb_get("/rest/v1/" + tb, {"select": "*", "limit": "12",
+                                              "or": "(" + ",".join("%s.ilike.*%s*" % (c, tok) for c in tc) + ")"})
+        except Exception:
+            continue
+        for row in rows if isinstance(rows, list) else []:
+            title = " ".join(str(row.get(c) or "") for c in tc)
+            rel = ws_rel(sq, title)
+            if rel <= 0:
+                continue
+            rid, slug, low = row.get("id"), row.get("slug"), tb.lower()
+            kind = str(row.get("type") or row.get("kind") or row.get("content_type") or low).lower()
+            sid = row.get("series_id")
+            if "episode" in low and sid and row.get("season") is not None and row.get("episode") is not None:
+                url = "%s/download/series/%s/season/%s/episode/%s" % (YOYO, sid, row["season"], row["episode"])
+            elif "series" in kind or "tv" in kind or "show" in kind:
+                url = (YOYO + "/series/" + quote(str(slug))) if slug else ("%s/watch/series/%s/season/1/episode/1" % (YOYO, rid))
+            elif rid:
+                url = "%s/download/movie/%s" % (YOYO, rid)
+            else:
+                continue
+            out[url] = max(out.get(url, 0), rel)
+    return sorted(((r, u) for u, r in out.items()), reverse=True)[:5]
+
+
+_YY_DET2 = re.compile(r"^/(?:movie|series)/[^/?#]+/?$")
+_YY_BROWSE = ("/", "/latest", "/movies", "/series", "/movies?sort=latest", "/series?sort=latest",
+              "/movies/arabic-movies", "/movies/foreign-movies", "/series/arabic-series",
+              "/series/foreign-series", "/series/turkish-series", "/movies?sort=popular")
+
+
+def _yy_browse(sq):
+    """بديل لما بحث الموقع يطلع فاضي (بيتحمّل بالجافاسكريبت): بنفتح صفحات القوايم اللي السيرفر بيشوفها
+    (الرئيسية والأحدث والأفلام والمسلسلات) وبنفلتر العناوين بالاسم. بيغطي الأعمال الحديثة بس."""
+    pages = {}
+
+    def get(p):
+        pages[p] = _yy_get(YOYO + p)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(get, _YY_BROWSE))
+    found = {}
+    for p, pg in pages.items():
+        if not pg:
+            continue
+        base = YOYO + p
+        for au, txt in _yy_anchors(pg, base):
+            pth = urlparse(au).path
+            if len(txt) > 600 or not (_YY_EP.search(pth) or _YY_MV.search(pth) or _YY_DET2.match(pth)):
+                continue
+            rel = ws_rel(sq, txt + " " + unquote(au))
+            if rel > 0:
+                k = _yy_norm(au) or au.split("?")[0].rstrip("/")
+                found[k] = max(found.get(k, (0, au)), (rel, au))
+        # عناوين الـ hero: <h2>العنوان</h2> ... href="/series/slug" أو "/movie/slug"
+        for m in re.finditer(r"<h2[^>]*>(.*?)</h2>", pg, re.S):
+            title = _mz_clean(m.group(1))
+            hm = re.search(r'href="(/(?:movie|series)/[^"/?#]+)"', pg[m.end():m.end() + 4000])
+            if title and hm:
+                rel = ws_rel(sq, title)
+                if rel > 0:
+                    au = YOYO + _html.unescape(hm.group(1))
+                    found[au] = max(found.get(au, (0, au)), (rel, au))
+    return sorted(found.values(), key=lambda x: -x[0])[:5], sum(1 for v in pages.values() if v)
 
 
 def _yoyo_search(q):
@@ -4476,6 +4583,17 @@ def _yoyo_search(q):
         return jsonify(error="موقع Yoyo رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي (YOYO_PROXY)." % (_YY_ERR["last"] or "مجهول")), 502
     cands.sort(key=lambda x: -x[0])
     cands = cands[:5]
+    if not cands:
+        try:
+            cands = _yy_supabase(sq)
+            if cands:
+                notes.append("لقيت النتايج من قاعدة بيانات Yoyo مباشرة")
+        except Exception as e:
+            notes.append("بحث قاعدة بيانات Yoyo فشل: %s" % str(e)[:100])
+    if not cands:
+        cands, okp = _yy_browse(sq)
+        if cands:
+            notes.append("بحث Yoyo بيتحمّل بالجافاسكريبت، فدوّرت في قوايم الموقع (الأحدث والأفلام والمسلسلات) وده بيغطي الأعمال الحديثة بس")
     if not cands:
         return jsonify(items=[], found=0, notes=[
             "مفيش نتايج ليها علاقة بالاسم في Yoyo (أو صفحة البحث بتحمّل النتايج بالجافاسكريبت ومش ظاهرة للسيرفر)"] + _yy_diag(sq))
