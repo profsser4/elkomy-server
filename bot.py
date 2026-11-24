@@ -3972,8 +3972,12 @@ def websearch():
             continue
         h = urlparse(u).netloc.lower().replace("www.", "")
         rel = ws_rel(title, ttl + " " + snip + " " + unquote(u))
+        junk = bool(re.search(r"trailer|teaser|promo|تريلر|إعلان|اعلان|برومو|اعلان تشويقي", (ttl + " " + snip).lower())) \
+            or "/clck/" in u or h in ("yandex.ru", "ya.ru")
         if _host_ok(h, hosts):
-            if rel > 0:
+            if junk:
+                dropped += 1
+            elif rel > 0:
                 direct.append({"url": u, "title": ttl, "page": u, "rel": rel})
             else:
                 dropped += 1       # رابط موقع مدعوم بس مالوش علاقة باسم العمل
@@ -3990,7 +3994,34 @@ def websearch():
             txt, fu = _fetch_html(u)
             if txt is None:
                 return {"url": u, "title": ttl, "links": [], "status": "مش بيفتح"}
-            return {"url": u, "title": ws_title(txt) or ttl, "links": ws_extract(txt, fu, hosts), "status": "تمام", "rel": rel0}
+            links = ws_extract(txt, fu, hosts)
+            status = "تمام"
+            if len(links) < 3:
+                # روابط التحميل غالباً في صفحة فرعية: بنتبع لحد 4 روابط "تحميل/download/سيرفرات" من نفس الصفحة
+                subs = []
+                for au, at in _yy_anchors(txt, fu):
+                    low = (at + " " + unquote(au)).lower()
+                    if au.split("#")[0] == fu or not _public_url(au) or _host_ok(urlparse(au).netloc.lower().replace("www.", ""), WS_SKIP_PAGES):
+                        continue
+                    if any(k in low for k in ("download", "تحميل", "تنزيل", "حمل", "سيرفر", "/dl/", "get-link", "links")) and len(at) < 80:
+                        if au not in subs:
+                            subs.append(au)
+                    if len(subs) >= 4:
+                        break
+
+                def sub(au):
+                    try:
+                        t2, f2 = _fetch_html(au)
+                        return ws_extract(t2, f2, hosts) if t2 else []
+                    except Exception:
+                        return []
+
+                if subs:
+                    with ThreadPoolExecutor(max_workers=4) as exs:
+                        for r2 in exs.map(sub, subs):
+                            links += [x for x in r2 if x not in links]
+                    status = "تمام (+%d صفحة تحميل)" % len(subs)
+            return {"url": u, "title": ws_title(txt) or ttl, "links": links, "status": status, "rel": rel0}
         except Exception as e:
             return {"url": u, "title": ttl, "links": [], "status": "فشل: " + str(e)[:50]}
 
@@ -4567,41 +4598,78 @@ def _sb_schema():
     return _SB_CACHE["schema"]
 
 
-def _yy_supabase(sq):
-    """بحث مباشر في قاعدة بيانات Yoyo (نفس اللي الموقع بيستخدمه). بيرجّع [(rel, رابط)]."""
-    sch = _sb_schema()
-    toks = sorted({re.sub(r"[^\w]", "", w) for w in re.split(r"\s+", sq) if len(w) >= 3}, key=len, reverse=True)
-    if not toks:
+_HAMZA = str.maketrans("أإآى", "اااي")
+
+
+def _yy_supabase(sq, nums=()):
+    """بحث مباشر في قاعدة بيانات Yoyo (جداول movies / series / episodes زي ما الموقع بيعمل).
+    بيرجّع [(rel, رابط صفحة تحميل)] جاهزة من غير ما نفتح صفحة البحث."""
+    t = re.sub(r"[%,()*]", " ", sq).strip()
+    n = re.sub(r"^(مشاهدة|تحميل|فيلم|مسلسل|انمي|مسرحية)\s+", "", t)
+    n = re.sub(r"\s+(مترجم|مدبلج|كامل|اون\s*لاين|اونلاين|HD)\b.*", "", n, flags=re.I).strip()
+    vs = []
+    for v in (t, n, t.translate(_HAMZA), n.translate(_HAMZA)):
+        if len(v) >= 2 and v not in vs:
+            vs.append(v)
+    if not vs:
         return []
-    tok = toks[0]
+    orx = ",".join("title.ilike.*%s*,original_title.ilike.*%s*" % (v, v) for v in vs)
+    ort = ",".join("title.ilike.*%s*" % v for v in vs)
+
+    def get(tb, params):
+        return _sb_get("/rest/v1/" + tb, params)
+
+    errs, res = [], {}
+    jobs = {
+        "movies": ("movies", {"select": "id,title,original_title,slug", "or": "(%s)" % orx, "limit": "30"}),
+        "series": ("series", {"select": "id,title,original_title,slug", "or": "(%s)" % orx, "limit": "30"}),
+        "eps": ("episodes", {"select": "id,title,series_id,episode_number,season:season_id(season_number)",
+                             "or": "(%s)" % ort, "limit": "20"}),
+    }
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {k: ex.submit(get, *v) for k, v in jobs.items()}
+        for k, f in futs.items():
+            try:
+                res[k] = f.result()
+            except Exception as e:
+                errs.append(str(e)[:100])
+                res[k] = []
+    if len(errs) == 3:
+        raise Exception(errs[0])
+
+    def rel_of(*txt):
+        return ws_rel(sq, " ".join(str(x or "") for x in txt)) or 0.1   # القاعدة أصلاً رجّعته بالاسم
+
     out = {}
-    for tb, cols in sch.items():
-        tc = [c for c in _TITLE_COLS if c in cols]
-        if not tc:
-            continue
+    for r in res["movies"]:
+        if r.get("id"):
+            out["%s/download/movie/%s" % (YOYO, r["id"])] = rel_of(r.get("title"), r.get("original_title"))
+    for r in res["eps"]:
+        sn = ((r.get("season") or {}) if isinstance(r.get("season"), dict) else {}).get("season_number") or 1
+        if r.get("series_id") and r.get("episode_number") is not None:
+            out["%s/download/series/%s/season/%s/episode/%s" % (YOYO, r["series_id"], sn, r["episode_number"])] = \
+                rel_of(r.get("title")) + 0.2
+    ser = sorted(res["series"], key=lambda r: -rel_of(r.get("title"), r.get("original_title")))[:3]
+
+    def eps_of(r):
         try:
-            rows = _sb_get("/rest/v1/" + tb, {"select": "*", "limit": "12",
-                                              "or": "(" + ",".join("%s.ilike.*%s*" % (c, tok) for c in tc) + ")"})
+            return r, get("episodes", {"select": "episode_number,season:season_id(season_number)",
+                                       "series_id": "eq.%s" % r["id"], "order": "episode_number.asc", "limit": "80"})
         except Exception:
-            continue
-        for row in rows if isinstance(rows, list) else []:
-            title = " ".join(str(row.get(c) or "") for c in tc)
-            rel = ws_rel(sq, title)
-            if rel <= 0:
-                continue
-            rid, slug, low = row.get("id"), row.get("slug"), tb.lower()
-            kind = str(row.get("type") or row.get("kind") or row.get("content_type") or low).lower()
-            sid = row.get("series_id")
-            if "episode" in low and sid and row.get("season") is not None and row.get("episode") is not None:
-                url = "%s/download/series/%s/season/%s/episode/%s" % (YOYO, sid, row["season"], row["episode"])
-            elif "series" in kind or "tv" in kind or "show" in kind:
-                url = (YOYO + "/series/" + quote(str(slug))) if slug else ("%s/watch/series/%s/season/1/episode/1" % (YOYO, rid))
-            elif rid:
-                url = "%s/download/movie/%s" % (YOYO, rid)
-            else:
-                continue
-            out[url] = max(out.get(url, 0), rel)
-    return sorted(((r, u) for u, r in out.items()), reverse=True)[:5]
+            return r, []
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for r, eps in ex.map(eps_of, ser):
+            rl = rel_of(r.get("title"), r.get("original_title"))
+            rows = []
+            for e in eps:
+                sn = ((e.get("season") or {}) if isinstance(e.get("season"), dict) else {}).get("season_number") or 1
+                if e.get("episode_number") is None or (nums and int(e["episode_number"]) not in nums):
+                    continue
+                rows.append((sn, int(e["episode_number"])))
+            for sn, en in sorted(rows)[:30]:
+                out["%s/download/series/%s/season/%s/episode/%s" % (YOYO, r["id"], sn, en)] = rl
+    return sorted(((v, u) for u, v in out.items()), key=lambda x: -x[0])[:30]
 
 
 _YY_DET2 = re.compile(r"^/(?:movie|series)/[^/?#]+/?$")
@@ -4676,10 +4744,12 @@ def _yoyo_search(q):
         return jsonify(error="موقع Yoyo رفض السيرفر (%s). غالباً بيحظر عناوين السيرفرات، جرّب تشغّل البوت من IP تاني أو بروكسي (YOYO_PROXY)." % (_YY_ERR["last"] or "مجهول")), 502
     cands.sort(key=lambda x: -x[0])
     cands = cands[:5]
+    pre_targets = None
     if not cands:
         try:
-            cands = _yy_supabase(sq)
+            cands = _yy_supabase(sq, nums)
             if cands:
+                pre_targets = [u for _, u in cands]
                 notes.append("لقيت النتايج من قاعدة بيانات Yoyo مباشرة")
         except Exception as e:
             notes.append("بحث قاعدة بيانات Yoyo فشل: %s" % str(e)[:100])
@@ -4692,12 +4762,15 @@ def _yoyo_search(q):
             "مفيش نتايج ليها علاقة بالاسم في Yoyo (أو صفحة البحث بتحمّل النتايج بالجافاسكريبت ومش ظاهرة للسيرفر)"] + _yy_diag(sq))
 
     targets = []
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        for lst in ex.map(lambda c: _yy_expand(c[1], nums), cands):
-            for u in lst:
-                if u not in targets:
-                    targets.append(u)
-    targets = targets[:20]
+    if pre_targets:
+        targets = pre_targets[:30]
+    else:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for lst in ex.map(lambda c: _yy_expand(c[1], nums), cands):
+                for u in lst:
+                    if u not in targets:
+                        targets.append(u)
+        targets = targets[:20]
 
     def work(u):
         page = _yy_get(u)
