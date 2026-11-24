@@ -2861,8 +2861,41 @@ def clean_torbox(k):
                json={"webdl_id": x["id"], "operation": "delete"})
 
 
+def _web_key(u):
+    """مفتاح موحّد للرابط: يوتيوب بالـ video id، والباقي من غير fragment/سلاش آخر"""
+    u = str(u or "").strip()
+    m = re.search(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|embed/|live/))([\w-]{11})", u)
+    if m:
+        return "yt:" + m.group(1)
+    u = u.split("#", 1)[0].rstrip("/")
+    return re.sub(r"^https?://(www\.)?", "", u.lower())
+
+
+def find_existing_web(k, q):
+    """بدور في حساب TorBox على نفس الرابط اتحمّل قبل كده (جاهز أو لسه بيجهز)"""
+    want = _web_key(q)
+    try:
+        items = tb(k, "GET", "/webdl/mylist",
+                   params={"bypass_cache": "true"}).get("data") or []
+    except Exception:
+        return None
+    best = None
+    for x in (items if isinstance(items, list) else []):
+        if _web_key(x.get("original_url") or x.get("url")) != want:
+            continue
+        st = str(x.get("download_state", "")).lower()
+        if st in ("error", "failed", "expired"):
+            continue
+        if is_ready(x):
+            return x.get("id")  # الجاهز أولوية
+        best = best or x.get("id")
+    return best
+
+
 def torbox_web(p, q, web_id=None):
     k = p["key"]
+    if not web_id:
+        web_id = find_existing_web(k, q)
     if not web_id:
         add = tb(k, "POST", "/webdl/createwebdownload", data={"link": q})
         msg = str(add.get("detail") or add.get("error") or "").lower()
@@ -4354,7 +4387,11 @@ def _yy_diag(sq):
         u = urljoin(YOYO + "/", m.group(1))
         if u.startswith(YOYO + "/") and u not in srcs:
             srcs.append(u)
-    found = {"pid": set(), "key": set(), "col": set(), "fn": set()}
+    found = {"pid": set(), "key": set(), "col": set(), "fn": set(), "api": set(), "ext": set()}
+    out.append("تشخيص: ملفات JS اتلقت %d · روابط الأعمال: %s" % (
+        len(srcs), " | ".join(sorted({urlparse(u).path[:40] for u, _ in _yy_anchors(pg, su)
+                                      if _YY_EP.search(u) or _YY_MV.search(u) or _YY_DET.match(urlparse(u).path)})[:6]) or "-"))
+    out.append("تشخيص نص الصفحة: " + _mz_clean(re.sub(r"<(script|style)\b.*?</\1>", " ", pg, flags=re.S | re.I))[:200])
 
     def scan(u):
         t = _yy_get(u)
@@ -4364,12 +4401,14 @@ def _yy_diag(sq):
         found["pid"].update(re.findall(r'projectId\W{1,3}([a-z0-9\-]{4,40})', t))
         found["key"].update(re.findall(r'AIza[0-9A-Za-z_\-]{35}', t))
         found["fn"].update(re.findall(r'/_serverFn/[A-Za-z0-9_\-%.]+', t))
+        found["api"].update(re.findall(r'["\'`](/api/[A-Za-z0-9_\-/.?=&]{2,70})["\'`]', t))
+        found["ext"].update(re.findall(r'https://[a-z0-9.\-]*(?:googleapis|firebaseio|firebase|supabase|workers\.dev|vercel\.app|convex|algolia|typesense|meilisearch)[a-z0-9./\-]*', t, re.I))
         if re.search(r"ext-db|servers-db|catalog|firebase", u):
             found["col"].update(re.findall(r'\(\s*[A-Za-z_$][\w$]*\s*,\s*"([a-z][A-Za-z0-9_]{2,25})"\s*[,)]', t))
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(scan, srcs[:30]))
-    for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn")):
+    for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn"), ("api", "api"), ("ext", "ext")):
         if found[k]:
             out.append("تشخيص %s: %s" % (lab, " | ".join(sorted(found[k])[:25])))
     return out
@@ -4591,8 +4630,24 @@ def r_alldebrid(k, u):
                      params={"agent": "Elkomy", "apikey": k, "link": u},
                      timeout=20)
     res = jj(r)
-    if res.get("status") == "success" and res.get("data", {}).get("link"):
-        return res["data"]["link"]
+    data = res.get("data") or {}
+    if res.get("status") == "success" and data.get("link"):
+        return data["link"]
+    # مواقع الستريم (زي يوتيوب) AllDebrid بيجهزها في الخلفية ويرجّع delayed id
+    # نفس الرابط بيرجّع نفس الـ id فمفيش تحميل مكرر، بنستنى لحد ما يجهز
+    if res.get("status") == "success" and data.get("delayed"):
+        did = data["delayed"]
+        for _ in range(12):
+            time.sleep(2)
+            rr = jj(requests.get("https://api.alldebrid.com/v4/link/delayed",
+                                 params={"agent": "Elkomy", "apikey": k, "id": did},
+                                 timeout=20))
+            dd = rr.get("data") or {}
+            if dd.get("status") == 2 and dd.get("link"):
+                return dd["link"]
+            if dd.get("status") == 3:
+                raise Exception("AllDebrid فشل يجهّز الرابط")
+        raise Exception("AllDebrid لسه بيجهّز الرابط، جرّب تاني بعد شوية (مش هيبدأ من الأول)")
     raise Exception(str(res.get("error", {}).get("message", "فشل")))
 
 
