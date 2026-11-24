@@ -4545,11 +4545,6 @@ def _yy_diag(sq):
     scan(su, pg)
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(scan, srcs[:30]))
-    try:
-        sch = _sb_schema()
-        out.append("تشخيص Supabase جداول: " + " | ".join("%s(%s)" % (t, ",".join(c[:14] for c in cols[:12])) for t, cols in list(sch.items())[:12]))
-    except Exception as e:
-        out.append("تشخيص Supabase: %s" % str(e)[:120])
     for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn"), ("api", "api"), ("ext", "ext")):
         if found[k]:
             out.append("تشخيص %s: %s" % (lab, " | ".join(sorted(found[k])[:25])))
@@ -4598,43 +4593,42 @@ def _sb_schema():
     return _SB_CACHE["schema"]
 
 
-_HAMZA = str.maketrans("أإآى", "اااي")
+def _sb_pat(v):
+    """نفس تحويل موقع Yoyo للبحث: بنشيل التشكيل، وحروف (أإآا ة/ه ي/ى/ئ) بتبقى أي حرف، و% → *."""
+    v = re.sub(r"[\u064B-\u065F\u0670]", "", v)
+    v = re.sub(r'["\\*_]', "_", v)
+    v = re.sub(r"[أإآاٱةهيىئ]", "_", v)
+    return "*" + v.replace("%", "*") + "*"
 
 
 def _yy_supabase(sq, nums=()):
-    """بحث مباشر في قاعدة بيانات Yoyo (جداول movies / series / episodes زي ما الموقع بيعمل).
+    """بحث مباشر في قاعدة Yoyo: كل البيانات في جدول docs (collection = movies / series / seasons / episodes).
     بيرجّع [(rel, رابط صفحة تحميل)] جاهزة من غير ما نفتح صفحة البحث."""
-    t = re.sub(r"[%,()*]", " ", sq).strip()
+    t = re.sub(r"[%,()*\"]", " ", sq).strip()
     n = re.sub(r"^(مشاهدة|تحميل|فيلم|مسلسل|انمي|مسرحية)\s+", "", t)
     n = re.sub(r"\s+(مترجم|مدبلج|كامل|اون\s*لاين|اونلاين|HD)\b.*", "", n, flags=re.I).strip()
-    vs = []
-    for v in (t, n, t.translate(_HAMZA), n.translate(_HAMZA)):
-        if len(v) >= 2 and v not in vs:
-            vs.append(v)
+    vs = [v for i, v in enumerate((t, n)) if len(v) >= 2 and v not in (t, n)[:i]]
     if not vs:
         return []
-    orx = ",".join("title.ilike.*%s*,original_title.ilike.*%s*" % (v, v) for v in vs)
-    ort = ",".join("title.ilike.*%s*" % v for v in vs)
+    orx = ",".join('data->>title.ilike."%s",data->>original_title.ilike."%s"' % (_sb_pat(v), _sb_pat(v)) for v in vs)
 
-    def get(tb, params):
-        return _sb_get("/rest/v1/" + tb, params)
+    def get(params):
+        return _sb_get("/rest/v1/docs", params)
+
+    def find(coll):
+        return get({"collection": "eq." + coll, "or": "(%s)" % orx, "limit": "30",
+                    "select": "id,title:data->title,original_title:data->original_title,status:data->status"})
 
     errs, res = [], {}
-    jobs = {
-        "movies": ("movies", {"select": "id,title,original_title,slug", "or": "(%s)" % orx, "limit": "30"}),
-        "series": ("series", {"select": "id,title,original_title,slug", "or": "(%s)" % orx, "limit": "30"}),
-        "eps": ("episodes", {"select": "id,title,series_id,episode_number,season:season_id(season_number)",
-                             "or": "(%s)" % ort, "limit": "20"}),
-    }
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        futs = {k: ex.submit(get, *v) for k, v in jobs.items()}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = {k: ex.submit(find, k) for k in ("movies", "series")}
         for k, f in futs.items():
             try:
-                res[k] = f.result()
+                res[k] = [r for r in f.result() if r.get("status") in (None, "published")]
             except Exception as e:
                 errs.append(str(e)[:100])
                 res[k] = []
-    if len(errs) == 3:
+    if len(errs) == 2:
         raise Exception(errs[0])
 
     def rel_of(*txt):
@@ -4644,29 +4638,33 @@ def _yy_supabase(sq, nums=()):
     for r in res["movies"]:
         if r.get("id"):
             out["%s/download/movie/%s" % (YOYO, r["id"])] = rel_of(r.get("title"), r.get("original_title"))
-    for r in res["eps"]:
-        sn = ((r.get("season") or {}) if isinstance(r.get("season"), dict) else {}).get("season_number") or 1
-        if r.get("series_id") and r.get("episode_number") is not None:
-            out["%s/download/series/%s/season/%s/episode/%s" % (YOYO, r["series_id"], sn, r["episode_number"])] = \
-                rel_of(r.get("title")) + 0.2
     ser = sorted(res["series"], key=lambda r: -rel_of(r.get("title"), r.get("original_title")))[:3]
 
     def eps_of(r):
         try:
-            return r, get("episodes", {"select": "episode_number,season:season_id(season_number)",
-                                       "series_id": "eq.%s" % r["id"], "order": "episode_number.asc", "limit": "80"})
+            sid = "eq.%s" % r["id"]
+            seas = get({"collection": "eq.seasons", "data->>series_id": sid, "limit": "200",
+                        "select": "id,season_number:data->season_number"})
+            eps = get({"collection": "eq.episodes", "data->>series_id": sid, "limit": "1000",
+                       "select": "id,episode_number:data->episode_number,season_id:data->season_id,status:data->status"})
+            return r, {x["id"]: x.get("season_number") for x in seas}, eps
         except Exception:
-            return r, []
+            return r, {}, []
 
     with ThreadPoolExecutor(max_workers=3) as ex:
-        for r, eps in ex.map(eps_of, ser):
+        for r, smap, eps in ex.map(eps_of, ser):
             rl = rel_of(r.get("title"), r.get("original_title"))
             rows = []
             for e in eps:
-                sn = ((e.get("season") or {}) if isinstance(e.get("season"), dict) else {}).get("season_number") or 1
-                if e.get("episode_number") is None or (nums and int(e["episode_number"]) not in nums):
+                if e.get("status") not in (None, "published") or e.get("episode_number") is None:
                     continue
-                rows.append((sn, int(e["episode_number"])))
+                try:
+                    en = int(e["episode_number"])
+                except Exception:
+                    continue
+                if nums and en not in nums:
+                    continue
+                rows.append((smap.get(e.get("season_id")) or 1, en))
             for sn, en in sorted(rows)[:30]:
                 out["%s/download/series/%s/season/%s/episode/%s" % (YOYO, r["id"], sn, en)] = rl
     return sorted(((v, u) for u, v in out.items()), key=lambda x: -x[0])[:30]
