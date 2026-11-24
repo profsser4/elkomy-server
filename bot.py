@@ -4012,12 +4012,38 @@ def moviz_links(page_html, hosts):
     return out
 
 
+_MZ_SESS = requests.Session()
+_MZ_ERR = {"last": ""}
+_MZ_HD = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Referer": MOVIZ + "/",
+}
+
+
 def _mz_get(u):
-    try:
-        t, _ = _fetch_html(u)
-        return t
-    except Exception:
-        return None
+    """بهيدرز متصفح موبايل ومهلة أطول وإعادة محاولة، وبيسجّل سبب الفشل. بروكسي اختياري من MOVIZ_PROXY (أو CIMA_PROXY)."""
+    px = (os.environ.get("MOVIZ_PROXY") or os.environ.get("CIMA_PROXY") or "").strip()
+    for _ in range(2):
+        try:
+            r = _MZ_SESS.get(u, headers=_MZ_HD, timeout=25, allow_redirects=True,
+                             proxies=({"http": px, "https": px} if px else None))
+            if r.status_code != 200:
+                _MZ_ERR["last"] = "كود %d" % r.status_code
+                if r.status_code in (403, 429, 503):
+                    return None
+                continue
+            t = r.content.decode("utf-8", "ignore")
+            if "Just a moment" in t[:3000] or "cf-browser-verification" in t:
+                _MZ_ERR["last"] = "صفحة تحقق (Cloudflare)"
+                return None
+            return t
+        except requests.Timeout:
+            _MZ_ERR["last"] = "انتهى الوقت (Timeout)"
+        except Exception as e:
+            _MZ_ERR["last"] = str(e)[:80]
+    return None
 
 
 def _mz_title(page_html):
@@ -4393,11 +4419,15 @@ def _yy_diag(sq):
                                       if _YY_EP.search(u) or _YY_MV.search(u) or _YY_DET.match(urlparse(u).path)})[:6]) or "-"))
     out.append("تشخيص نص الصفحة: " + _mz_clean(re.sub(r"<(script|style)\b.*?</\1>", " ", pg, flags=re.S | re.I))[:200])
 
-    def scan(u):
-        t = _yy_get(u)
+    def scan(u, txt=None):
+        t = txt if txt is not None else _yy_get(u)
         if not t:
             return
         t = t.replace("\\/", "/")
+        found["pid"].update(re.findall(r'projects/([a-z0-9\-]{4,40})/databases', t))
+        found["pid"].update(re.findall(r'([a-z0-9\-]{4,40})\.(?:firebaseapp\.com|appspot\.com|firebasestorage\.app)', t))
+        found["pid"].update(re.findall(r'(?:project_?id|PROJECT_ID)\W{1,4}([a-z0-9\-]{4,40})', t, re.I))
+        found["key"].update(re.findall(r'AIza[0-9A-Za-z_\-]{35}', t))
         found["pid"].update(re.findall(r'projectId\W{1,3}([a-z0-9\-]{4,40})', t))
         found["key"].update(re.findall(r'AIza[0-9A-Za-z_\-]{35}', t))
         found["fn"].update(re.findall(r'/_serverFn/[A-Za-z0-9_\-%.]+', t))
@@ -4406,6 +4436,7 @@ def _yy_diag(sq):
         if re.search(r"ext-db|servers-db|catalog|firebase", u):
             found["col"].update(re.findall(r'\(\s*[A-Za-z_$][\w$]*\s*,\s*"([a-z][A-Za-z0-9_]{2,25})"\s*[,)]', t))
 
+    scan(su, pg)
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(scan, srcs[:30]))
     for k, lab in (("pid", "projectId"), ("key", "apiKey"), ("col", "collections"), ("fn", "serverFn"), ("api", "api"), ("ext", "ext")):
@@ -4496,7 +4527,7 @@ def sitesearch():
     notes = []
     sres = _mz_get(MOVIZ + "/?s=" + quote(q))
     if not sres:
-        return jsonify(error="موقع MovizLand ما ردّش (ممكن بيحظر السيرفر أو واقع)"), 502
+        return jsonify(error="موقع MovizLand ما ردّش (%s). لو الموقع شغال عندك في المتصفح يبقى غالباً بيحظر عنوان السيرفر، جرّب بروكسي (MOVIZ_PROXY)." % (_MZ_ERR["last"] or "مجهول")), 502
     cands, seen = [], set()
     for m in re.finditer(r"<a\b([^>]*)>(.*?)</a>", sres, re.S | re.I):
         hm = re.search(r'href="([^"]+)"', m.group(1))
