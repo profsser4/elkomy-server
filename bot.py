@@ -3859,6 +3859,76 @@ def serper(q):
     return (r.json() or {}).get("organic") or []
 
 
+def _ddg_unwrap(u):
+    u = _html.unescape(u or "")
+    if u.startswith("//"):
+        u = "https:" + u
+    m = re.search(r"[?&]uddg=([^&]+)", u)
+    return unquote(m.group(1)) if m else u
+
+
+def _bing_unwrap(u):
+    u = _html.unescape(u or "")
+    m = re.search(r"[?&]u=a1([A-Za-z0-9_\-]+)", u)
+    if m:
+        import base64
+        b = m.group(1)
+        try:
+            return base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    return u
+
+
+def search_ddg(q):
+    r = requests.post("https://html.duckduckgo.com/html/", data={"q": q}, timeout=15,
+                      headers={"User-Agent": WS_UA, "Accept-Language": "ar,en;q=0.8"})
+    if r.status_code != 200:
+        raise Exception("DuckDuckGo كود %d" % r.status_code)
+    out = []
+    for m in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="result__a"|$)', r.text, re.S):
+        sn = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', m.group(3), re.S)
+        out.append({"link": _ddg_unwrap(m.group(1)), "title": _mz_clean(m.group(2)),
+                    "snippet": _mz_clean(sn.group(1)) if sn else ""})
+    return out
+
+
+def search_bing(q):
+    r = requests.get("https://www.bing.com/search", params={"q": q, "count": 20, "setlang": "ar"}, timeout=15,
+                     headers={"User-Agent": WS_UA, "Accept-Language": "ar,en;q=0.8"})
+    if r.status_code != 200:
+        raise Exception("Bing كود %d" % r.status_code)
+    out = []
+    for m in re.finditer(r'<li class="b_algo"[^>]*>(.*?)</li>', r.text, re.S):
+        blk = m.group(1)
+        a = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', blk, re.S)
+        if not a:
+            continue
+        sn = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
+        out.append({"link": _bing_unwrap(a.group(1)), "title": _mz_clean(a.group(2)),
+                    "snippet": _mz_clean(sn.group(1)) if sn else ""})
+    return out
+
+
+def search_any(q):
+    """Serper لو متاح وشغّال، وإلا DuckDuckGo ثم Bing من غير مفتاح ولا رصيد."""
+    errs = []
+    if SERPER_KEY:
+        try:
+            return serper(q)
+        except Exception as e:
+            errs.append(str(e))
+    for fn in (search_ddg, search_bing):
+        try:
+            r = fn(q)
+            if r:
+                return r
+            errs.append(fn.__name__ + ": فاضي")
+        except Exception as e:
+            errs.append(str(e)[:80])
+    raise Exception(" / ".join(errs)[:200] or "محرك البحث ما ردّش")
+
+
 @app.get("/websearch/hosts")
 def websearch_hosts():
     c = ws_hosts(request.args.get("refresh") == "1")
@@ -3871,17 +3941,22 @@ def websearch():
     title = str(b.get("q") or "").strip()[:120]
     if not title:
         return jsonify(error="اكتب اسم العمل"), 400
-    if not SERPER_KEY:
-        return jsonify(error="ضيف SERPER_KEY في Variables بتاعة Railway وأعد التشغيل"), 400
     hosts = ws_hosts()["hosts"]
     notes, organic = [], []
-    for q in ws_queries(title, hosts, bool(b.get("deep"))):
+    qs = ws_queries(title, hosts, bool(b.get("deep")))
+    # استعلامات إضافية موجّهة لكل موقع تحميل مدعوم عشان النتايج تكون روابط مش مجرد صفحات
+    qs += [f"{title} {h}" for h in [h for h in WS_PREFER if _host_ok(h, hosts)][:4]]
+    def _safe_search(q):
         try:
-            organic += serper(q)
+            return search_any(q)
         except Exception as ex:
             notes.append(str(ex)[:120])
-            if "مفتاح" in str(ex) or "رصيد" in str(ex):
-                break
+            return []
+
+    with ThreadPoolExecutor(max_workers=4) as exq:
+        for res in exq.map(_safe_search, qs):
+            organic += res
+    notes[:] = list(dict.fromkeys(notes))[:3]
     raw = []
     seen = set()
     for o in organic:
@@ -4465,12 +4540,30 @@ def _sb_get(path, params=None):
     return r.json()
 
 
+_SB_GUESS = ("movies", "series", "episodes", "titles", "content", "contents", "catalog", "items", "media",
+             "shows", "films", "tv_series", "seasons", "posts", "works")
+
+
 def _sb_schema():
-    """جداول وأعمدة قاعدة Yoyo من OpenAPI (لو مسموحة بالمفتاح العام)."""
+    """جداول وأعمدة Yoyo. الـ OpenAPI محتاج مفتاح سري، فبنجرّب أسماء الجداول الشايعة ونقرا الأعمدة من أول صف."""
     if _SB_CACHE["schema"] is None:
-        d = _sb_get("/rest/v1/")
-        _SB_CACHE["schema"] = {t: list((v.get("properties") or {}).keys())
-                               for t, v in (d.get("definitions") or {}).items()}
+        sch = {}
+        try:
+            d = _sb_get("/rest/v1/")
+            sch = {t: list((v.get("properties") or {}).keys()) for t, v in (d.get("definitions") or {}).items()}
+        except Exception:
+            pass
+        if not sch:
+            def probe(t):
+                try:
+                    r = _sb_get("/rest/v1/" + t, {"select": "*", "limit": "1"})
+                    if isinstance(r, list):
+                        sch[t] = list(r[0].keys()) if r else []
+                except Exception:
+                    pass
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(probe, _SB_GUESS))
+        _SB_CACHE["schema"] = sch
     return _SB_CACHE["schema"]
 
 
