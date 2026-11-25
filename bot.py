@@ -657,7 +657,7 @@ def read_token(tok):
     return read_token_ex(tok)[0]
 
 
-_ADMIN_PREFIXES = ("/users", "/iptv/admin", "/activity")
+_ADMIN_PREFIXES = ("/users", "/iptv/admin", "/activity", "/ru")
 _ADMIN_WRITE = ("/settings", "/imdbfix", "/providers", "/home/layout")
 _ADMIN_ANY = ("/home/dub-refresh", "/providers", "/providers/export", "/play/diag", "/play/reports")
 # مسارات ستريميو بتغيّر إعداد مشترك للموقع كله (حساب + إضافات + مفاتيح مزوّدين): للأدمن بس
@@ -9757,3 +9757,88 @@ def x_trailer_impl():
     except Exception:
         pass
     return jsonify(key="")
+
+
+# ============================================================
+# رفع ريموت (Remote Upload) — الصق الملف ده كله في آخر bot.py
+# + عدّل سطر واحد فوق (حماية الأدمن):
+#   _ADMIN_PREFIXES = ("/users", "/iptv/admin", "/activity", "/ru")
+# ============================================================
+# الفكرة: انت بتديله روابط (من IPTV أو غيره) + بتختار الحساب، والسيرفر بيبعت
+# الطلب لـ 1fichier وهو اللي بيسحب الملف على حسابك (من غير ما ينزل عندك).
+# ملاحظة: ريموت 1fichier بيشتغل بمفتاح API بس (حسابات يوزر/باسورد مش بتنفع هنا).
+# راجع الباراميترات من https://1fichier.com/api.html لو الرد اختلف.
+
+RU_API = "https://api.1fichier.com/v1/remote"
+
+
+def _ru_accounts():
+    """حسابات 1fichier اللي بمفتاح API (مستبعد حسابات اليوزر/باسورد)."""
+    return [p for p in load() if p["type"] == "1fichier" and not p.get("login")]
+
+
+def _ru_acc(pid):
+    return next((p for p in _ru_accounts() if p["id"] == pid), None)
+
+
+def _ru_call(p, ep, body):
+    r = requests.post(f"{RU_API}/{ep}.cgi", json=body,
+                      headers={"Authorization": "Bearer " + p["key"]}, timeout=30)
+    res = jj(r)
+    if res.get("status") == "KO":
+        raise Exception(res.get("message") or "1fichier رفض الطلب")
+    return res
+
+
+# ---- "المواقع": كل موقع رفع = دالة send(p, urls, folder_id) ----
+# لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها هنا (لازم الموقع يكون ليه ريموت API).
+def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
+    body = {"urls": urls, "folder_id": str(folder_id or "0")}
+    if headers:
+        body["headers"] = headers          # مثال: ["User-Agent: VLC/3.0"]
+    return _ru_call(p, "request", body)
+
+
+RU_HOSTS = {"1fichier": _ru_send_1fichier}
+
+
+@app.get("/ru/targets")
+def ru_targets():
+    """الحسابات اللي ينفع ترفع عليها (للقايمة المنسدلة)."""
+    return jsonify(hosts=list(RU_HOSTS), items=[{
+        "id": p["id"], "name": p["name"], "type": p["type"],
+        "cdn": bool(p.get("cdn")), "key": "••••" + p["key"][-4:],
+    } for p in _ru_accounts()])
+
+
+@app.post("/ru/send")
+def ru_send():
+    d = request.get_json(silent=True) or {}
+    p = _ru_acc(d.get("account_id", ""))
+    if not p:
+        return jsonify(error="اختار حساب صحيح"), 400
+    urls = [u.strip() for u in (d.get("urls") or []) if str(u).strip().startswith(("http://", "https://"))]
+    if not urls:
+        return jsonify(error="مفيش روابط صالحة"), 400
+    send = RU_HOSTS.get(p["type"])
+    if not send:
+        return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
+    try:
+        res = send(p, urls[:100], d.get("folder_id") or "0", d.get("headers") or None)
+        return jsonify(ok=True, account=p["name"], count=len(urls), res=res)
+    except Exception as e:
+        _fi_mark(p, str(e))
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/ru/status")
+def ru_status():
+    p = _ru_acc(request.args.get("account_id", ""))
+    if not p:
+        return jsonify(error="حساب غلط"), 400
+    try:
+        rid = request.args.get("id")
+        res = _ru_call(p, "info", {"id": rid}) if rid else _ru_call(p, "ls", {})
+        return jsonify(ok=True, res=res)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
