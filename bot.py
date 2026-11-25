@@ -9794,8 +9794,8 @@ def _ru_call(p, ep, body):
 # لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها هنا (لازم الموقع يكون ليه ريموت API).
 def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
     body = {"urls": urls, "folder_id": str(folder_id or "0")}
-    if headers:
-        body["headers"] = headers          # مثال: ["User-Agent: VLC/3.0"]
+    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل: نبعت User-Agent بتاع VLC افتراضيًا
+    body["headers"] = headers or ["User-Agent: VLC/3.0.20 LibVLC/3.0.20", "Accept: */*"]
     return _ru_call(p, "request", body)
 
 
@@ -9824,7 +9824,7 @@ def ru_send():
     if not send:
         return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
     try:
-        res = send(p, urls[:100], d.get("folder_id") or "0", d.get("headers") or None)
+        res = send(p, urls[:30], d.get("folder_id") or "0", d.get("headers") or None)
         return jsonify(ok=True, account=p["name"], count=len(urls), res=res)
     except Exception as e:
         _fi_mark(p, str(e))
