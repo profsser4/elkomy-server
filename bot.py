@@ -9793,10 +9793,23 @@ def _ru_call(p, ep, body):
 # ---- "المواقع": كل موقع رفع = دالة send(p, urls, folder_id) ----
 # لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها هنا (لازم الموقع يكون ليه ريموت API).
 def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
-    body = {"urls": urls, "folder_id": str(folder_id or "0")}
-    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل: نبعت User-Agent بتاع VLC افتراضيًا
-    body["headers"] = headers or ["User-Agent: VLC/3.0.20 LibVLC/3.0.20", "Accept: */*"]
-    return _ru_call(p, "request", body)
+    try:
+        fid = int(folder_id or 0)
+    except Exception:
+        fid = 0
+    base = {"urls": urls, "folder_id": fid}
+    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل: نجرّب نبعت User-Agent بتاع VLC،
+    # ولو 1fichier رفض شكل الباراميتر (Bad Parameters) نرجع نبعت من غيره
+    hl = headers or ["User-Agent: VLC/3.0.20 LibVLC/3.0.20"]
+    last = None
+    for extra in ({"headers": hl}, {"headers": "\n".join(hl)}, {}):
+        try:
+            return _ru_call(p, "request", dict(base, **extra))
+        except Exception as e:
+            last = e
+            if "bad param" not in str(e).lower():
+                raise
+    raise last
 
 
 RU_HOSTS = {"1fichier": _ru_send_1fichier}
