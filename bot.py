@@ -9798,13 +9798,16 @@ def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
     except Exception:
         fid = 0
     base = {"urls": urls, "folder_id": fid}
-    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل: نجرّب نبعت User-Agent بتاع VLC،
-    # ولو 1fichier رفض شكل الباراميتر (Bad Parameters) نرجع نبعت من غيره
-    hl = headers or ["User-Agent: VLC/3.0.20 LibVLC/3.0.20"]
+    # حسب وثائق 1fichier: headers لازم تكون object {"Name": "Value"} (مش قايمة ولا نص).
+    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل، فنبعت User-Agent بتاع VLC.
+    if isinstance(headers, dict) and headers:
+        tries = [headers]
+    else:
+        tries = [{"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}, {"User-Agent": "VLC"}]
     last = None
-    for extra in ({"headers": hl}, {"headers": "\n".join(hl)}, {}):
+    for h in tries + [None]:               # آخر محاولة من غير headers لو 1fichier رفض القيمة
         try:
-            return _ru_call(p, "request", dict(base, **extra))
+            return _ru_call(p, "request", dict(base, headers=h) if h else base)
         except Exception as e:
             last = e
             if "bad param" not in str(e).lower():
