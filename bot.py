@@ -10189,13 +10189,12 @@ def lib_add():
         data = _ru_data()
         lnk = data.setdefault("links", {})
         lib = data.setdefault("lib", {})
-        if key:
-            if key not in lnk:
-                return jsonify(error="العمل مش موجود"), 404
-        else:
+        if key and key not in lnk and not title:
+            return jsonify(error="العمل مش موجود"), 404
+        if not key or key not in lnk:
             if not title:
                 return jsonify(error="اكتب اسم العمل"), 400
-            key = "m:" + format(int(time.time() * 1000), "x")
+            key = key or ("m:" + format(int(time.time() * 1000), "x"))
             poster = str(d.get("poster") or "")[:500]
             m = {"title": title, "kind": kind, "year": str(d.get("year") or "")[:10],
                  "plot": str(d.get("plot") or "")[:700], "manual": True}
