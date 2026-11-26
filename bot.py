@@ -4994,8 +4994,8 @@ INSTANT = {
 }
 
 
-def _generate():
-    data = request.get_json() or {}
+def _generate(data=None):
+    data = data or request.get_json() or {}
     q = (data.get("query") or data.get("magnet") or data.get("link") or "").strip()
     tid = data.get("torrent_id")
     if not q and not tid:
@@ -9760,16 +9760,23 @@ def x_trailer_impl():
 
 
 # ============================================================
-# رفع ريموت (Remote Upload) — الصق الملف ده كله في آخر bot.py
-# + عدّل سطر واحد فوق (حماية الأدمن):
-#   _ADMIN_PREFIXES = ("/users", "/iptv/admin", "/activity", "/ru")
+# رفع ريموت (Remote Upload) على 1fichier — للأدمن بس (/ru محمي في _ADMIN_PREFIXES)
+#  - اختيار المجلد بالاسم + إنشاء مجلد جديد
+#  - بعد ما 1fichier يخلّص السحب: تظبيط الاسم الحقيقي للملف + حفظ اللينك على صفحة الفيلم/المسلسل في الـIPTV
 # ============================================================
-# الفكرة: انت بتديله روابط (من IPTV أو غيره) + بتختار الحساب، والسيرفر بيبعت
-# الطلب لـ 1fichier وهو اللي بيسحب الملف على حسابك (من غير ما ينزل عندك).
-# ملاحظة: ريموت 1fichier بيشتغل بمفتاح API بس (حسابات يوزر/باسورد مش بتنفع هنا).
-# راجع الباراميترات من https://1fichier.com/api.html لو الرد اختلف.
 
-RU_API = "https://api.1fichier.com/v1/remote"
+FI_API = "https://api.1fichier.com/v1"
+RU_FILE = os.path.join(DATA_DIR, "ru_data.json")
+RU_LOCK = threading.Lock()
+_RU_LAST = [0.0]
+
+
+def _ru_data():
+    try:
+        d = store_load(RU_FILE)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
 
 
 def _ru_accounts():
@@ -9781,31 +9788,47 @@ def _ru_acc(pid):
     return next((p for p in _ru_accounts() if p["id"] == pid), None)
 
 
-def _ru_call(p, ep, body):
-    r = requests.post(f"{RU_API}/{ep}.cgi", json=body,
+def _fi_call(p, path, body):
+    r = requests.post(f"{FI_API}/{path}.cgi", json=body,
                       headers={"Authorization": "Bearer " + p["key"]}, timeout=30)
     res = jj(r)
-    if res.get("status") == "KO":
+    if isinstance(res, dict) and res.get("status") == "KO":
         raise Exception(res.get("message") or "1fichier رفض الطلب")
     return res
 
 
-# ---- "المواقع": كل موقع رفع = دالة send(p, urls, folder_id) ----
-# لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها هنا (لازم الموقع يكون ليه ريموت API).
+def _ru_call(p, ep, body):
+    return _fi_call(p, "remote/" + ep, body)
+
+
+def _ru_clean(name, fallback="file"):
+    n = re.sub(r'[\\/:*?"<>|$&;\r\n\t]+', " ", str(name or "")).strip(" .")
+    n = re.sub(r"\s{2,}", " ", n).replace(" .", ".")
+    return n[:150] or fallback
+
+
+def _ru_subs(res):
+    for k in ("sub_folders", "subfolders", "folders"):
+        if isinstance(res.get(k), list):
+            return res[k]
+    return []
+
+
+# ---- "المواقع": كل موقع رفع = دالة send(p, urls, folder_id, headers) ----
+# لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها في RU_HOSTS (لازم الموقع يكون ليه ريموت API).
 def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
     try:
         fid = int(folder_id or 0)
     except Exception:
         fid = 0
     base = {"urls": urls, "folder_id": fid}
-    # حسب وثائق 1fichier: headers لازم تكون object {"Name": "Value"} (مش قايمة ولا نص).
-    # بانلات IPTV كتير بتقطع أي طلب مش جاي من مشغّل، فنبعت User-Agent بتاع VLC.
+    # حسب وثائق 1fichier: headers لازم تكون object {"Name": "Value"}
     if isinstance(headers, dict) and headers:
         tries = [headers]
     else:
         tries = [{"User-Agent": "VLC/3.0.20 LibVLC/3.0.20"}, {"User-Agent": "VLC"}]
     last = None
-    for h in tries + [None]:               # آخر محاولة من غير headers لو 1fichier رفض القيمة
+    for h in tries + [None]:
         try:
             return _ru_call(p, "request", dict(base, headers=h) if h else base)
         except Exception as e:
@@ -9820,11 +9843,65 @@ RU_HOSTS = {"1fichier": _ru_send_1fichier}
 
 @app.get("/ru/targets")
 def ru_targets():
-    """الحسابات اللي ينفع ترفع عليها (للقايمة المنسدلة)."""
     return jsonify(hosts=list(RU_HOSTS), items=[{
         "id": p["id"], "name": p["name"], "type": p["type"],
         "cdn": bool(p.get("cdn")), "key": "••••" + p["key"][-4:],
     } for p in _ru_accounts()])
+
+
+@app.get("/ru/folders")
+def ru_folders():
+    p = _ru_acc(request.args.get("account_id", ""))
+    if not p:
+        return jsonify(ok=False, error="حساب غلط"), 400
+    try:
+        parent = int(request.args.get("parent") or 0)
+    except Exception:
+        parent = 0
+    try:
+        res = _fi_call(p, "folder/ls", {"folder_id": parent})
+        items = []
+        for f in _ru_subs(res):
+            try:
+                items.append({"id": int(f.get("id")), "name": str(f.get("name") or "")})
+            except Exception:
+                pass
+        items.sort(key=lambda x: x["name"].lower())
+        return jsonify(ok=True, parent=parent, items=items)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.post("/ru/mkdir")
+def ru_mkdir():
+    d = request.get_json(silent=True) or {}
+    p = _ru_acc(d.get("account_id", ""))
+    if not p:
+        return jsonify(ok=False, error="حساب غلط"), 400
+    name = _ru_clean(d.get("name"), "")
+    if not name:
+        return jsonify(ok=False, error="اكتب اسم المجلد"), 400
+    try:
+        parent = int(d.get("parent") or 0)
+    except Exception:
+        parent = 0
+
+    def find():
+        for f in _ru_subs(_fi_call(p, "folder/ls", {"folder_id": parent})):
+            if str(f.get("name")) == name:
+                return int(f.get("id"))
+        return None
+    try:
+        fid = find()                    # لو المجلد موجود بنفس الاسم نستخدمه
+        if fid is None:
+            res = _fi_call(p, "folder/mkdir", {"name": name, "folder_id": parent})
+            fid = res.get("folder_id") or res.get("id")
+            fid = int(fid) if fid else find()
+        if fid is None:
+            return jsonify(ok=False, error="المجلد اتعمل بس مقدرتش أجيب رقمه"), 502
+        return jsonify(ok=True, id=fid, name=name)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
 
 
 @app.post("/ru/send")
@@ -9833,18 +9910,138 @@ def ru_send():
     p = _ru_acc(d.get("account_id", ""))
     if not p:
         return jsonify(error="اختار حساب صحيح"), 400
-    urls = [u.strip() for u in (d.get("urls") or []) if str(u).strip().startswith(("http://", "https://"))]
-    if not urls:
+    items = []
+    for it in (d.get("items") or [])[:30]:
+        u = str((it or {}).get("url") or "").strip()
+        if u.startswith(("http://", "https://")):
+            items.append({"u": u, "n": _ru_clean(it.get("name"), ""), "e": str(it.get("ep") or "")[:40]})
+    if not items:
         return jsonify(error="مفيش روابط صالحة"), 400
     send = RU_HOSTS.get(p["type"])
     if not send:
         return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
     try:
-        res = send(p, urls[:30], d.get("folder_id") or "0", d.get("headers") or None)
-        return jsonify(ok=True, account=p["name"], count=len(urls), res=res)
+        res = send(p, [x["u"] for x in items], d.get("folder_id") or "0", d.get("headers") or None)
     except Exception as e:
         _fi_mark(p, str(e))
         return jsonify(ok=False, error=str(e)), 502
+    rid = res.get("id") if isinstance(res, dict) else None
+    key = str(d.get("key") or "")[:60]
+    mt = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+    if rid or (key and mt):
+        with RU_LOCK:
+            data = _ru_data()
+            if key and mt:
+                m = data.setdefault("lib", {}).setdefault(key, {})
+                poster = str(mt.get("poster") or "")[:500]
+                m.update(title=str(mt.get("title") or "")[:120], year=str(mt.get("year") or "")[:10],
+                         plot=str(mt.get("plot") or "")[:700],
+                         kind="series" if mt.get("kind") == "series" else "vod")
+                if poster.startswith(("http://", "https://")):
+                    m["poster"] = poster
+                try:
+                    m["rating"] = float(mt.get("rating") or 0)
+                except Exception:
+                    pass
+            if rid:
+                jobs = data.setdefault("jobs", [])
+                jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False})
+                data["jobs"] = jobs[-80:]
+            try:
+                store_save(RU_FILE, data)
+            except Exception:
+                pass
+    return jsonify(ok=True, account=p["name"], count=len(items), id=rid)
+
+
+def _ru_info(p, rid):
+    try:
+        return _ru_call(p, "info", {"id": rid})
+    except Exception as e:
+        if "bad param" in str(e).lower():
+            return _ru_call(p, "info", {"id": str(rid)})
+        raise
+
+
+def _ru_sync():
+    """بيشوف الطلبات اللي لسه ما خلصتش؛ اللي خلص: يظبط الاسم الحقيقي ويحفظ اللينك."""
+    with RU_LOCK:
+        data = _ru_data()
+        jobs = data.get("jobs") or []
+        links = data.setdefault("links", {})
+        changed = False
+        for j in jobs:
+            if j.get("done"):
+                continue
+            p = _ru_acc(j.get("acc"))
+            if not p:
+                continue
+            try:
+                info = _ru_info(p, j["id"])
+            except Exception as e:
+                j["err"] = str(e)[:200]
+                changed = True
+                continue
+            time.sleep(0.4)
+            if not info.get("execution_date"):
+                continue                            # لسه بيتسحب
+            by_src = {x["u"]: x for x in j.get("items") or []}
+            ren, entries = [], []
+            for r in info.get("result") or []:
+                it = by_src.get(r.get("url")) or {}
+                name = it.get("n") or ""
+                ent = {"ep": it.get("e") or "", "name": name or str(r.get("url") or "")[-40:], "t": int(time.time())}
+                dl = r.get("download_link")
+                if r.get("status") == "OK" and dl:
+                    ent.update(ok=True, link=dl)
+                    if name:
+                        ren.append({"url": dl, "filename": name})
+                else:
+                    ent.update(ok=False, err=str(r.get("message") or "فشل")[:160])
+                entries.append(ent)
+            if ren:
+                try:
+                    _fi_call(p, "file/rename", {"urls": ren})
+                except Exception as e:
+                    j["rename_err"] = str(e)[:160]
+                time.sleep(0.4)
+            if j.get("key"):
+                cur = links.setdefault(j["key"], {"files": []})["files"]
+                for ent in entries:
+                    same = next((i for i, f in enumerate(cur)
+                                 if (ent["ep"] and f.get("ep") == ent["ep"]) or (not ent["ep"] and f.get("name") == ent["name"])), None)
+                    if same is None:
+                        cur.append(ent)
+                    else:
+                        cur[same] = ent
+            j["done"] = True
+            changed = True
+        if changed:
+            try:
+                store_save(RU_FILE, data)
+            except Exception:
+                pass
+        return sum(1 for j in jobs if not j.get("done"))
+
+
+@app.post("/ru/sync")
+def ru_sync():
+    if time.time() - _RU_LAST[0] < 8:
+        return jsonify(ok=True, skipped=True)
+    _RU_LAST[0] = time.time()
+    try:
+        return jsonify(ok=True, pending=_ru_sync())
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 502
+
+
+@app.get("/ru/links")
+def ru_links():
+    key = str(request.args.get("key", ""))[:60]
+    data = _ru_data()
+    files = ((data.get("links") or {}).get(key) or {}).get("files") or []
+    pend = sum(1 for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done"))
+    return jsonify(ok=True, files=files, pending=pend)
 
 
 @app.get("/ru/status")
@@ -9858,3 +10055,115 @@ def ru_status():
         return jsonify(ok=True, res=res)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+# ============================================================
+# المكتبة: اللي بيترفع بيظهر للأعضاء كلهم بلينكات المرفوعات (اللينك نفسه مخفي عنهم)
+# الأدمن: تثبيت / إلغاء تثبيت / شيل من المكتبة. الترتيب العادي = الأحدث رفعًا الأول، والمثبّت فوق.
+# ============================================================
+
+def _nat(s):
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", str(s or ""))]
+
+
+def _lib_items(data):
+    lib = data.get("lib") or {}
+    out = []
+    for key, v in (data.get("links") or {}).items():
+        files = [f for f in (v.get("files") or []) if f.get("ok") and f.get("link")]
+        if not files:
+            continue
+        m = lib.get(key) or {}
+        try:
+            rating = float(m.get("rating") or 0)
+        except Exception:
+            rating = 0
+        out.append({"key": key, "title": m.get("title") or key, "poster": m.get("poster") or "",
+                    "year": m.get("year") or "", "rating": rating,
+                    "kind": m.get("kind") or key.split(":")[0], "n": len(files),
+                    "pin": int(m.get("pin") or 0),
+                    "t": max([int(f.get("t") or 0) for f in files] or [0])})
+    out.sort(key=lambda x: (0, -x["pin"], -x["t"]) if x["pin"] else (1, 0, -x["t"]))
+    return out
+
+
+@app.get("/lib/list")
+def lib_list():
+    return jsonify(ok=True, items=_lib_items(_ru_data()), admin=(g.role == "admin"))
+
+
+@app.get("/lib/item")
+def lib_item():
+    key = str(request.args.get("key", ""))[:60]
+    data = _ru_data()
+    v = (data.get("links") or {}).get(key) or {}
+    files = [{"i": i, "ep": f.get("ep") or "", "name": f.get("name") or ""}
+             for i, f in enumerate(v.get("files") or []) if f.get("ok") and f.get("link")]
+    if not files:
+        return jsonify(ok=False, error="مش موجود في المكتبة"), 404
+    files.sort(key=lambda f: _nat(f["name"]))
+    m = (data.get("lib") or {}).get(key) or {}
+    return jsonify(ok=True, key=key, title=m.get("title") or key, poster=m.get("poster") or "",
+                   year=m.get("year") or "", rating=m.get("rating") or 0, plot=m.get("plot") or "",
+                   kind=m.get("kind") or key.split(":")[0], pin=int(m.get("pin") or 0),
+                   files=files, admin=(g.role == "admin"))
+
+
+@app.post("/lib/go")
+def lib_go():
+    """بيحوّل لينك 1fichier المحفوظ (من غير ما العضو يشوفه) لرابط تحميل/تشغيل بنفس منطق /generate."""
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    try:
+        i = int(d.get("i"))
+    except Exception:
+        return jsonify(error="ملف غلط"), 400
+    files = ((_ru_data().get("links") or {}).get(key) or {}).get("files") or []
+    if not (0 <= i < len(files)) or not files[i].get("ok") or not files[i].get("link"):
+        return jsonify(error="الملف مش موجود"), 404
+    resp = make_response(_generate({"link": files[i]["link"]}))
+    if resp.status_code == 200:
+        try:
+            r = resp.get_json(silent=True) or {}
+            if r.get("direct_link"):
+                r["name"] = files[i].get("name") or r.get("name")
+                act_log(g.user, "link", r.get("name"), r.get("size"), r.get("provider"))
+                return jsonify(r)
+        except Exception:
+            pass
+    return resp
+
+
+def _lib_admin():
+    return g.role == "admin"
+
+
+@app.post("/lib/pin")
+def lib_pin():
+    if not _lib_admin():
+        return jsonify(error="للأدمن بس"), 403
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    with RU_LOCK:
+        data = _ru_data()
+        if key not in (data.get("links") or {}):
+            return jsonify(error="مش موجود"), 404
+        lib = data.setdefault("lib", {})
+        m = lib.setdefault(key, {})
+        m["pin"] = (max([int(v.get("pin") or 0) for v in lib.values()] + [0]) + 1) if d.get("pin") else 0
+        store_save(RU_FILE, data)
+    return jsonify(ok=True, pin=m["pin"])
+
+
+@app.post("/lib/del")
+def lib_del():
+    if not _lib_admin():
+        return jsonify(error="للأدمن بس"), 403
+    key = str((request.get_json(silent=True) or {}).get("key") or "")[:60]
+    with RU_LOCK:
+        data = _ru_data()
+        (data.get("links") or {}).pop(key, None)
+        (data.get("lib") or {}).pop(key, None)
+        data["jobs"] = [j for j in (data.get("jobs") or []) if j.get("key") != key or j.get("done")]
+        store_save(RU_FILE, data)
+    return jsonify(ok=True)
