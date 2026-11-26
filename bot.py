@@ -10303,7 +10303,7 @@ def ru_links():
     qe = str(((data.get("queue") or {}).get(key) or {}).get("err") or "")
     if qe:
         errs.append(qe)
-    return jsonify(ok=True, files=files, pending=pend, queued=qn, errs=errs[:3], watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
+    return jsonify(ok=True, files=files, pending=pend, queued=qn, errs=errs[:3], cool=_fi_cool_left(), watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
 
 
 @app.get("/ru/status")
@@ -10623,6 +10623,53 @@ def ru_watchlist():
     out.sort(key=lambda x: x["name"].lower())
     return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
                    cool=_fi_cool_left())
+
+
+@app.post("/ru/reset")
+def ru_reset():
+    """إعادة المحاولة: يمسح الخطأ العالق وفترة الهدوء، ويرجّع الطلبات العالقة للطابور ويبعت أول رابط.
+    لو 1fichier لسه قافل الحساب، الخطأ الحقيقي الجديد هو اللي هيظهر."""
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    _FI_COOL[0] = 0.0
+    try:
+        store_save(RU_COOL_FILE, {"t": 0})
+    except Exception:
+        pass
+    moved = 0
+    with RU_LOCK:
+        data = _ru_data()
+        files = ((data.get("links") or {}).get(key) or {}).get("files") or []
+        okeps = {str(f.get("ep")) for f in files if f.get("ep") and f.get("ok")}
+        keep = []
+        for j in data.get("jobs") or []:
+            k = j.get("key")
+            if j.get("done") or not k or (key and k != key):
+                keep.append(j)
+                continue
+            q = data.setdefault("queue", {}).setdefault(k, {"items": []})
+            q["acc"], q["folder"] = j.get("acc"), j.get("folder")
+            have = {x.get("e") for x in q["items"] if x.get("e")} | {x.get("u") for x in q["items"]}
+            for x in j.get("items") or []:
+                if not x.get("u") or x.get("u") in have or (x.get("e") and (x["e"] in have or str(x["e"]) in okeps)):
+                    continue
+                q["items"].append({"u": x["u"], "n": x.get("n") or "", "e": x.get("e") or ""})
+                moved += 1
+        data["jobs"] = keep
+        for k, q in (data.get("queue") or {}).items():
+            if not key or k == key:
+                for f in ("err", "fails", "claim"):
+                    q.pop(f, None)
+        for k, w in (data.get("watch") or {}).items():
+            if not key or k == key:
+                w.pop("err", None)
+        store_save(RU_FILE, data)
+    sent = 0
+    try:
+        sent = _ru_pump()
+    except Exception as e:
+        app.logger.warning("ru reset pump: %s", e)
+    return jsonify(ok=True, requeued=moved, sent=sent, cool=_fi_cool_left())
 
 
 @app.post("/ru/runnow")
