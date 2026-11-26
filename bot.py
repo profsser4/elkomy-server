@@ -9945,7 +9945,8 @@ def ru_send():
                     pass
             if rid:
                 jobs = data.setdefault("jobs", [])
-                jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False})
+                jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False,
+                             "folder": int(d.get("folder_id") or 0) if str(d.get("folder_id") or "0").isdigit() else None})
                 data["jobs"] = jobs[-80:]
             try:
                 store_save(RU_FILE, data)
@@ -9977,6 +9978,25 @@ def _ru_info(p, rid):
         raise
 
 
+def _ru_scan_folder(p, j, data):
+    """طريقة بديلة: لو info مش بيرد، ندوّر في المجلد نفسه على ملفات اسمها رقم الحلقة (زي 714577.mp4)."""
+    fid = j.get("folder")
+    if fid is None:
+        fid = ((data.get("watch") or {}).get(j.get("key")) or {}).get("folder")
+    if fid is None:
+        return []
+    res = _fi_call(p, "file/ls", {"folder_id": int(fid)})
+    stems = {}
+    for f in (res.get("items") or []):
+        stems[os.path.splitext(str(f.get("filename") or ""))[0]] = f
+    out = []
+    for it in j.get("items") or []:
+        f = stems.get(str(it.get("e") or "")) if it.get("e") else None
+        if f and f.get("url"):
+            out.append({"url": it["u"], "status": "OK", "download_link": f["url"]})
+    return out
+
+
 def _ru_sync():
     """بيشوف الطلبات اللي لسه ما خلصتش؛ اللي خلص: يظبط الاسم الحقيقي ويحفظ اللينك."""
     with RU_LOCK:
@@ -9990,15 +10010,31 @@ def _ru_sync():
             p = _ru_acc(j.get("acc"))
             if not p:
                 continue
+            info, einfo = {}, None
             try:
                 info = _ru_info(p, j["id"])
+                time.sleep(0.4)
             except Exception as e:
-                j["err"] = str(e)[:200]
-                changed = True
-                continue
-            time.sleep(0.4)
-            if not info.get("execution_date"):
-                continue                            # لسه بيتسحب
+                einfo = str(e)[:200]
+            res_l = (info.get("result") or []) if isinstance(info, dict) else []
+            complete = isinstance(info, dict) and (info.get("execution_date") or any(isinstance(r, dict) and r.get("download_link") for r in res_l))
+            if not complete:
+                found = []
+                if time.time() - int(j.get("t") or 0) > 120:
+                    try:
+                        found = _ru_scan_folder(p, j, data)
+                    except Exception as e:
+                        einfo = einfo or str(e)[:200]
+                if not found:
+                    if einfo:
+                        j["err"] = einfo
+                        changed = True
+                    continue                        # لسه بيتسحب
+                info = {"result": found}
+                j["scan"] = True
+                if len(found) < len(j.get("items") or []):
+                    j["partial"] = True
+            j.pop("err", None)
             by_src = {x["u"]: x for x in j.get("items") or []}
             ren, entries = [], []
             for r in info.get("result") or []:
@@ -10028,7 +10064,7 @@ def _ru_sync():
                         cur.append(ent)
                     else:
                         cur[same] = ent
-            j["done"] = True
+            j["done"] = not j.pop("partial", False)
             changed = True
         if changed:
             try:
@@ -10052,11 +10088,13 @@ def ru_sync():
 @app.get("/ru/links")
 def ru_links():
     key = str(request.args.get("key", ""))[:60]
+    _lib_bg_sync()
     data = _ru_data()
     files = ((data.get("links") or {}).get(key) or {}).get("files") or []
     pend = sum(1 for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done"))
     w = (data.get("watch") or {}).get(key) or {}
-    return jsonify(ok=True, files=files, pending=pend, watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
+    errs = [str(j.get("err"))[:160] for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done") and j.get("err")]
+    return jsonify(ok=True, files=files, pending=pend, errs=errs[:3], watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
 
 
 @app.get("/ru/status")
@@ -10144,7 +10182,7 @@ def _ru_watch_run():
                 ww["seen"] = list(dict.fromkeys((ww.get("seen") or []) + [x["e"] for x in items]))
                 ww["last"] = int(time.time())
                 if rid:
-                    data.setdefault("jobs", []).append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False})
+                    data.setdefault("jobs", []).append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False, "folder": w.get("folder")})
                     data["jobs"] = data["jobs"][-80:]
                 store_save(RU_FILE, data)
             sent += len(items)
@@ -10222,17 +10260,23 @@ def _lib_items(data):
 _LIB_SYNC = [0.0]
 
 
+_WATCH_LAST = [0.0]
+
+
 def _lib_bg_sync():
-    """أي رفع ريموت لسه معلّق بيتزامن في الخلفية، فالملفات تظهر في المكتبة من غير ما تفتح صفحة الفيلم."""
+    """بيتشغّل مع أي طلب للمكتبة (من غير الاعتماد على خيط خلفي): بيكمّل الرفع المعلّق وبيفحص الحلقات الجديدة."""
     try:
-        if time.time() - _LIB_SYNC[0] < 15:
-            return
-        if not any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
-            return
-        _LIB_SYNC[0] = time.time()
-        threading.Thread(target=_ru_sync, daemon=True).start()
-    except Exception:
-        pass
+        now = time.time()
+        if now - _LIB_SYNC[0] >= 12:
+            _LIB_SYNC[0] = now
+            if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
+                _ru_sync()
+        if now - _WATCH_LAST[0] >= max(int(os.environ.get("RU_WATCH_MIN", "30")), 5) * 60:
+            _WATCH_LAST[0] = now
+            if any(w.get("on") for w in (_ru_data().get("watch") or {}).values()):
+                _ru_watch_run()
+    except Exception as e:
+        app.logger.warning("lib sync: %s", e)
 
 
 @app.get("/lib/list")
