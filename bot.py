@@ -10034,22 +10034,36 @@ def _ru_sync():
             if time.time() < _FI_COOL[0]:
                 break
             info, einfo = {}, None
-            try:
-                info = _ru_info(p, j["id"])
-                time.sleep(0.4)
-            except Exception as e:
-                einfo = str(e)[:200]
-                _fi_cool(e)
+            cands = [p] + [a for a in _ru_accounts() if a["id"] != p["id"]]   # الطلب ممكن يكون تابع لحساب تاني
+            for a_ in cands:
+                try:
+                    info = _ru_info(a_, j["id"])
+                    p, j["acc"], einfo = a_, a_["id"], None
+                    time.sleep(0.4)
+                    break
+                except Exception as e:
+                    einfo = str(e)[:200]
+                    _fi_cool(e)
+                    if time.time() < _FI_COOL[0]:
+                        break
+                    time.sleep(0.4)
             res_l = (info.get("result") or []) if isinstance(info, dict) else []
             complete = isinstance(info, dict) and (info.get("execution_date") or any(isinstance(r, dict) and r.get("download_link") for r in res_l))
             if not complete:
                 found = []
                 if time.time() - int(j.get("t") or 0) > 120:
-                    try:
-                        found = _ru_scan_folder(p, j, data)
-                    except Exception as e:
-                        einfo = einfo or str(e)[:200]
-                        _fi_cool(e)
+                    for a_ in cands:
+                        try:
+                            found = _ru_scan_folder(a_, j, data)
+                            if found:
+                                p, j["acc"] = a_, a_["id"]
+                                break
+                        except Exception as e:
+                            einfo = einfo or str(e)[:200]
+                            _fi_cool(e)
+                            if time.time() < _FI_COOL[0]:
+                                break
+                        time.sleep(0.4)
                 if not found:
                     if einfo:
                         j["err"] = einfo
