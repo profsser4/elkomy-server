@@ -9951,6 +9951,20 @@ def ru_send():
                 store_save(RU_FILE, data)
             except Exception:
                 pass
+    wt = d.get("watch") if isinstance(d.get("watch"), dict) else None
+    if wt and key.startswith("series:") and wt.get("sid"):
+        with RU_LOCK:
+            data = _ru_data()
+            w = data.setdefault("watch", {}).setdefault(key, {"seen": []})
+            sc = wt.get("scope")
+            w.update(on=True, sid=str(wt.get("sid"))[:40], name=str(wt.get("name") or mt.get("title") or "")[:120],
+                     acc=p["id"], folder=int(d.get("folder_id") or 0) if str(d.get("folder_id") or "0").lstrip("-").isdigit() else 0,
+                     scope=(int(sc) if str(sc).isdigit() else "all"))
+            w["seen"] = list(dict.fromkeys((w.get("seen") or []) + [x["e"] for x in items if x["e"]]))
+            try:
+                store_save(RU_FILE, data)
+            except Exception:
+                pass
     return jsonify(ok=True, account=p["name"], count=len(items), id=rid)
 
 
@@ -10041,7 +10055,8 @@ def ru_links():
     data = _ru_data()
     files = ((data.get("links") or {}).get(key) or {}).get("files") or []
     pend = sum(1 for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done"))
-    return jsonify(ok=True, files=files, pending=pend)
+    w = (data.get("watch") or {}).get(key) or {}
+    return jsonify(ok=True, files=files, pending=pend, watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
 
 
 @app.get("/ru/status")
@@ -10055,6 +10070,123 @@ def ru_status():
         return jsonify(ok=True, res=res)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 502
+
+
+# ---- متابعة المسلسلات: أي حلقة جديدة بتظهر في الـIPTV بتترفع لوحدها بنفس المجلد وباسم SxxExx ----
+def _ru_iptv_acc():
+    al = iptv_load()
+    rec = al.get(IPTV_ALL) or {}
+    if not rec.get("host"):
+        rec = next((v for k, v in al.items() if isinstance(v, dict) and v.get("host") and not str(k).startswith("__")), {})
+    accs = iptv_accs(rec)
+    return accs[0] if accs else None
+
+
+def _ru_series_eps(a, sid):
+    u = f"{a['host']}/player_api.php"
+    r = requests.get(u, params={"username": a["user"], "password": a["pass"], "action": "get_series_info", "series_id": sid}, timeout=40)
+    v = jj(r)
+    eps = (v or {}).get("episodes") or {}
+    out = []
+
+    def add(x, sn=None):
+        try:
+            out.append({"id": str(x.get("id")), "ext": x.get("container_extension") or "mp4",
+                        "s": int(x.get("season") or sn or 0), "e": int(x.get("episode_num") or 0)})
+        except Exception:
+            pass
+    if isinstance(eps, list):
+        for a_ in eps:
+            for x in (a_ if isinstance(a_, list) else [a_]):
+                add(x)
+    elif isinstance(eps, dict):
+        for sn, lst in eps.items():
+            for x in (lst or []):
+                add(x, sn)
+    out.sort(key=lambda x: (x["s"], x["e"]))
+    return a, out
+
+
+def _ru_watch_run():
+    data = _ru_data()
+    ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on")}
+    if not ws:
+        return 0
+    a = _ru_iptv_acc()
+    if not a:
+        return 0
+    sent = 0
+    for key, w in ws.items():
+        try:
+            p = _ru_acc(w.get("acc"))
+            send = RU_HOSTS.get(p["type"]) if p else None
+            if not send:
+                continue
+            _, eps = _ru_series_eps(a, w["sid"])
+            have = set(w.get("seen") or [])
+            for f in (((_ru_data().get("links") or {}).get(key) or {}).get("files") or []):
+                if f.get("ep"):
+                    have.add(str(f["ep"]))
+            sc = w.get("scope", "all")
+            new = [x for x in eps if x["id"] not in have and (sc == "all" or x["s"] == sc)]
+            if not new:
+                continue
+            items = [{"u": f"{a['host']}/series/{quote(a['user'])}/{quote(a['pass'])}/{x['id']}.{x['ext']}",
+                      "n": _ru_clean("%s S%02dE%02d.%s" % (w.get("name") or key, x["s"], x["e"], x["ext"])),
+                      "e": x["id"]} for x in new[:30]]
+            res = send(p, [x["u"] for x in items], str(w.get("folder") or 0), None)
+            rid = res.get("id") if isinstance(res, dict) else None
+            with RU_LOCK:
+                data = _ru_data()
+                ww = (data.get("watch") or {}).get(key)
+                if ww is None:
+                    continue
+                ww["seen"] = list(dict.fromkeys((ww.get("seen") or []) + [x["e"] for x in items]))
+                ww["last"] = int(time.time())
+                if rid:
+                    data.setdefault("jobs", []).append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False})
+                    data["jobs"] = data["jobs"][-80:]
+                store_save(RU_FILE, data)
+            sent += len(items)
+        except Exception as e:
+            app.logger.warning("ru watch %s: %s", key, e)
+    return sent
+
+
+def _ru_bg_loop():
+    time.sleep(60)
+    n = 0
+    every = max(int(os.environ.get("RU_WATCH_MIN", "30")), 5)
+    while True:
+        try:
+            if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
+                _ru_sync()
+            if n % every == 0:
+                _ru_watch_run()
+        except Exception:
+            pass
+        n += 1
+        time.sleep(60)
+
+
+if os.environ.get("RU_AUTOWATCH", "1") != "0":
+    threading.Thread(target=_ru_bg_loop, daemon=True).start()
+
+
+@app.post("/ru/watch")
+def ru_watch_set():
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    with RU_LOCK:
+        data = _ru_data()
+        w = (data.get("watch") or {}).get(key)
+        if not w:
+            return jsonify(ok=False, error="مفيش متابعة للمسلسل ده"), 404
+        w["on"] = bool(d.get("on"))
+        store_save(RU_FILE, data)
+    if d.get("now"):
+        threading.Thread(target=_ru_watch_run, daemon=True).start()
+    return jsonify(ok=True, on=w["on"])
 
 
 # ============================================================
@@ -10087,8 +10219,25 @@ def _lib_items(data):
     return out
 
 
+_LIB_SYNC = [0.0]
+
+
+def _lib_bg_sync():
+    """أي رفع ريموت لسه معلّق بيتزامن في الخلفية، فالملفات تظهر في المكتبة من غير ما تفتح صفحة الفيلم."""
+    try:
+        if time.time() - _LIB_SYNC[0] < 15:
+            return
+        if not any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
+            return
+        _LIB_SYNC[0] = time.time()
+        threading.Thread(target=_ru_sync, daemon=True).start()
+    except Exception:
+        pass
+
+
 @app.get("/lib/list")
 def lib_list():
+    _lib_bg_sync()
     return jsonify(ok=True, items=_lib_items(_ru_data()), admin=(g.role == "admin"))
 
 
