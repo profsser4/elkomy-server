@@ -10332,7 +10332,8 @@ def lib_item():
     key = str(request.args.get("key", ""))[:60]
     data = _ru_data()
     v = (data.get("links") or {}).get(key) or {}
-    files = [{"i": i, "ep": f.get("ep") or "", "name": f.get("name") or ""}
+    adm = g.role == "admin"
+    files = [dict({"i": i, "ep": f.get("ep") or "", "name": f.get("name") or ""}, **({"link": f.get("link")} if adm else {}))
              for i, f in enumerate(v.get("files") or []) if f.get("ok") and f.get("link")]
     if not files:
         return jsonify(ok=False, error="مش موجود في المكتبة"), 404
