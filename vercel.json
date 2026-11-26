@@ -1,8 +1,5 @@
 {
   "functions": {
     "wsgi.py": { "maxDuration": 60 }
-  },
-  "crons": [
-    { "path": "/cron/ru", "schedule": "*/5 * * * *" }
-  ]
+  }
 }
