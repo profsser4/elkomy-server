@@ -680,7 +680,7 @@ def needs_admin(path, method):
 @app.before_request
 def guard():
     open_paths = ("/", "/auth", "/ud/beacon")
-    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith(("/subx/", "/auth/", "/px/")):
+    if request.method == "OPTIONS" or request.path in open_paths or request.path.startswith(("/subx/", "/auth/", "/px/", "/cron/")):
         return None
     who, why, _rec, _sid = read_token_ex(request.headers.get("X-Token", ""))
     if not who:
@@ -10159,11 +10159,17 @@ def _ru_iptv_acc():
     return accs[0] if accs else None
 
 
-def _ru_series_eps(a, sid):
-    u = f"{a['host']}/player_api.php"
-    r = requests.get(u, params={"username": a["user"], "password": a["pass"], "action": "get_series_info", "series_id": sid}, timeout=40)
+def _ru_series_pull(a, sid):
+    """من الـIPTV: (meta, eps). meta = بيانات العمل، eps = كل الحلقات مرتّبة (موسم ثم حلقة).
+    لو السيرفر مش بيوصل للـIPTV (آيبي مصري مثلًا) ضيف متغير IPTV_PROXY."""
+    px = os.environ.get("IPTV_PROXY", "").strip()
+    r = requests.get(f"{a['host']}/player_api.php",
+                     params={"username": a["user"], "password": a["pass"], "action": "get_series_info", "series_id": sid},
+                     timeout=40, proxies=({"http": px, "https": px} if px else None))
     v = jj(r)
-    eps = (v or {}).get("episodes") or {}
+    if not isinstance(v, dict) or not (v.get("episodes") or v.get("info")):
+        raise Exception("الـIPTV مرجّعش بيانات للمسلسل (السيرفر ممكن يكون محجوب أو الاشتراك منتهي)")
+    eps = v.get("episodes") or {}
     out = []
 
     def add(x, sn=None):
@@ -10180,40 +10186,130 @@ def _ru_series_eps(a, sid):
         for sn, lst in eps.items():
             for x in (lst or []):
                 add(x, sn)
+    # حلقة من غير رقم: نديها رقم متسلسل جوه موسمها عشان الاسم SxxExx ميتكررش
+    by_s = {}
+    for x in out:
+        by_s.setdefault(x["s"], []).append(x)
+    for lst in by_s.values():
+        used = {x["e"] for x in lst if x["e"]}
+        n = 0
+        for x in sorted(lst, key=lambda z: (z["e"] or 10 ** 9, int(z["id"]) if z["id"].isdigit() else 0)):
+            if not x["e"]:
+                n += 1
+                while n in used:
+                    n += 1
+                x["e"] = n
+                used.add(n)
     out.sort(key=lambda x: (x["s"], x["e"]))
-    return a, out
+    inf = v.get("info") or {}
+
+    def num(z):
+        try:
+            return float(z)
+        except Exception:
+            return 0.0
+    bd = inf.get("backdrop_path")
+    meta = {"title": str(inf.get("name") or "")[:120],
+            "poster": str(inf.get("cover") or inf.get("cover_big") or (bd[0] if isinstance(bd, list) and bd else "") or ""),
+            "year": str(inf.get("releaseDate") or inf.get("release_date") or inf.get("year") or "")[:4],
+            "rating": num(inf.get("rating")) or num(inf.get("rating_5based")) * 2,
+            "plot": str(inf.get("plot") or inf.get("description") or "")[:700]}
+    return meta, out
 
 
-def _ru_watch_run():
+def _ru_series_eps(a, sid):
+    return a, _ru_series_pull(a, sid)[1]
+
+
+def _ru_mk(p, name, parent=0):
+    """مجلد بالاسم جوه parent (لو موجود بنستخدمه) → رقمه."""
+    def find():
+        for f in _ru_subs(_fi_call(p, "folder/ls", {"folder_id": parent})):
+            if str(f.get("name")) == name:
+                return int(f.get("id"))
+        return None
+    fid = find()
+    if fid is None:
+        res = _fi_call(p, "folder/mkdir", {"name": name, "folder_id": parent})
+        fid = res.get("folder_id") or res.get("id")
+        fid = int(fid) if fid else find()
+    if fid is None:
+        raise Exception("المجلد اتعمل بس مقدرتش أجيب رقمه")
+    return fid
+
+
+def _ru_watch_run(only=None, force=False, eps_override=None):
+    """بيفحص المسلسلات المتابَعة: أي حلقة جديدة (أو فاشلة/ضايعة) بتتبعت لـ1fichier بنفس المجلد وباسم SxxExx.
+    الدور بيتحجز في التخزين الدائم عشان أكتر من instance ما يرفعوش نفس الحلقة مرتين."""
     if time.time() < _FI_COOL[0]:
         return 0
     data = _ru_data()
-    ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on")}
+    ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on") and (not only or k == only)}
     if not ws:
         return 0
     a = _ru_iptv_acc()
     if not a:
         return 0
-    sent = 0
-    for key, w in ws.items():
+    gap = max(int(os.environ.get("RU_WATCH_MIN", "15") or 15), 3) * 60
+    t0, sent = time.time(), 0
+    for key, _w in sorted(ws.items(), key=lambda kv: float(kv[1].get("chk") or 0)):
+        if time.time() - t0 > 45 or time.time() < _FI_COOL[0]:
+            break
+        with RU_LOCK:
+            d2 = _ru_data()
+            w = (d2.get("watch") or {}).get(key)
+            if not w or not w.get("on"):
+                continue
+            if not force and time.time() - float(w.get("chk") or 0) < (240 if w.get("backlog") else gap):
+                continue
+            w["chk"] = time.time()
+            try:
+                store_save(RU_FILE, d2)
+            except Exception:
+                pass
         try:
-            p = _ru_acc(w.get("acc"))
+            p = _ru_acc(w.get("acc")) or (_ru_accounts() or [None])[0]
             send = RU_HOSTS.get(p["type"]) if p else None
             if not send:
                 continue
-            _, eps = _ru_series_eps(a, w["sid"])
-            have = set(w.get("seen") or [])
-            for f in (((_ru_data().get("links") or {}).get(key) or {}).get("files") or []):
-                if f.get("ep"):
-                    have.add(str(f["ep"]))
+            eps = (eps_override or {}).get(key)
+            if eps is None:
+                eps = _ru_series_pull(a, w["sid"])[1]
+            cur = _ru_data()
+            cw = (cur.get("watch") or {}).get(key) or {}
+            files = ((cur.get("links") or {}).get(key) or {}).get("files") or []
+            okeps = {str(f["ep"]) for f in files if f.get("ep") and f.get("ok")}
+            failed = {str(f["ep"]) for f in files if f.get("ep") and not f.get("ok")}
+            seen, tries = set(cw.get("seen") or []), cw.get("tries") or {}
+            pend = set()
+            for j in cur.get("jobs") or []:
+                if j.get("key") == key and not j.get("done") and time.time() - int(j.get("t") or 0) < 6 * 3600:
+                    pend |= {str(x.get("e")) for x in j.get("items") or []}
+            # اتبعتت قبل كده بس مفيش ملف ولا طلب شغّال (فشلت/ضاعت): نعيدها لحد 3 مرات
+            lost = {e for e in ((seen | failed) - okeps - pend) if int(tries.get(e, 0)) < 3}
+            have = (seen | okeps | failed) - lost
             sc = w.get("scope", "all")
             new = [x for x in eps if x["id"] not in have and (sc == "all" or x["s"] == sc)]
             if not new:
+                with RU_LOCK:
+                    data = _ru_data()
+                    ww = (data.get("watch") or {}).get(key)
+                    if ww is not None and (ww.get("backlog") or ww.get("err")):
+                        ww["backlog"] = False
+                        ww.pop("err", None)
+                        store_save(RU_FILE, data)
                 continue
             items = [{"u": f"{a['host']}/series/{quote(a['user'])}/{quote(a['pass'])}/{x['id']}.{x['ext']}",
                       "n": _ru_clean("%s S%02dE%02d.%s" % (w.get("name") or key, x["s"], x["e"], x["ext"])),
                       "e": x["id"]} for x in new[:30]]
-            res = send(p, [x["u"] for x in items], str(w.get("folder") or 0), None)
+            try:
+                res = send(p, [x["u"] for x in items], str(w.get("folder") or 0), None)
+            except Exception as e:
+                m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
+                if not m_:
+                    _fi_mark(p, str(e))
+                    raise
+                res = {"id": int(m_.group(1))}
             rid = res.get("id") if isinstance(res, dict) else None
             with RU_LOCK:
                 data = _ru_data()
@@ -10221,22 +10317,40 @@ def _ru_watch_run():
                 if ww is None:
                     continue
                 ww["seen"] = list(dict.fromkeys((ww.get("seen") or []) + [x["e"] for x in items]))
+                tr = ww.setdefault("tries", {})
+                for x in items:
+                    tr[x["e"]] = int(tr.get(x["e"], 0)) + 1
                 ww["last"] = int(time.time())
+                ww["backlog"] = len(new) > len(items)
+                ww.pop("err", None)
                 if rid:
-                    data.setdefault("jobs", []).append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False, "folder": w.get("folder")})
-                    data["jobs"] = data["jobs"][-80:]
+                    jobs = data.setdefault("jobs", [])
+                    for oj in [x for x in jobs if str(x.get("id")) == str(rid)]:
+                        jobs.remove(oj)
+                    jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items,
+                                 "done": False, "folder": w.get("folder")})
+                    data["jobs"] = jobs[-80:]
                 store_save(RU_FILE, data)
             sent += len(items)
         except Exception as e:
             _fi_cool(e)
             app.logger.warning("ru watch %s: %s", key, e)
+            try:
+                with RU_LOCK:
+                    data = _ru_data()
+                    ww = (data.get("watch") or {}).get(key)
+                    if ww is not None:
+                        ww["err"] = str(e)[:160]
+                        store_save(RU_FILE, data)
+            except Exception:
+                pass
     return sent
 
 
 def _ru_bg_loop():
     time.sleep(60)
     n = 0
-    every = max(int(os.environ.get("RU_WATCH_MIN", "30")), 5)
+    every = max(int(os.environ.get("RU_WATCH_MIN", "15")), 5)
     while True:
         try:
             if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
@@ -10269,6 +10383,119 @@ def ru_watch_set():
     return jsonify(ok=True, on=w["on"])
 
 
+@app.post("/ru/follow")
+def ru_follow():
+    """ضغطة واحدة: يعمل مجلد بالاسم، يرفع كل الحلقات، يضيف المسلسل للمكتبة، ويفضل يتابع الحلقات الجديدة لوحده."""
+    d = request.get_json(silent=True) or {}
+    sid = str(d.get("sid") or "").strip()
+    if not sid.isdigit() or len(sid) > 20:
+        return jsonify(ok=False, error="رقم المسلسل غلط"), 400
+    a = _ru_iptv_acc()
+    if not a:
+        return jsonify(ok=False, error="مفيش حساب IPTV متسجّل"), 400
+    key = "series:" + sid
+    d0 = _ru_data()
+    cfg, old = d0.get("cfg") or {}, (d0.get("watch") or {}).get(key) or {}
+    p = _ru_acc(d.get("account_id") or old.get("acc") or cfg.get("acc") or "") or (_ru_accounts() or [None])[0]
+    if not p:
+        return jsonify(ok=False, error="مفيش حساب 1fichier بمفتاح API. ضيفه من الإعدادات ← المزوّدين"), 400
+    cm = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+    meta, eps, from_client = {}, [], False
+    try:
+        meta, eps = _ru_series_pull(a, sid)
+    except Exception as e:
+        # السيرفر مش واصل للـIPTV: نستخدم قايمة الحلقات اللي المتصفح باعتها (أول دفعة بس)
+        for x in (d.get("eps") or [])[:600]:
+            try:
+                eps.append({"id": str(int(x.get("id"))), "ext": re.sub(r"\W", "", str(x.get("ext") or "mp4"))[:5] or "mp4",
+                            "s": int(x.get("s") or 0), "e": int(x.get("e") or 0)})
+            except Exception:
+                pass
+        if not eps:
+            return jsonify(ok=False, error="السيرفر مش واصل للـIPTV: " + str(e)[:140]), 502
+        from_client = True
+    title = _ru_clean(d.get("name") or meta.get("title") or cm.get("title"), "") or ("series " + sid)
+    parent = int(d["parent"]) if str(d.get("parent", "")).isdigit() else int(cfg.get("parent") or 0)
+    try:
+        fid = old["folder"] if old.get("folder") is not None else _ru_mk(p, title, parent)
+    except Exception as e:
+        _fi_mark(p, str(e))
+        return jsonify(ok=False, error=str(e)), 502
+    with RU_LOCK:
+        data = _ru_data()
+        m = data.setdefault("lib", {}).setdefault(key, {})
+        poster = str(meta.get("poster") or cm.get("poster") or "")[:500]
+        m.update(title=title, kind="series", year=str(meta.get("year") or cm.get("year") or "")[:10],
+                 plot=str(meta.get("plot") or cm.get("plot") or "")[:700])
+        if poster.startswith(("http://", "https://")):
+            m["poster"] = poster
+        try:
+            m["rating"] = float(meta.get("rating") or cm.get("rating") or 0)
+        except Exception:
+            pass
+        w = data.setdefault("watch", {}).setdefault(key, {"seen": []})
+        sc = d.get("scope")
+        w.update(on=True, sid=sid, name=title, acc=p["id"], folder=fid, scope=(int(sc) if str(sc).isdigit() else "all"),
+                 auto=True, backlog=True, chk=0)
+        w.setdefault("added", int(time.time()))
+        data["cfg"] = {"acc": p["id"], "parent": parent}
+        store_save(RU_FILE, data)
+    sent = _ru_watch_run(only=key, force=True, eps_override=({key: eps} if from_client else None))
+    return jsonify(ok=True, title=title, folder=fid, account=p["name"], episodes=len(eps), sent=sent,
+                   already=bool(old.get("on")))
+
+
+@app.get("/ru/watchlist")
+def ru_watchlist():
+    data = _ru_data()
+    jobs, out = data.get("jobs") or [], []
+    for k, w in (data.get("watch") or {}).items():
+        files = ((data.get("links") or {}).get(k) or {}).get("files") or []
+        out.append({"key": k, "name": w.get("name") or k, "on": bool(w.get("on")),
+                    "ok": sum(1 for f in files if f.get("ok") and f.get("link")),
+                    "bad": sum(1 for f in files if not f.get("ok")),
+                    "pending": sum(1 for j in jobs if j.get("key") == k and not j.get("done")),
+                    "backlog": bool(w.get("backlog")), "err": str(w.get("err") or ""),
+                    "chk": int(w.get("chk") or 0), "last": int(w.get("last") or 0),
+                    "poster": ((data.get("lib") or {}).get(k) or {}).get("poster") or ""})
+    out.sort(key=lambda x: x["name"].lower())
+    return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
+                   cool=max(0, int(_FI_COOL[0] - time.time())))
+
+
+@app.post("/ru/runnow")
+def ru_runnow():
+    try:
+        pend = _ru_sync()
+        sent = _ru_watch_run(force=True)
+        return jsonify(ok=True, pending=pend, sent=sent)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)[:200]), 502
+
+
+@app.route("/cron/ru", methods=["GET", "POST"])
+def cron_ru():
+    """بيتنادى كل 5 دقايق من Vercel Cron أو cron-job.org: يكمّل الرفع المعلّق ويفحص الحلقات الجديدة.
+    محمي بمتغير CRON_KEY (أو CRON_SECRET بتاع Vercel) — ?key=... أو Authorization: Bearer ..."""
+    want = os.environ.get("CRON_KEY", "") or os.environ.get("CRON_SECRET", "")
+    got = request.args.get("key", "") or request.headers.get("X-Cron-Key", "")
+    au = request.headers.get("Authorization", "")
+    if not got and au.startswith("Bearer "):
+        got = au[7:]
+    if not want or not hmac.compare_digest(got.encode(), want.encode()):
+        return jsonify(error="forbidden"), 403
+    out = {}
+    try:
+        out["pending"] = _ru_sync()
+    except Exception as e:
+        out["sync_err"] = str(e)[:120]
+    try:
+        out["sent"] = _ru_watch_run()
+    except Exception as e:
+        out["watch_err"] = str(e)[:120]
+    return jsonify(ok=True, **out)
+
+
 # ============================================================
 # المكتبة: اللي بيترفع بيظهر للأعضاء كلهم بلينكات المرفوعات (اللينك نفسه مخفي عنهم)
 # الأدمن: تثبيت / إلغاء تثبيت / شيل من المكتبة. الترتيب العادي = الأحدث رفعًا الأول، والمثبّت فوق.
@@ -10290,11 +10517,15 @@ def _lib_items(data):
             rating = float(m.get("rating") or 0)
         except Exception:
             rating = 0
+        ts = [int(f.get("t") or 0) for f in files]
+        newest = max(files, key=lambda f: int(f.get("t") or 0))
+        tg = re.search(r"S\d+E\d+", str(newest.get("name") or ""), re.I)
+        newn = sum(1 for t_ in ts if time.time() - t_ < 3 * 86400)
         out.append({"key": key, "title": m.get("title") or key, "poster": m.get("poster") or "",
                     "year": m.get("year") or "", "rating": rating,
                     "kind": m.get("kind") or key.split(":")[0], "n": len(files),
-                    "pin": int(m.get("pin") or 0),
-                    "t": max([int(f.get("t") or 0) for f in files] or [0])})
+                    "pin": int(m.get("pin") or 0), "new": newn, "last": tg.group(0).upper() if tg else "",
+                    "t": max(ts or [0])})
     out.sort(key=lambda x: (0, -x["pin"], -x["t"]) if x["pin"] else (1, 0, -x["t"]))
     return out
 
@@ -10313,10 +10544,10 @@ def _lib_bg_sync():
             _LIB_SYNC[0] = now
             if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
                 _ru_sync()
-        if now - _WATCH_LAST[0] >= max(int(os.environ.get("RU_WATCH_MIN", "30")), 5) * 60:
+        if now - _WATCH_LAST[0] >= max(int(os.environ.get("RU_WATCH_MIN", "15")), 5) * 60:
             _WATCH_LAST[0] = now
             if any(w.get("on") for w in (_ru_data().get("watch") or {}).values()):
-                _ru_watch_run()
+                threading.Thread(target=_ru_watch_run, daemon=True).start()
     except Exception as e:
         app.logger.warning("lib sync: %s", e)
 
@@ -10337,7 +10568,10 @@ def lib_item():
              for i, f in enumerate(v.get("files") or []) if f.get("ok") and f.get("link")]
     if not files:
         return jsonify(ok=False, error="مش موجود في المكتبة"), 404
-    files.sort(key=lambda f: _nat(f["name"]))
+    def _ek(f):
+        mm = re.search(r"S(\d+)E(\d+)", f["name"], re.I)
+        return (0, int(mm.group(1)), int(mm.group(2)), _nat(f["name"])) if mm else (1, 0, 0, _nat(f["name"]))
+    files.sort(key=_ek)                     # الموسم ثم الحلقة، مهما كان ترتيب الرفع
     m = (data.get("lib") or {}).get(key) or {}
     return jsonify(ok=True, key=key, title=m.get("title") or key, poster=m.get("poster") or "",
                    year=m.get("year") or "", rating=m.get("rating") or 0, plot=m.get("plot") or "",
