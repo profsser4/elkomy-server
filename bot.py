@@ -9788,12 +9788,25 @@ def _ru_acc(pid):
     return next((p for p in _ru_accounts() if p["id"] == pid), None)
 
 
+_FI_LAST = [0.0]
+
+
 def _fi_call(p, path, body):
+    left = _fi_cool_left()
+    if left > 0:
+        # فترة هدوء بعد قفل 1fichier للحساب: مفيش أي طلب يتبعت لحد ما تخلص
+        raise Exception("1fichier في فترة هدوء، جرّب بعد %d دقيقة" % (left // 60 + 1))
+    gap = float(os.environ.get("FI_GAP", "1.2") or 1.2) - (time.time() - _FI_LAST[0])
+    if gap > 0:
+        time.sleep(gap)                 # مسافة بين الطلبات عشان 1fichier ما يعتبرهاش flood
+    _FI_LAST[0] = time.time()
     r = requests.post(f"{FI_API}/{path}.cgi", json=body,
                       headers={"Authorization": "Bearer " + p["key"]}, timeout=30)
     res = jj(r)
     if isinstance(res, dict) and res.get("status") == "KO":
-        raise Exception(res.get("message") or "1fichier رفض الطلب")
+        msg = res.get("message") or "1fichier رفض الطلب"
+        _fi_cool(msg)
+        raise Exception(msg)
     return res
 
 
@@ -9921,16 +9934,23 @@ def ru_send():
     if not send:
         return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
     already = False
-    try:
-        res = send(p, [x["u"] for x in items], d.get("folder_id") or "0", d.get("headers") or None)
-    except Exception as e:
-        m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
-        if not m_:
-            _fi_mark(p, str(e))
-            return jsonify(ok=False, error=str(e)), 502
-        res, already = {"id": int(m_.group(1))}, True      # الطلب اتبعت قبل كده: نكمّل متابعته بدل ما نعتبره فشل
-    rid = res.get("id") if isinstance(res, dict) else None
     key = str(d.get("key") or "")[:60]
+    queued = len(items) > 1 or (key.startswith("series:") and _ru_has_active(key))
+    if queued:
+        key = key or ("q:" + format(int(time.time() * 1000), "x"))
+        fq = int(d.get("folder_id") or 0) if str(d.get("folder_id") or "0").isdigit() else 0
+        _ru_queue_add(key, p["id"], fq, items)          # رابط واحد في المرة، والتاني لما الأول يخلّص
+        res = {}
+    else:
+        try:
+            res = send(p, [x["u"] for x in items], d.get("folder_id") or "0", d.get("headers") or None)
+        except Exception as e:
+            m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
+            if not m_:
+                _fi_mark(p, str(e))
+                return jsonify(ok=False, error=str(e)), 502
+            res, already = {"id": int(m_.group(1))}, True      # الطلب اتبعت قبل كده: نكمّل متابعته بدل ما نعتبره فشل
+    rid = res.get("id") if isinstance(res, dict) else None
     mt = d.get("meta") if isinstance(d.get("meta"), dict) else {}
     if rid or (key and mt):
         with RU_LOCK:
@@ -9972,7 +9992,12 @@ def ru_send():
                 store_save(RU_FILE, data)
             except Exception:
                 pass
-    return jsonify(ok=True, account=p["name"], count=len(items), id=rid, already=already)
+    if queued:
+        try:
+            _ru_pump()
+        except Exception as e:
+            app.logger.warning("ru pump: %s", e)
+    return jsonify(ok=True, account=p["name"], count=len(items), id=rid, already=already, queued=queued)
 
 
 def _ru_info(p, rid):
@@ -9987,10 +10012,29 @@ def _ru_info(p, rid):
 _FI_COOL = [0.0]
 
 
+RU_COOL_FILE = os.path.join(DATA_DIR, "ru_cool.json")
+
+
+def _fi_cool_left():
+    """الثواني المتبقية من فترة الهدوء (مشتركة بين كل الـinstances عن طريق التخزين الدائم)."""
+    if time.time() >= _FI_COOL[0]:
+        try:
+            v = float((store_load(RU_COOL_FILE) or {}).get("t") or 0)
+        except Exception:
+            v = 0.0
+        if v > _FI_COOL[0]:
+            _FI_COOL[0] = v
+    return max(0, int(_FI_COOL[0] - time.time()))
+
+
 def _fi_cool(e):
-    """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات التلقائية 30 دقيقة."""
+    """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات 30 دقيقة (FI_COOL_MIN) في كل الـinstances."""
     if re.search(r"lock|flood|too many|#211|#316", str(e), re.I):
-        _FI_COOL[0] = time.time() + 1800
+        _FI_COOL[0] = time.time() + max(int(os.environ.get("FI_COOL_MIN", "30") or 30), 5) * 60
+        try:
+            store_save(RU_COOL_FILE, {"t": _FI_COOL[0]})
+        except Exception:
+            pass
 
 
 def _ru_scan_folder(p, j, data):
@@ -10012,26 +10056,30 @@ def _ru_scan_folder(p, j, data):
     return out
 
 
-def _ru_sync():
+def _ru_sync_core():
     """بيشوف الطلبات اللي لسه ما خلصتش؛ اللي خلص: يظبط الاسم الحقيقي ويحفظ اللينك."""
-    if time.time() < _FI_COOL[0]:
+    if _fi_cool_left() > 0:
         return -1
     with RU_LOCK:
         data = _ru_data()
         jobs = data.get("jobs") or []
         links = data.setdefault("links", {})
         changed = False
+        budget = 4
         for j in jobs:
             if j.get("done"):
                 continue
+            if budget <= 0:
+                break
             p = _ru_acc(j.get("acc"))
             if not p:
                 continue
-            if time.time() - float(j.get("chk") or 0) < 90:
+            if time.time() - float(j.get("chk") or 0) < 120:
                 continue
             j["chk"] = time.time()
             changed = True
-            if time.time() < _FI_COOL[0]:
+            budget -= 1
+            if _fi_cool_left() > 0:
                 break
             info, einfo = {}, None
             cands = [p] + [a for a in _ru_accounts() if a["id"] != p["id"]]   # الطلب ممكن يكون تابع لحساب تاني
@@ -10044,7 +10092,7 @@ def _ru_sync():
                 except Exception as e:
                     einfo = str(e)[:200]
                     _fi_cool(e)
-                    if time.time() < _FI_COOL[0]:
+                    if _fi_cool_left() > 0:
                         break
                     time.sleep(0.4)
             res_l = (info.get("result") or []) if isinstance(info, dict) else []
@@ -10061,7 +10109,7 @@ def _ru_sync():
                         except Exception as e:
                             einfo = einfo or str(e)[:200]
                             _fi_cool(e)
-                            if time.time() < _FI_COOL[0]:
+                            if _fi_cool_left() > 0:
                                 break
                         time.sleep(0.4)
                 if not found:
@@ -10113,6 +10161,124 @@ def _ru_sync():
         return sum(1 for j in jobs if not j.get("done"))
 
 
+def _ru_has_active(key):
+    d = _ru_data()
+    if any(j.get("key") == key and not j.get("done") for j in (d.get("jobs") or [])):
+        return True
+    return bool(((d.get("queue") or {}).get(key) or {}).get("items"))
+
+
+def _ru_queue_add(key, acc, folder, items):
+    """بيضيف روابط للطابور (من غير تكرار): الرفع بيتم رابط واحد في المرة."""
+    with RU_LOCK:
+        data = _ru_data()
+        q = data.setdefault("queue", {}).setdefault(key, {"items": []})
+        q["acc"], q["folder"] = acc, folder
+        have = {x.get("e") for x in q["items"] if x.get("e")} | {x.get("u") for x in q["items"]}
+        for x in items:
+            if (x.get("e") and x["e"] in have) or x.get("u") in have:
+                continue
+            q["items"].append({"u": x["u"], "n": x.get("n") or "", "e": x.get("e") or ""})
+        store_save(RU_FILE, data)
+
+
+def _ru_pump():
+    """لكل عمل في الطابور: لو مفيش طلب شغّال له، يبعت الرابط اللي بعده (QUEUE_BATCH، الافتراضي 1)."""
+    if _fi_cool_left() > 0:
+        return 0
+    nb = max(int(os.environ.get("QUEUE_BATCH", "1") or 1), 1)
+    sent, t0 = 0, time.time()
+    for key in list((_ru_data().get("queue") or {}).keys()):
+        if time.time() - t0 > 40 or _fi_cool_left() > 0:
+            break
+        with RU_LOCK:
+            data = _ru_data()
+            q = (data.get("queue") or {}).get(key)
+            if not q or not q.get("items"):
+                (data.get("queue") or {}).pop(key, None)
+                store_save(RU_FILE, data)
+                continue
+            if any(j.get("key") == key and not j.get("done") for j in (data.get("jobs") or [])):
+                continue                                    # لسه اللي قبله بيتسحب
+            if time.time() - float(q.get("claim") or 0) < 60:
+                continue                                    # instance تانية بتبعته دلوقتي
+            q["claim"] = time.time()
+            items, acc, folder = list(q["items"][:nb]), q.get("acc"), q.get("folder")
+            store_save(RU_FILE, data)
+        p = _ru_acc(acc) or (_ru_accounts() or [None])[0]
+        send = RU_HOSTS.get(p["type"]) if p else None
+        if not send:
+            continue
+        try:
+            try:
+                res = send(p, [x["u"] for x in items], str(folder or 0), None)
+            except Exception as e:
+                m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
+                if not m_:
+                    _fi_mark(p, str(e))
+                    raise
+                res = {"id": int(m_.group(1))}
+        except Exception as e:
+            _fi_cool(e)
+            app.logger.warning("ru pump %s: %s", key, e)
+            with RU_LOCK:
+                data = _ru_data()
+                q = (data.get("queue") or {}).get(key)
+                if q is not None:
+                    q.pop("claim", None)
+                    q["err"] = str(e)[:160]
+                    q["fails"] = int(q.get("fails") or 0) + 1
+                    if q["fails"] >= 5 and q["items"]:         # رابط بيفشل كل مرة: نشيله ونسجّله فاشل ونكمّل اللي بعده
+                        bad = q["items"].pop(0)
+                        data.setdefault("links", {}).setdefault(key, {"files": []})["files"].append(
+                            {"ep": bad.get("e") or "", "name": bad.get("n") or "", "t": int(time.time()), "ok": False,
+                             "err": str(e)[:160]})
+                        q["fails"] = 0
+                    if not q["items"]:
+                        data["queue"].pop(key, None)
+                    store_save(RU_FILE, data)
+            continue
+        rid = res.get("id") if isinstance(res, dict) else None
+        with RU_LOCK:
+            data = _ru_data()
+            q = (data.get("queue") or {}).get(key)
+            if q is not None:
+                done_e = {(x.get("e"), x.get("u")) for x in items}
+                q["items"] = [x for x in q["items"] if (x.get("e"), x.get("u")) not in done_e]
+                q.pop("claim", None)
+                q.pop("err", None)
+                q["fails"] = 0
+                if not q["items"]:
+                    data["queue"].pop(key, None)
+            w = (data.get("watch") or {}).get(key)
+            if w is not None:
+                w["seen"] = list(dict.fromkeys((w.get("seen") or []) + [x["e"] for x in items if x.get("e")]))
+                tr = w.setdefault("tries", {})
+                for x in items:
+                    if x.get("e"):
+                        tr[x["e"]] = int(tr.get(x["e"], 0)) + 1
+                w["last"] = int(time.time())
+            if rid:
+                jobs = data.setdefault("jobs", [])
+                for oj in [x for x in jobs if str(x.get("id")) == str(rid)]:
+                    jobs.remove(oj)
+                jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items,
+                             "done": False, "folder": folder})
+                data["jobs"] = jobs[-80:]
+            store_save(RU_FILE, data)
+        sent += len(items)
+    return sent
+
+
+def _ru_sync():
+    r = _ru_sync_core()
+    try:
+        _ru_pump()
+    except Exception as e:
+        app.logger.warning("ru pump: %s", e)
+    return r
+
+
 @app.post("/ru/sync")
 def ru_sync():
     if time.time() - _RU_LAST[0] < 8:
@@ -10133,7 +10299,11 @@ def ru_links():
     pend = sum(1 for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done"))
     w = (data.get("watch") or {}).get(key) or {}
     errs = [str(j.get("err"))[:160] for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done") and j.get("err")]
-    return jsonify(ok=True, files=files, pending=pend, errs=errs[:3], watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
+    qn = len(((data.get("queue") or {}).get(key) or {}).get("items") or [])
+    qe = str(((data.get("queue") or {}).get(key) or {}).get("err") or "")
+    if qe:
+        errs.append(qe)
+    return jsonify(ok=True, files=files, pending=pend, queued=qn, errs=errs[:3], watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
 
 
 @app.get("/ru/status")
@@ -10241,7 +10411,7 @@ def _ru_mk(p, name, parent=0):
 def _ru_watch_run(only=None, force=False, eps_override=None):
     """بيفحص المسلسلات المتابَعة: أي حلقة جديدة (أو فاشلة/ضايعة) بتتبعت لـ1fichier بنفس المجلد وباسم SxxExx.
     الدور بيتحجز في التخزين الدائم عشان أكتر من instance ما يرفعوش نفس الحلقة مرتين."""
-    if time.time() < _FI_COOL[0]:
+    if _fi_cool_left() > 0:
         return 0
     data = _ru_data()
     ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on") and (not only or k == only)}
@@ -10253,7 +10423,7 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
     gap = max(int(os.environ.get("RU_WATCH_MIN", "15") or 15), 3) * 60
     t0, sent = time.time(), 0
     for key, _w in sorted(ws.items(), key=lambda kv: float(kv[1].get("chk") or 0)):
-        if time.time() - t0 > 45 or time.time() < _FI_COOL[0]:
+        if time.time() - t0 > 45 or _fi_cool_left() > 0:
             break
         with RU_LOCK:
             d2 = _ru_data()
@@ -10285,6 +10455,7 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
             for j in cur.get("jobs") or []:
                 if j.get("key") == key and not j.get("done") and time.time() - int(j.get("t") or 0) < 6 * 3600:
                     pend |= {str(x.get("e")) for x in j.get("items") or []}
+            pend |= {str(x.get("e")) for x in ((cur.get("queue") or {}).get(key) or {}).get("items") or []}
             # اتبعتت قبل كده بس مفيش ملف ولا طلب شغّال (فشلت/ضاعت): نعيدها لحد 3 مرات
             lost = {e for e in ((seen | failed) - okeps - pend) if int(tries.get(e, 0)) < 3}
             have = (seen | okeps | failed) - lost
@@ -10301,35 +10472,16 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
                 continue
             items = [{"u": f"{a['host']}/series/{quote(a['user'])}/{quote(a['pass'])}/{x['id']}.{x['ext']}",
                       "n": _ru_clean("%s S%02dE%02d.%s" % (w.get("name") or key, x["s"], x["e"], x["ext"])),
-                      "e": x["id"]} for x in new[:30]]
-            try:
-                res = send(p, [x["u"] for x in items], str(w.get("folder") or 0), None)
-            except Exception as e:
-                m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
-                if not m_:
-                    _fi_mark(p, str(e))
-                    raise
-                res = {"id": int(m_.group(1))}
-            rid = res.get("id") if isinstance(res, dict) else None
+                      "e": x["id"]} for x in new]
+            _ru_queue_add(key, p["id"], w.get("folder"), items)      # بتترفع واحدة واحدة من الطابور
             with RU_LOCK:
                 data = _ru_data()
                 ww = (data.get("watch") or {}).get(key)
                 if ww is None:
                     continue
                 ww["seen"] = list(dict.fromkeys((ww.get("seen") or []) + [x["e"] for x in items]))
-                tr = ww.setdefault("tries", {})
-                for x in items:
-                    tr[x["e"]] = int(tr.get(x["e"], 0)) + 1
-                ww["last"] = int(time.time())
-                ww["backlog"] = len(new) > len(items)
+                ww["backlog"] = False
                 ww.pop("err", None)
-                if rid:
-                    jobs = data.setdefault("jobs", [])
-                    for oj in [x for x in jobs if str(x.get("id")) == str(rid)]:
-                        jobs.remove(oj)
-                    jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items,
-                                 "done": False, "folder": w.get("folder")})
-                    data["jobs"] = jobs[-80:]
                 store_save(RU_FILE, data)
             sent += len(items)
         except Exception as e:
@@ -10344,6 +10496,11 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
                         store_save(RU_FILE, data)
             except Exception:
                 pass
+    if sent:
+        try:
+            _ru_pump()
+        except Exception as e:
+            app.logger.warning("ru pump: %s", e)
     return sent
 
 
@@ -10455,12 +10612,17 @@ def ru_watchlist():
                     "ok": sum(1 for f in files if f.get("ok") and f.get("link")),
                     "bad": sum(1 for f in files if not f.get("ok")),
                     "pending": sum(1 for j in jobs if j.get("key") == k and not j.get("done")),
+                    "queued": len(((data.get("queue") or {}).get(k) or {}).get("items") or []),
                     "backlog": bool(w.get("backlog")), "err": str(w.get("err") or ""),
                     "chk": int(w.get("chk") or 0), "last": int(w.get("last") or 0),
                     "poster": ((data.get("lib") or {}).get(k) or {}).get("poster") or ""})
+    for x in out:
+        qe = str(((data.get("queue") or {}).get(x["key"]) or {}).get("err") or "")
+        if qe and not x["err"]:
+            x["err"] = qe
     out.sort(key=lambda x: x["name"].lower())
     return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
-                   cool=max(0, int(_FI_COOL[0] - time.time())))
+                   cool=_fi_cool_left())
 
 
 @app.post("/ru/runnow")
