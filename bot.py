@@ -10167,3 +10167,85 @@ def lib_del():
         data["jobs"] = [j for j in (data.get("jobs") or []) if j.get("key") != key or j.get("done")]
         store_save(RU_FILE, data)
     return jsonify(ok=True)
+
+
+@app.post("/lib/add")
+def lib_add():
+    """إضافة لينك/لينكات للمكتبة بإيدك (من غير IPTV): فيلم / مسلسل / كرتون، أو إضافة ملفات لعمل موجود."""
+    if not _lib_admin():
+        return jsonify(error="للأدمن بس"), 403
+    d = request.get_json(silent=True) or {}
+    links = []
+    for u in (d.get("links") or [])[:60]:
+        u = str(u).strip()
+        if u.startswith(("http://", "https://")) and u not in links:
+            links.append(u)
+    if not links:
+        return jsonify(error="حط لينك واحد على الأقل (http/https)"), 400
+    key = str(d.get("key") or "")[:60]
+    title = str(d.get("title") or "").strip()[:120]
+    kind = d.get("kind") if d.get("kind") in ("vod", "series", "cartoon") else "vod"
+    with RU_LOCK:
+        data = _ru_data()
+        lnk = data.setdefault("links", {})
+        lib = data.setdefault("lib", {})
+        if key:
+            if key not in lnk:
+                return jsonify(error="العمل مش موجود"), 404
+        else:
+            if not title:
+                return jsonify(error="اكتب اسم العمل"), 400
+            key = "m:" + format(int(time.time() * 1000), "x")
+            poster = str(d.get("poster") or "")[:500]
+            m = {"title": title, "kind": kind, "year": str(d.get("year") or "")[:10],
+                 "plot": str(d.get("plot") or "")[:700], "manual": True}
+            if poster.startswith(("http://", "https://")):
+                m["poster"] = poster
+            try:
+                m["rating"] = float(d.get("rating") or 0)
+            except Exception:
+                m["rating"] = 0
+            lib[key] = m
+        files = lnk.setdefault(key, {"files": []}).setdefault("files", [])
+        have = {f.get("link") for f in files}
+        acc = (_ru_accounts() or [None])[0]
+        added = 0
+        for n, u in enumerate(links, 1):
+            if u in have:
+                continue
+            name = ""
+            if acc and "1fichier.com" in u:          # الاسم الحقيقي للملف من 1fichier نفسه
+                try:
+                    name = _ru_clean(_fi_call(acc, "file/info", {"url": u}).get("filename"), "")
+                except Exception:
+                    name = ""
+                time.sleep(0.35)
+            if not name:
+                name = _ru_clean(title or lib.get(key, {}).get("title") or "ملف", "ملف") + (" %d" % (len(files) + 1) if (len(links) > 1 or files) else "")
+            files.append({"ep": "", "name": name, "ok": True, "link": u, "t": int(time.time())})
+            added += 1
+        store_save(RU_FILE, data)
+    return jsonify(ok=True, key=key, added=added)
+
+
+@app.post("/lib/rmfile")
+def lib_rmfile():
+    if not _lib_admin():
+        return jsonify(error="للأدمن بس"), 403
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    try:
+        i = int(d.get("i"))
+    except Exception:
+        return jsonify(error="ملف غلط"), 400
+    with RU_LOCK:
+        data = _ru_data()
+        files = ((data.get("links") or {}).get(key) or {}).get("files") or []
+        if not (0 <= i < len(files)):
+            return jsonify(error="مش موجود"), 404
+        files.pop(i)
+        if not any(f.get("ok") and f.get("link") for f in files):
+            (data.get("links") or {}).pop(key, None)
+            (data.get("lib") or {}).pop(key, None)
+        store_save(RU_FILE, data)
+    return jsonify(ok=True)
