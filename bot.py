@@ -9920,11 +9920,15 @@ def ru_send():
     send = RU_HOSTS.get(p["type"])
     if not send:
         return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
+    already = False
     try:
         res = send(p, [x["u"] for x in items], d.get("folder_id") or "0", d.get("headers") or None)
     except Exception as e:
-        _fi_mark(p, str(e))
-        return jsonify(ok=False, error=str(e)), 502
+        m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
+        if not m_:
+            _fi_mark(p, str(e))
+            return jsonify(ok=False, error=str(e)), 502
+        res, already = {"id": int(m_.group(1))}, True      # الطلب اتبعت قبل كده: نكمّل متابعته بدل ما نعتبره فشل
     rid = res.get("id") if isinstance(res, dict) else None
     key = str(d.get("key") or "")[:60]
     mt = d.get("meta") if isinstance(d.get("meta"), dict) else {}
@@ -9945,6 +9949,8 @@ def ru_send():
                     pass
             if rid:
                 jobs = data.setdefault("jobs", [])
+                for old_j in [x for x in jobs if str(x.get("id")) == str(rid)]:
+                    jobs.remove(old_j)                 # نفس الطلب: نعيد مزامنته من الأول
                 jobs.append({"id": rid, "acc": p["id"], "key": key, "t": int(time.time()), "items": items, "done": False,
                              "folder": int(d.get("folder_id") or 0) if str(d.get("folder_id") or "0").isdigit() else None})
                 data["jobs"] = jobs[-80:]
@@ -9966,7 +9972,7 @@ def ru_send():
                 store_save(RU_FILE, data)
             except Exception:
                 pass
-    return jsonify(ok=True, account=p["name"], count=len(items), id=rid)
+    return jsonify(ok=True, account=p["name"], count=len(items), id=rid, already=already)
 
 
 def _ru_info(p, rid):
