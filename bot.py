@@ -9984,6 +9984,15 @@ def _ru_info(p, rid):
         raise
 
 
+_FI_COOL = [0.0]
+
+
+def _fi_cool(e):
+    """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات التلقائية 30 دقيقة."""
+    if re.search(r"lock|flood|too many|#211|#316", str(e), re.I):
+        _FI_COOL[0] = time.time() + 1800
+
+
 def _ru_scan_folder(p, j, data):
     """طريقة بديلة: لو info مش بيرد، ندوّر في المجلد نفسه على ملفات اسمها رقم الحلقة (زي 714577.mp4)."""
     fid = j.get("folder")
@@ -10005,6 +10014,8 @@ def _ru_scan_folder(p, j, data):
 
 def _ru_sync():
     """بيشوف الطلبات اللي لسه ما خلصتش؛ اللي خلص: يظبط الاسم الحقيقي ويحفظ اللينك."""
+    if time.time() < _FI_COOL[0]:
+        return -1
     with RU_LOCK:
         data = _ru_data()
         jobs = data.get("jobs") or []
@@ -10016,12 +10027,19 @@ def _ru_sync():
             p = _ru_acc(j.get("acc"))
             if not p:
                 continue
+            if time.time() - float(j.get("chk") or 0) < 90:
+                continue
+            j["chk"] = time.time()
+            changed = True
+            if time.time() < _FI_COOL[0]:
+                break
             info, einfo = {}, None
             try:
                 info = _ru_info(p, j["id"])
                 time.sleep(0.4)
             except Exception as e:
                 einfo = str(e)[:200]
+                _fi_cool(e)
             res_l = (info.get("result") or []) if isinstance(info, dict) else []
             complete = isinstance(info, dict) and (info.get("execution_date") or any(isinstance(r, dict) and r.get("download_link") for r in res_l))
             if not complete:
@@ -10031,6 +10049,7 @@ def _ru_sync():
                         found = _ru_scan_folder(p, j, data)
                     except Exception as e:
                         einfo = einfo or str(e)[:200]
+                        _fi_cool(e)
                 if not found:
                     if einfo:
                         j["err"] = einfo
@@ -10152,6 +10171,8 @@ def _ru_series_eps(a, sid):
 
 
 def _ru_watch_run():
+    if time.time() < _FI_COOL[0]:
+        return 0
     data = _ru_data()
     ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on")}
     if not ws:
@@ -10193,6 +10214,7 @@ def _ru_watch_run():
                 store_save(RU_FILE, data)
             sent += len(items)
         except Exception as e:
+            _fi_cool(e)
             app.logger.warning("ru watch %s: %s", key, e)
     return sent
 
@@ -10273,7 +10295,7 @@ def _lib_bg_sync():
     """بيتشغّل مع أي طلب للمكتبة (من غير الاعتماد على خيط خلفي): بيكمّل الرفع المعلّق وبيفحص الحلقات الجديدة."""
     try:
         now = time.time()
-        if now - _LIB_SYNC[0] >= 12:
+        if now - _LIB_SYNC[0] >= 45:
             _LIB_SYNC[0] = now
             if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
                 _ru_sync()
