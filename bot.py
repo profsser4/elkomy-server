@@ -672,7 +672,7 @@ def needs_admin(path, method):
         return True
     if method == "POST" and path in _ADMIN_POST_EXACT:
         return True
-    if method == "DELETE" and path.startswith("/stremio/addons/"):
+    if method in ("DELETE", "POST", "PUT") and path.startswith("/stremio/addons/"):
         return True
     return False
 
@@ -5339,8 +5339,65 @@ def st_list():
         return jsonify(logged=False, email="", items=[], n=n)
     return jsonify(
         logged=bool(d.get("authKey")), email=d.get("email", ""), n=n,
-        items=[{"id": a["id"], "name": a["name"], "stream": a["stream"]}
-               for a in d["addons"]])
+        items=[{"id": a["id"], "name": a["name"], "stream": a["stream"],
+                "base": a.get("base", "")} for a in d["addons"]])
+
+
+@app.post("/stremio/addons/<aid>/move")
+def st_move(aid):
+    """تحريك إضافة لفوق/تحت (dir = up | down | top | bottom)"""
+    dr = (request.get_json() or {}).get("dir", "")
+    with ST_LOCK:
+        d = st_load()
+        L = d["addons"]
+        i = next((k for k, a in enumerate(L) if a["id"] == aid), -1)
+        if i < 0:
+            return jsonify(error="الإضافة مش موجودة"), 404
+        a = L.pop(i)
+        j = {"up": i - 1, "down": i + 1, "top": 0, "bottom": len(L)}.get(dr, i)
+        L.insert(max(0, min(len(L), j)), a)
+        st_save(d)
+    return jsonify(ok=True)
+
+
+@app.post("/stremio/addons/<aid>/edit")
+def st_edit(aid):
+    """تعديل اسم الإضافة و/أو رابطها (الرابط الجديد بيتفحص الأول)"""
+    b = request.get_json() or {}
+    name = str(b.get("name") or "").strip()[:80]
+    url = str(b.get("url") or "").strip()
+    with ST_LOCK:
+        d = st_load()
+        a = next((x for x in d["addons"] if x["id"] == aid), None)
+        if not a:
+            return jsonify(error="الإضافة مش موجودة"), 404
+        if url:
+            base = st_base(url)
+            if base != a.get("base"):
+                if not base.startswith(("http://", "https://")):
+                    return jsonify(error="الرابط لازم يبدأ بـ https:// أو stremio://"), 400
+                if not _public_url(base):
+                    return jsonify(error="الرابط ده مش مسموح (لازم يكون عنوان عام)"), 400
+                if any(x["base"] == base for x in d["addons"] if x["id"] != aid):
+                    return jsonify(error="الرابط ده موجود في إضافة تانية"), 400
+                try:
+                    man = st_manifest(base)
+                except Exception as e:
+                    return jsonify(error=f"الإضافة مش شغالة: {e}"), 400
+                if not isinstance(man, dict) or not man.get("name"):
+                    return jsonify(error="ده مش manifest إضافة صحيح"), 400
+                info = st_info(man)
+                a["base"] = base
+                a["stream"] = info is not None
+                a["types"] = (info or {}).get("types", [])
+                a["prefixes"] = (info or {}).get("prefixes", [])
+                a["catalogs"] = st_catalogs(man)
+                if not name:
+                    name = man.get("name") or a["name"]
+        if name:
+            a["name"] = name
+        st_save(d)
+    return jsonify(ok=True)
 
 
 @app.delete("/stremio/addons/<aid>")
