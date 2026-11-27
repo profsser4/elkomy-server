@@ -10213,7 +10213,13 @@ def _ru_sync_core():
                             j["err"] = "الطلب ضاع عند 1fichier، هيتعاد تلقائي"
                             changed = True
                             continue
-                        j["err"] = ("الطلب خلص عند 1fichier ومش لاقي الملف. " + str(j.get("lsn") or ""))[:300]
+                        if not scan_ok:
+                            # لسه ما دوّرناش في المجلد (الطلب أحدث من دقيقتين): مفيش خطأ، نعيد الفحص بعد ~45 ثانية
+                            j["nchk"] = 0
+                            j["chk"] = time.time() - 75
+                            j.pop("err", None)
+                        else:
+                            j["err"] = ("الطلب خلص عند 1fichier ومش لاقي الملف. " + str(j.get("lsn") or ""))[:300]
                         changed = True
                     elif einfo:
                         j["err"] = einfo
