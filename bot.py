@@ -9828,6 +9828,164 @@ RU_LOCK = threading.Lock()
 _RU_LAST = [0.0]
 
 
+MU_FILE = os.path.join(DATA_DIR, "multiup.json")
+MU_API = "https://multiup.io/api"
+
+
+class MuError(Exception):
+    """أخطاء MultiUp: ما بتفعّلش فترة هدوء 1fichier."""
+
+
+_MU_CACHE = [0.0, {}]
+
+
+def _mu_creds():
+    """(يوزر، باسورد) من الإعدادات المحفوظة، أو من MULTIUP_USER/MULTIUP_PASS لو موجودين."""
+    c = _MU_CACHE
+    if time.time() - c[0] > 20:
+        try:
+            c[1] = store_load(MU_FILE) or {}
+        except Exception:
+            c[1] = c[1] or {}
+        c[0] = time.time()
+    d = c[1] if isinstance(c[1], dict) else {}
+    u = str(d.get("user") or os.environ.get("MULTIUP_USER", "")).strip()
+    pw = str(d.get("pass") or os.environ.get("MULTIUP_PASS", "")).strip()
+    return (u, pw) if u and pw else ("", "")
+
+
+def _mu_post(path, data, timeout=60):
+    try:
+        r = requests.post(MU_API + "/" + path, data=data, timeout=timeout,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        res = r.json()
+    except Exception as e:
+        raise MuError("MultiUp: " + str(e)[:150])
+    if isinstance(res, dict) and res.get("error") and str(res["error"]).lower() not in ("success", "none", "0", "false"):
+        raise MuError("MultiUp: " + str(res["error"])[:160])
+    return res if isinstance(res, dict) else {}
+
+
+def _mu_hosts_pref():
+    return [w.strip().lower() for w in os.environ.get("MU_HOSTS", "1fichier,ddownload,rapidgator").split(",") if w.strip()]
+
+
+def _mu_host_names():
+    """أسماء المواقع المتاحة في MultiUp، مرتّبة حسب الأفضلية (الافتراضي: مواقع بتفتحها الدابريد)."""
+    res = _mu_post("get-list-hosts", {}, 30)
+    hs = res.get("hosts")
+    names = []
+    if isinstance(hs, dict):
+        names = [str(k) for k in hs.keys()]
+    elif isinstance(hs, list):
+        for h in hs:
+            if isinstance(h, dict):
+                n = h.get("name") or h.get("host") or (list(h.keys())[0] if len(h) == 1 else "")
+                if n:
+                    names.append(str(n))
+            elif h:
+                names.append(str(h))
+    want = _mu_hosts_pref()
+    pick = []
+    for w in want:
+        for n in names:
+            if w in n.lower() and n not in pick:
+                pick.append(n)
+    pick = pick[:10]            # MultiUp بيسمح بـ10 مواقع بالكتير في الرفعة الواحدة
+    if not pick:
+        raise MuError("MultiUp: ما لقيتش المواقع المطلوبة (MU_HOSTS=%s). المتاح: %s" % (",".join(want), ", ".join(names[:12])))
+    return pick
+
+
+def _mu_links(res):
+    """بيطلّع [(اسم الموقع, الرابط)] من رد check-file مهما كان شكل hosts."""
+    out = []
+    hs = res.get("hosts")
+    items = hs.items() if isinstance(hs, dict) else enumerate(hs or [])
+    for k, h in items:
+        name, url, bad = (k if isinstance(k, str) else ""), "", False
+        if isinstance(h, str):
+            url = h
+        elif isinstance(h, dict):
+            name = str(h.get("host") or h.get("name") or h.get("hostname") or name)
+            url = str(h.get("url") or h.get("link") or h.get("download_link") or "")
+            st = str(h.get("validity") or h.get("status") or h.get("valid") or "").lower()
+            bad = any(x in st for x in ("invalid", "dead", "not_found", "error", "false"))
+        if url.startswith("http") and not bad:
+            out.append((name, url))
+    return out
+
+
+def _mu_call(p, ep, body):
+    user, pw = _mu_creds()
+    if not user:
+        raise MuError("MultiUp: ضيف اليوزر والباسورد من الإعدادات")
+    if ep == "request":
+        urls = body.get("urls") or []
+        names = body.get("names") or []
+        data = {"link": urls[0], "username": user, "password": pw}
+        if names and names[0]:
+            data["fileName"] = names[0]
+        for h in _mu_host_names():
+            data[h] = "true"
+        res = _mu_post("remote-upload", data, int(os.environ.get("MU_TIMEOUT", "90") or 90))
+        link = res.get("link")
+        if not link:
+            raise MuError("MultiUp: مفيش رابط في الرد: " + str(res)[:140])
+        return {"id": link}
+    if ep == "info":
+        link = str(body.get("id") or "")
+        res = _mu_post("check-file", {"link": link}, 40)
+        st = str(res.get("status") or "").lower()
+        if st == "not_found":
+            raise MuError("no such remote (MultiUp not_found)")
+        if st != "completed":
+            return {}                                   # لسه بيتسحب/بيترفع
+        ls = _mu_links(res)
+        best = None
+        for w in _mu_hosts_pref():
+            best = next((u for n, u in ls if w in n.lower() or w in u.lower()), None)
+            if best:
+                break
+        best = best or (ls[0][1] if ls else link)
+        return {"execution_date": int(time.time()), "result": [{"status": "OK", "download_link": best, "mu": link}]}
+    raise MuError("MultiUp: عملية مش مدعومة: " + ep)
+
+
+@app.get("/ru/multiup")
+def ru_multiup_get():
+    u, pw = _mu_creds()
+    return jsonify(ok=True, on=bool(u), user=u, hosts=_mu_hosts_pref())
+
+
+@app.post("/ru/multiup")
+def ru_multiup_set():
+    d = request.get_json(silent=True) or {}
+    u, pw = str(d.get("user") or "").strip(), str(d.get("pass") or "").strip()
+    if not u or not pw:
+        return jsonify(ok=False, error="اكتب اليوزر والباسورد"), 400
+    try:
+        r = _mu_post("login", {"username": u, "password": pw}, 30)       # نتأكد إنهم صح قبل ما نحفظهم
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
+    try:
+        store_save(MU_FILE, {"user": u, "pass": pw})
+        _MU_CACHE[0] = 0.0
+    except Exception as e:
+        return jsonify(ok=False, error="ما قدرتش أحفظ: " + str(e)[:100]), 500
+    return jsonify(ok=True, account=str(r.get("account_type") or ""), days=r.get("premium_days_left"))
+
+
+@app.delete("/ru/multiup")
+def ru_multiup_del():
+    try:
+        store_save(MU_FILE, {})
+        _MU_CACHE[0] = 0.0
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+
 def _ru_data():
     try:
         d = store_load(RU_FILE)
@@ -9838,7 +9996,10 @@ def _ru_data():
 
 def _ru_accounts():
     """حسابات 1fichier اللي بمفتاح API (مستبعد حسابات اليوزر/باسورد)."""
-    return [p for p in load() if p["type"] == "1fichier" and not p.get("login")]
+    out = [p for p in load() if p["type"] == "1fichier" and not p.get("login")]
+    if _mu_creds()[0]:
+        out.append({"id": "multiup", "type": "multiup", "name": "MultiUp", "key": "multiup", "cdn": False})
+    return out
 
 
 def _ru_acc(pid):
@@ -9889,6 +10050,8 @@ def _fi_call(p, path, body):
 
 
 def _ru_call(p, ep, body):
+    if p.get("type") == "multiup":
+        return _mu_call(p, ep, body)
     return _fi_call(p, "remote/" + ep, body)
 
 
@@ -9928,7 +10091,7 @@ def _ru_subs(res):
 
 # ---- "المواقع": كل موقع رفع = دالة send(p, urls, folder_id, headers) ----
 # لإضافة موقع تاني: اكتب دالة بنفس الشكل وضيفها في RU_HOSTS (لازم الموقع يكون ليه ريموت API).
-def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
+def _ru_send_1fichier(p, urls, folder_id="0", headers=None, names=None):
     try:
         fid = int(folder_id or 0)
     except Exception:
@@ -9950,7 +10113,11 @@ def _ru_send_1fichier(p, urls, folder_id="0", headers=None):
     raise last
 
 
-RU_HOSTS = {"1fichier": _ru_send_1fichier}
+def _ru_send_multiup(p, urls, folder_id="0", headers=None, names=None):
+    return _mu_call(p, "request", {"urls": urls, "names": names or []})
+
+
+RU_HOSTS = {"1fichier": _ru_send_1fichier, "multiup": _ru_send_multiup}
 
 
 @app.get("/ru/targets")
@@ -9970,6 +10137,8 @@ def ru_folders():
         parent = int(request.args.get("parent") or 0)
     except Exception:
         parent = 0
+    if p.get("type") == "multiup":
+        return jsonify(ok=True, parent=0, items=[])
     try:
         res = _fi_call(p, "folder/ls", {"folder_id": parent})
         items = []
@@ -9993,6 +10162,8 @@ def ru_mkdir():
     name = _ru_clean(d.get("name"), "")
     if not name:
         return jsonify(ok=False, error="اكتب اسم المجلد"), 400
+    if p.get("type") == "multiup":
+        return jsonify(ok=True, id=0, name=name)          # MultiUp مفيهوش مجلدات: الاسم بيتحط في اسم الملف
     try:
         parent = int(d.get("parent") or 0)
     except Exception:
@@ -10128,6 +10299,8 @@ def _fi_cool_left():
 
 def _fi_cool(e):
     """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات 30 دقيقة (FI_COOL_MIN) في كل الـinstances."""
+    if isinstance(e, MuError):
+        return
     if re.search(r"lock|flood|too many|#209|#211|#316|rate.?limit|banned|try again", str(e), re.I):
         _FI_COOL[0] = time.time() + max(int(os.environ.get("FI_COOL_MIN", "45") or 45), 5) * 60
         try:
@@ -10138,6 +10311,8 @@ def _fi_cool(e):
 
 def _ru_scan_folder(p, j, data):
     """طريقة بديلة: لو info مش بيرد، ندوّر في المجلد نفسه على ملفات اسمها رقم الحلقة (زي 714577.mp4)."""
+    if p.get("type") != "1fichier":
+        return []
     fid = j.get("folder")
     if fid is None:
         fid = ((data.get("watch") or {}).get(j.get("key")) or {}).get("folder")
@@ -10265,7 +10440,7 @@ def _ru_sync_core():
             by_src = {x["u"]: x for x in j.get("items") or []}
             ren, entries = [], []
             for r in info.get("result") or []:
-                it = by_src.get(r.get("url")) or {}
+                it = by_src.get(r.get("url")) or ((j.get("items") or [{}])[0] if p.get("type") == "multiup" else {})
                 name = it.get("n") or ""
                 ent = {"ep": it.get("e") or "", "name": name or str(r.get("url") or "")[-40:], "t": int(time.time())}
                 dl = r.get("download_link")
@@ -10276,7 +10451,7 @@ def _ru_sync_core():
                 else:
                     ent.update(ok=False, err=str(r.get("message") or "فشل")[:160])
                 entries.append(ent)
-            if ren:
+            if ren and p.get("type") == "1fichier":
                 try:
                     _fi_call(p, "file/rename", {"urls": ren})
                 except Exception as e:
@@ -10368,7 +10543,7 @@ def _ru_pump():
             continue
         try:
             try:
-                res = send(p, [x["u"] for x in items], str(folder or 0), None)
+                res = send(p, [x["u"] for x in items], str(folder or 0), None, [x.get("n") or "" for x in items])
             except Exception as e:
                 m_ = re.search(r"already requested\s*#?(\d+)", str(e), re.I)
                 if not m_:
