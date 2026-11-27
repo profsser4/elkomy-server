@@ -9855,12 +9855,23 @@ def _mu_creds():
 
 
 def _mu_post(path, data, timeout=60):
-    try:
-        r = requests.post(MU_API + "/" + path, data=data, timeout=timeout,
-                          headers={"User-Agent": "Mozilla/5.0"})
-        res = r.json()
-    except Exception as e:
-        raise MuError("MultiUp: " + str(e)[:150])
+    res = None
+    _last = None
+    for _try in range(4):          # SSL EOF / انقطاع لحظي: نعيد المحاولة بهدوء قبل ما نعتبره خطأ
+        try:
+            r = requests.post(MU_API + "/" + path, data=data, timeout=timeout,
+                              headers={"User-Agent": "Mozilla/5.0", "Connection": "close"})
+            res = r.json()
+            break
+        except Exception as e:
+            _last = e
+            m = str(e).lower()
+            transient = any(x in m for x in ("ssl", "eof", "reset", "aborted", "max retries", "connection", "temporarily"))
+            if not transient or _try == 3 or path == "remote-upload":
+                break                # remote-upload مش بنعيده هنا (بيتعامل معاه _mu_call عشان ما يتكررش الملف)
+            time.sleep(2 + _try * 3)
+    if res is None:
+        raise MuError("MultiUp: " + str(_last)[:150])
     if isinstance(res, dict) and res.get("error") and str(res["error"]).lower() not in ("success", "none", "0", "false"):
         raise MuError("MultiUp: " + str(res["error"])[:160])
     return res if isinstance(res, dict) else {}
