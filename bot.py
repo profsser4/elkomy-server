@@ -9898,6 +9898,27 @@ def _ru_clean(name, fallback="file"):
     return n[:150] or fallback
 
 
+def _ru_title(t):
+    """عنوان نضيف للمسلسل: من غير سنة (2026) ولا زيادات، عشان كل الحلقات تتسمّى بنفس الشكل وتترتب صح."""
+    t = re.sub(r"\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", " ", str(t or ""))
+    t = re.sub(r"\s+S\d+E\d+.*$", "", t, flags=re.I)
+    t = re.sub(r"\s*[-–|:·]+\s*$", "", t)
+    return re.sub(r"\s{2,}", " ", t).strip(" ._-")
+
+
+def _ru_norm_name(n):
+    """أي اسم فيه SxxExx يتحوّل لـ: «العنوان SxxExx.ext» بنفس الصيغة دايماً."""
+    n = str(n or "")
+    me = re.search(r"(\.[A-Za-z0-9]{2,4})$", n)
+    ext = me.group(1).lower() if me else ""
+    base = n[:me.start()] if me else n
+    m = re.match(r"^(.*?)[\s._-]*S(\d+)E(\d+)(?:\D.*)?$", base, re.I)
+    if not m:
+        return n
+    ti = _ru_title(m.group(1)) or "Series"
+    return _ru_clean("%s S%02dE%02d%s" % (ti, int(m.group(2)), int(m.group(3)), ext))
+
+
 def _ru_subs(res):
     for k in ("sub_folders", "subfolders", "folders"):
         if isinstance(res.get(k), list):
@@ -10005,7 +10026,7 @@ def ru_send():
     for it in (d.get("items") or [])[:30]:
         u = str((it or {}).get("url") or "").strip()
         if u.startswith(("http://", "https://")):
-            items.append({"u": u, "n": _ru_clean(it.get("name"), ""), "e": str(it.get("ep") or "")[:40]})
+            items.append({"u": u, "n": _ru_norm_name(_ru_clean(it.get("name"), "")), "e": str(it.get("ep") or "")[:40]})
     if not items:
         return jsonify(error="مفيش روابط صالحة"), 400
     send = RU_HOSTS.get(p["type"])
@@ -10131,19 +10152,30 @@ def _ru_scan_folder(p, j, data):
     j["lsn"] = "مجلد %s فيه %d ملف: %s | مطلوب: %s" % (
         fid, len(stems), ", ".join(list(stems)[:6]), ", ".join(str(i.get("e") or i.get("n"))[:20] for i in (j.get("items") or [])[:3]))
     out = []
+    nstems = {}
+    for k, v in stems.items():
+        nstems.setdefault(_ru_norm_name(k + ".x").rsplit(".", 1)[0].lower(), v)
+    def _tag(s):
+        t = re.search(r"S(\d+)E(\d+)", str(s or ""), re.I)
+        return (int(t.group(1)), int(t.group(2))) if t else None
     for it in j.get("items") or []:
         f = stems.get(str(it.get("e") or "")) if it.get("e") else None
         if not f and it.get("n"):
             f = names.get(str(it["n"]).lower())          # اتسمّى فعلاً SxxExx
+        if not f and it.get("n"):
+            f = nstems.get(os.path.splitext(_ru_norm_name(it["n"]))[0].lower())   # نفس الاسم بعد توحيده (من غير سنة/زيادات)
         if not f and it.get("e"):
             ee = str(it["e"])
             f = next((v for k, v in stems.items() if k == ee or re.search(r"(?<!\d)" + re.escape(ee) + r"(?!\d)", k)), None)
-        if not f and it.get("n"):
-            tg = re.search(r"S\d+E\d+", str(it["n"]), re.I)
-            if tg:
-                f = next((v for k, v in stems.items() if tg.group(0).lower() in k.lower()), None)
-        if f and f.get("url"):
-            out.append({"url": it["u"], "status": "OK", "download_link": f["url"]})
+        if not f and it.get("n") and _tag(it["n"]):
+            tg = _tag(it["n"])
+            f = next((v for k, v in stems.items() if _tag(k) == tg), None)   # نفس الموسم والحلقة بالظبط (S01E03 ≠ S01E030)
+        if f:
+            lk = f.get("url") or f.get("link") or f.get("download_link")
+            if lk:
+                out.append({"url": it["u"], "status": "OK", "download_link": lk})
+            else:
+                j["lsn"] = (str(j.get("lsn") or "") + " | الملف لقيته بس مفيش رابط في الرد، الحقول: " + ",".join(map(str, f.keys())))[:300]
     return out
 
 
@@ -10286,7 +10318,7 @@ def _ru_queue_add(key, acc, folder, items):
         for x in items:
             if (x.get("e") and x["e"] in have) or x.get("u") in have:
                 continue
-            q["items"].append({"u": x["u"], "n": x.get("n") or "", "e": x.get("e") or ""})
+            q["items"].append({"u": x["u"], "n": _ru_norm_name(x.get("n") or ""), "e": x.get("e") or ""})
         store_save(RU_FILE, data)
 
 
@@ -10597,7 +10629,7 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
                         store_save(RU_FILE, data)
                 continue
             items = [{"u": f"{a['host']}/series/{quote(a['user'])}/{quote(a['pass'])}/{x['id']}.{x['ext']}",
-                      "n": _ru_clean("%s S%02dE%02d.%s" % (w.get("name") or key, x["s"], x["e"], x["ext"])),
+                      "n": _ru_norm_name(_ru_clean("%s S%02dE%02d.%s" % (_ru_title(w.get("name") or key), x["s"], x["e"], x["ext"]))),
                       "e": x["id"]} for x in new]
             _ru_queue_add(key, p["id"], w.get("folder"), items)      # بتترفع واحدة واحدة من الطابور
             with RU_LOCK:
