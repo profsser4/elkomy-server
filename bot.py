@@ -10013,7 +10013,7 @@ def ru_send():
         return jsonify(error="الموقع ده مش مدعوم للريموت"), 400
     already = False
     key = str(d.get("key") or "")[:60]
-    queued = len(items) > 1 or (key.startswith("series:") and _ru_has_active(key))
+    queued = True          # كل الروابط بتعدي على الطابور: رابط واحد في المرة (IPTV بيقبل اتصال واحد بس)
     if queued:
         key = key or ("q:" + format(int(time.time() * 1000), "x"))
         fq = int(d.get("folder_id") or 0) if str(d.get("folder_id") or "0").isdigit() else 0
@@ -10288,7 +10288,7 @@ def _ru_pump():
     """لكل عمل في الطابور: لو مفيش طلب شغّال له، يبعت الرابط اللي بعده (QUEUE_BATCH، الافتراضي 1)."""
     if _fi_cool_left() > 0:
         return 0
-    nb = max(int(os.environ.get("QUEUE_BATCH", "1") or 1), 1)
+    nb = 1      # IPTV بيسمح بلينك واحد بس في نفس الوقت: رابط واحد في المرة دايماً (مفيش دفعات)
     sent, t0 = 0, time.time()
     for key in list((_ru_data().get("queue") or {}).keys()):
         if time.time() - t0 > 40 or _fi_cool_left() > 0:
@@ -10300,10 +10300,14 @@ def _ru_pump():
                 (data.get("queue") or {}).pop(key, None)
                 store_save(RU_FILE, data)
                 continue
-            if any(j.get("key") == key and not j.get("done") for j in (data.get("jobs") or [])):
-                continue                                    # لسه اللي قبله بيتسحب
-            if time.time() - float(q.get("claim") or 0) < 60:
+            _now = time.time()
+            if any((not j.get("done")) and _now - int(j.get("t") or 0) < 6 * 3600 for j in (data.get("jobs") or [])):
+                continue                                    # لسه فيه رابط بيتسحب (أي مسلسل): حساب IPTV بلينك واحد بس
+            if _now - float(q.get("claim") or 0) < 60:
                 continue                                    # instance تانية بتبعته دلوقتي
+            if any(k2 != key and _now - float((q2 or {}).get("claim") or 0) < 60
+                   for k2, q2 in (data.get("queue") or {}).items()):
+                continue                                    # رابط من مسلسل تاني بيتبعت دلوقتي
             q["claim"] = time.time()
             _okeps = {str(f.get("ep")) for f in ((data.get("links") or {}).get(key) or {}).get("files") or [] if f.get("ep") and f.get("ok")}
             _pend = set()
@@ -10623,8 +10627,11 @@ def _ru_bg_loop():
     every = max(int(os.environ.get("RU_WATCH_MIN", "15")), 5)
     while True:
         try:
-            if any(not j.get("done") for j in (_ru_data().get("jobs") or [])):
+            _d_ = _ru_data()
+            if any(not j.get("done") for j in (_d_.get("jobs") or [])):
                 _ru_sync()
+            elif any((q_ or {}).get("items") for q_ in (_d_.get("queue") or {}).values()):
+                _ru_pump()          # مفيش رابط شغّال والطابور فيه حاجة: ابعت اللي بعده
             if n % every == 0:
                 _ru_watch_run()
         except Exception:
