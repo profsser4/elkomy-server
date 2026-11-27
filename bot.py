@@ -10522,7 +10522,9 @@ def _ru_pump():
             _now = time.time()
             if any((not j.get("done")) and _now - int(j.get("t") or 0) < 6 * 3600 for j in (data.get("jobs") or [])):
                 continue                                    # لسه فيه رابط بيتسحب (أي مسلسل): حساب IPTV بلينك واحد بس
-            if _now - float(data.get("last_send") or 0) < max(int(os.environ.get("RU_SEND_GAP", "300") or 300), 30):
+            _qp = _ru_acc(q.get("acc")) or {}
+            _gap = int(os.environ.get("MU_SEND_GAP", "30") or 30) if _qp.get("type") == "multiup" else int(os.environ.get("RU_SEND_GAP", "300") or 300)
+            if _now - float(data.get("last_send") or 0) < max(_gap, 15):
                 continue                                    # مهلة بين كل رفع والتاني (الافتراضي 300 ثانية) عشان 1fichier ما يقفلش الحساب
             if _now - float(q.get("claim") or 0) < 60:
                 continue                                    # instance تانية بتبعته دلوقتي
@@ -10672,9 +10674,20 @@ def _ru_series_pull(a, sid):
     """من الـIPTV: (meta, eps). meta = بيانات العمل، eps = كل الحلقات مرتّبة (موسم ثم حلقة).
     لو السيرفر مش بيوصل للـIPTV (آيبي مصري مثلًا) ضيف متغير IPTV_PROXY."""
     px = os.environ.get("IPTV_PROXY", "").strip()
-    r = requests.get(f"{a['host']}/player_api.php",
-                     params={"username": a["user"], "password": a["pass"], "action": "get_series_info", "series_id": sid},
-                     timeout=40, proxies=({"http": px, "https": px} if px else None))
+    r, last = None, None
+    # كتير من سيرفرات IPTV بتقفل الاتصال في وش requests العادي: نجرّب User-Agent بتاع مشغّل حقيقي، ونعيد المحاولة
+    for ua in ("VLC/3.0.20 LibVLC/3.0.20", "IPTVSmartersPro", "okhttp/4.9.3"):
+        try:
+            r = requests.get(f"{a['host']}/player_api.php",
+                             params={"username": a["user"], "password": a["pass"], "action": "get_series_info", "series_id": sid},
+                             headers={"User-Agent": ua, "Accept": "*/*", "Connection": "close"},
+                             timeout=40, proxies=({"http": px, "https": px} if px else None))
+            break
+        except Exception as e:
+            last = e
+            time.sleep(1.5)
+    if r is None:
+        raise Exception("الـIPTV بيقفل الاتصال من السيرفر (ممكن يكون حاجب آيبي السيرفر، جرّب IPTV_PROXY): " + str(last)[:120])
     v = jj(r)
     if not isinstance(v, dict) or not (v.get("episodes") or v.get("info")):
         raise Exception("الـIPTV مرجّعش بيانات للمسلسل (السيرفر ممكن يكون محجوب أو الاشتراك منتهي)")
@@ -10835,11 +10848,10 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
                         store_save(RU_FILE, data)
             except Exception:
                 pass
-    if sent:
-        try:
-            _ru_pump()
-        except Exception as e:
-            app.logger.warning("ru pump: %s", e)
+    try:
+        _ru_pump()                  # دايماً: الطابور بيتبعت حتى لو فحص الحلقات الجديدة فشل
+    except Exception as e:
+        app.logger.warning("ru pump: %s", e)
     return sent
 
 
