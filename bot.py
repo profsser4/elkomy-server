@@ -10029,7 +10029,7 @@ def _fi_cool_left():
 
 def _fi_cool(e):
     """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات 30 دقيقة (FI_COOL_MIN) في كل الـinstances."""
-    if re.search(r"lock|flood|too many|#211|#316", str(e), re.I):
+    if re.search(r"lock|flood|too many|#209|#211|#316|rate.?limit|banned|try again", str(e), re.I):
         _FI_COOL[0] = time.time() + max(int(os.environ.get("FI_COOL_MIN", "30") or 30), 5) * 60
         try:
             store_save(RU_COOL_FILE, {"t": _FI_COOL[0]})
@@ -10050,11 +10050,20 @@ def _ru_scan_folder(p, j, data):
         fn = str(f.get("filename") or "")
         stems[os.path.splitext(fn)[0]] = f
         names[fn.lower()] = f
+    j["lsn"] = "مجلد %s فيه %d ملف: %s | مطلوب: %s" % (
+        fid, len(stems), ", ".join(list(stems)[:6]), ", ".join(str(i.get("e") or i.get("n"))[:20] for i in (j.get("items") or [])[:3]))
     out = []
     for it in j.get("items") or []:
         f = stems.get(str(it.get("e") or "")) if it.get("e") else None
         if not f and it.get("n"):
             f = names.get(str(it["n"]).lower())          # اتسمّى فعلاً SxxExx
+        if not f and it.get("e"):
+            ee = str(it["e"])
+            f = next((v for k, v in stems.items() if k == ee or re.search(r"(?<!\d)" + re.escape(ee) + r"(?!\d)", k)), None)
+        if not f and it.get("n"):
+            tg = re.search(r"S\d+E\d+", str(it["n"]), re.I)
+            if tg:
+                f = next((v for k, v in stems.items() if tg.group(0).lower() in k.lower()), None)
         if f and f.get("url"):
             out.append({"url": it["u"], "status": "OK", "download_link": f["url"]})
     return out
@@ -10125,7 +10134,7 @@ def _ru_sync_core():
                             j["err"] = "الطلب ضاع عند 1fichier، هيتعاد تلقائي"
                             changed = True
                             continue
-                        j["err"] = "الطلب خلص عند 1fichier، بدوّر على الملف في المجلد"
+                        j["err"] = ("الطلب خلص عند 1fichier ومش لاقي الملف. " + str(j.get("lsn") or ""))[:300]
                         changed = True
                     elif einfo:
                         j["err"] = einfo
@@ -10323,7 +10332,7 @@ def ru_links():
     files = ((data.get("links") or {}).get(key) or {}).get("files") or []
     pend = sum(1 for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done"))
     w = (data.get("watch") or {}).get(key) or {}
-    errs = [str(j.get("err"))[:160] for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done") and j.get("err")]
+    errs = [str(j.get("err"))[:320] for j in (data.get("jobs") or []) if j.get("key") == key and not j.get("done") and j.get("err")]
     qn = len(((data.get("queue") or {}).get(key) or {}).get("items") or [])
     qe = str(((data.get("queue") or {}).get(key) or {}).get("err") or "")
     if qe:
@@ -10648,6 +10657,65 @@ def ru_watchlist():
     out.sort(key=lambda x: x["name"].lower())
     return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
                    cool=_fi_cool_left())
+
+
+@app.post("/ru/wipe")
+def ru_wipe():
+    """إلغاء ومسح كل حاجة قديمة للمسلسل (أو لكل المتابَعات): الطلبات، الطابور، المتابعة، الروابط، والكارت في المكتبة.
+    purge=true بيمسح كمان الملفات من مجلد 1fichier (مجلد المسلسل بس، عمره ما بيلمس الجذر)."""
+    d = request.get_json(silent=True) or {}
+    key = str(d.get("key") or "")[:60]
+    allk = bool(d.get("all"))
+    if not key and not allk:
+        return jsonify(ok=False, error="حدد المسلسل"), 400
+    purge = bool(d.get("purge"))
+    purged, perr = 0, ""
+    with RU_LOCK:
+        data = _ru_data()
+        lib = data.get("lib") or {}
+        if allk:
+            keys = set(data.get("watch") or {}) | set(data.get("queue") or {}) | {j.get("key") for j in data.get("jobs") or [] if j.get("key")}
+            keys |= {k for k in (data.get("links") or {}) if not (lib.get(k) or {}).get("manual")}
+            keys.discard(None)
+        else:
+            keys = {key}
+        folders = {}
+        for k in keys:
+            w = (data.get("watch") or {}).get(k) or {}
+            fids = {w.get("folder")} | {j.get("folder") for j in data.get("jobs") or [] if j.get("key") == k}
+            q = (data.get("queue") or {}).get(k) or {}
+            fids.add(q.get("folder"))
+            acc = w.get("acc") or q.get("acc") or next((j.get("acc") for j in data.get("jobs") or [] if j.get("key") == k), None)
+            for f in fids:
+                try:
+                    if f is not None and int(f) > 0:
+                        folders[int(f)] = acc
+                except Exception:
+                    pass
+        data["jobs"] = [j for j in (data.get("jobs") or []) if j.get("key") not in keys]
+        for sec in ("queue", "watch", "links", "lib"):
+            for k in keys:
+                (data.get(sec) or {}).pop(k, None)
+        store_save(RU_FILE, data)
+    if purge and folders:
+        if _fi_cool_left() > 0:
+            perr = "1fichier في فترة هدوء، الملفات ما اتمسحتش من عندهم (امسحها من الموقع)"
+        else:
+            for fid, acc in folders.items():
+                try:
+                    p = _ru_acc(acc) or (_ru_accounts() or [None])[0]
+                    if not p:
+                        continue
+                    res = _fi_call(p, "file/ls", {"folder_id": fid})
+                    urls = [{"url": f["url"]} for f in (res.get("items") or []) if f.get("url")]
+                    if urls:
+                        _fi_call(p, "file/rm", {"files": urls})
+                        purged += len(urls)
+                except Exception as e:
+                    perr = str(e)[:160]
+                    _fi_cool(e)
+                    break
+    return jsonify(ok=True, wiped=len(keys), purged=purged, purge_error=perr, cool=_fi_cool_left())
 
 
 @app.post("/ru/reset")
