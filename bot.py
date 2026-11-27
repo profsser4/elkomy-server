@@ -9796,7 +9796,7 @@ def _fi_call(p, path, body):
     if left > 0:
         # فترة هدوء بعد قفل 1fichier للحساب: مفيش أي طلب يتبعت لحد ما تخلص
         raise Exception("1fichier في فترة هدوء، جرّب بعد %d دقيقة" % (left // 60 + 1))
-    gap = float(os.environ.get("FI_GAP", "1.2") or 1.2) - (time.time() - _FI_LAST[0])
+    gap = float(os.environ.get("FI_GAP", "2.0") or 2.0) - (time.time() - _FI_LAST[0])
     if gap > 0:
         time.sleep(gap)                 # مسافة بين الطلبات عشان 1fichier ما يعتبرهاش flood
     _FI_LAST[0] = time.time()
@@ -10045,12 +10045,16 @@ def _ru_scan_folder(p, j, data):
     if fid is None:
         return []
     res = _fi_call(p, "file/ls", {"folder_id": int(fid)})
-    stems = {}
+    stems, names = {}, {}
     for f in (res.get("items") or []):
-        stems[os.path.splitext(str(f.get("filename") or ""))[0]] = f
+        fn = str(f.get("filename") or "")
+        stems[os.path.splitext(fn)[0]] = f
+        names[fn.lower()] = f
     out = []
     for it in j.get("items") or []:
         f = stems.get(str(it.get("e") or "")) if it.get("e") else None
+        if not f and it.get("n"):
+            f = names.get(str(it["n"]).lower())          # اتسمّى فعلاً SxxExx
         if f and f.get("url"):
             out.append({"url": it["u"], "status": "OK", "download_link": f["url"]})
     return out
@@ -10098,11 +10102,12 @@ def _ru_sync_core():
             res_l = (info.get("result") or []) if isinstance(info, dict) else []
             complete = isinstance(info, dict) and (info.get("execution_date") or any(isinstance(r, dict) and r.get("download_link") for r in res_l))
             if not complete:
-                found = []
+                found, scan_ok = [], False
                 if time.time() - int(j.get("t") or 0) > 120:
                     for a_ in cands:
                         try:
                             found = _ru_scan_folder(a_, j, data)
+                            scan_ok = True
                             if found:
                                 p, j["acc"] = a_, a_["id"]
                                 break
@@ -10112,8 +10117,17 @@ def _ru_sync_core():
                             if _fi_cool_left() > 0:
                                 break
                         time.sleep(0.4)
+                gone = bool(einfo and re.search(r"no such remote", einfo, re.I))
                 if not found:
-                    if einfo:
+                    if gone:
+                        if scan_ok and time.time() - int(j.get("t") or 0) > 1200:
+                            j["done"] = True        # الطلب اتشال من 1fichier ومفيش ملف: المتابعة هتعيد الحلقة
+                            j["err"] = "الطلب ضاع عند 1fichier، هيتعاد تلقائي"
+                            changed = True
+                            continue
+                        j["err"] = "الطلب خلص عند 1fichier، بدوّر على الملف في المجلد"
+                        changed = True
+                    elif einfo:
                         j["err"] = einfo
                         changed = True
                     continue                        # لسه بيتسحب
@@ -10203,6 +10217,17 @@ def _ru_pump():
             if time.time() - float(q.get("claim") or 0) < 60:
                 continue                                    # instance تانية بتبعته دلوقتي
             q["claim"] = time.time()
+            _okeps = {str(f.get("ep")) for f in ((data.get("links") or {}).get(key) or {}).get("files") or [] if f.get("ep") and f.get("ok")}
+            _pend = set()
+            for j in data.get("jobs") or []:
+                if j.get("key") == key and not j.get("done"):
+                    for x in j.get("items") or []:
+                        _pend.add(x.get("u")); _pend.add(x.get("e"))
+            q["items"] = [x for x in q["items"] if not (x.get("u") in _pend or (x.get("e") and (x["e"] in _pend or str(x["e"]) in _okeps)))]
+            if not q["items"]:
+                data["queue"].pop(key, None)
+                store_save(RU_FILE, data)
+                continue
             items, acc, folder = list(q["items"][:nb]), q.get("acc"), q.get("folder")
             store_save(RU_FILE, data)
         p = _ru_acc(acc) or (_ru_accounts() or [None])[0]
@@ -10631,6 +10656,9 @@ def ru_reset():
     لو 1fichier لسه قافل الحساب، الخطأ الحقيقي الجديد هو اللي هيظهر."""
     d = request.get_json(silent=True) or {}
     key = str(d.get("key") or "")[:60]
+    if _fi_cool_left() > 0 and not d.get("force"):
+        # 1fichier لسه قافل: أي محاولة دلوقتي بتطوّل الحظر. نستنى وهو يكمّل لوحده بعد الهدوء.
+        return jsonify(ok=True, requeued=0, sent=0, cool=_fi_cool_left(), waiting=True)
     _FI_COOL[0] = 0.0
     try:
         store_save(RU_COOL_FILE, {"t": 0})
@@ -10645,6 +10673,12 @@ def ru_reset():
         for j in data.get("jobs") or []:
             k = j.get("key")
             if j.get("done") or not k or (key and k != key):
+                keep.append(j)
+                continue
+            if time.time() - float(j.get("t") or 0) < 3 * 3600:
+                # 1fichier قبل الطلب فعلاً: منعيدش إرساله (بيعمل ملف مكرر) — بس نصفّر الفحص عشان يتسجّل بعد الهدوء
+                j["chk"] = 0
+                j.pop("err", None)
                 keep.append(j)
                 continue
             q = data.setdefault("queue", {}).setdefault(k, {"items": []})
@@ -10761,8 +10795,59 @@ def _lib_bg_sync():
         app.logger.warning("lib sync: %s", e)
 
 
+def _lib_norm(t):
+    t = re.sub(r"\(\s*\d{4}\s*\)", "", str(t or ""))
+    return re.sub(r"[\W_]+", "", t, flags=re.U).lower()
+
+
+def _lib_merge():
+    """نفس العمل اتسجّل تحت مفتاحين (إضافة يدوي + متابعة تلقائية): نجمعهم في كارت واحد."""
+    with RU_LOCK:
+        data = _ru_data()
+        lib, lnk = data.get("lib") or {}, data.get("links") or {}
+        groups = {}
+        for k in lnk:
+            m = lib.get(k) or {}
+            nt = _lib_norm(m.get("title") or "")
+            if nt:
+                groups.setdefault((nt, m.get("kind") or k.split(":")[0]), []).append(k)
+        changed = False
+        for ks in groups.values():
+            if len(ks) < 2:
+                continue
+            ks.sort(key=lambda k: (not k.startswith("series:"), -len((lnk.get(k) or {}).get("files") or [])))
+            main = ks[0]
+            mf = lnk.setdefault(main, {"files": []}).setdefault("files", [])
+            for k in ks[1:]:
+                for f in (lnk.get(k) or {}).get("files") or []:
+                    tg = re.search(r"S\d+E\d+", str(f.get("name") or ""), re.I)
+                    dup = next((x for x in mf if (f.get("link") and x.get("link") == f.get("link")) or
+                                (tg and re.search(re.escape(tg.group(0)), str(x.get("name") or ""), re.I))), None)
+                    if dup is None:
+                        mf.append(f)
+                    elif f.get("ok") and not dup.get("ok"):
+                        mf[mf.index(dup)] = f
+                for j in data.get("jobs") or []:
+                    if j.get("key") == k:
+                        j["key"] = main
+                lm = lib.setdefault(main, {})
+                for fld in ("poster", "plot", "year", "rating"):
+                    if not lm.get(fld) and (lib.get(k) or {}).get(fld):
+                        lm[fld] = lib[k][fld]
+                lm["pin"] = max(int(lm.get("pin") or 0), int((lib.get(k) or {}).get("pin") or 0))
+                lnk.pop(k, None)
+                lib.pop(k, None)
+                changed = True
+        if changed:
+            store_save(RU_FILE, data)
+
+
 @app.get("/lib/list")
 def lib_list():
+    try:
+        _lib_merge()
+    except Exception as e:
+        app.logger.warning("lib merge: %s", e)
     _lib_bg_sync()
     return jsonify(ok=True, items=_lib_items(_ru_data()), admin=(g.role == "admin"))
 
