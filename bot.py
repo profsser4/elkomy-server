@@ -10297,6 +10297,14 @@ def _fi_cool_left():
     return max(0, int(_FI_COOL[0] - time.time()))
 
 
+def _cool_blocks(acc_id):
+    """فترة هدوء 1fichier بتوقف حسابات 1fichier بس، مش MultiUp."""
+    if _fi_cool_left() <= 0:
+        return False
+    p = _ru_acc(acc_id) or (_ru_accounts() or [{}])[0]
+    return (p or {}).get("type") != "multiup"
+
+
 def _fi_cool(e):
     """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات 30 دقيقة (FI_COOL_MIN) في كل الـinstances."""
     if isinstance(e, MuError):
@@ -10356,8 +10364,6 @@ def _ru_scan_folder(p, j, data):
 
 def _ru_sync_core():
     """بيشوف الطلبات اللي لسه ما خلصتش؛ اللي خلص: يظبط الاسم الحقيقي ويحفظ اللينك."""
-    if _fi_cool_left() > 0:
-        return -1
     with RU_LOCK:
         data = _ru_data()
         jobs = data.get("jobs") or []
@@ -10378,8 +10384,8 @@ def _ru_sync_core():
             j["nchk"] = int(j.get("nchk") or 0) + 1
             changed = True
             budget -= 1
-            if _fi_cool_left() > 0:
-                break
+            if p.get("type") != "multiup" and _fi_cool_left() > 0:
+                continue                    # هدوء 1fichier: نكمّل على باقي الطلبات (MultiUp مش متأثر)
             info, einfo = {}, None
             cands = [p]                     # حساب الطلب بس: كل حساب زيادة = طلبات زيادة على 1fichier
             for a_ in cands:
@@ -10499,12 +10505,10 @@ def _ru_queue_add(key, acc, folder, items):
 
 def _ru_pump():
     """لكل عمل في الطابور: لو مفيش طلب شغّال له، يبعت الرابط اللي بعده (QUEUE_BATCH، الافتراضي 1)."""
-    if _fi_cool_left() > 0:
-        return 0
     nb = 1      # IPTV بيسمح بلينك واحد بس في نفس الوقت: رابط واحد في المرة دايماً (مفيش دفعات)
     sent, t0 = 0, time.time()
     for key in list((_ru_data().get("queue") or {}).keys()):
-        if time.time() - t0 > 40 or _fi_cool_left() > 0:
+        if time.time() - t0 > 40:
             break
         with RU_LOCK:
             data = _ru_data()
@@ -10513,6 +10517,8 @@ def _ru_pump():
                 (data.get("queue") or {}).pop(key, None)
                 store_save(RU_FILE, data)
                 continue
+            if _cool_blocks(q.get("acc")):
+                continue                                    # هدوء 1fichier: الطابور ده على 1fichier، بنستنى
             _now = time.time()
             if any((not j.get("done")) and _now - int(j.get("t") or 0) < 6 * 3600 for j in (data.get("jobs") or [])):
                 continue                                    # لسه فيه رابط بيتسحب (أي مسلسل): حساب IPTV بلينك واحد بس
@@ -10744,8 +10750,6 @@ def _ru_mk(p, name, parent=0):
 def _ru_watch_run(only=None, force=False, eps_override=None):
     """بيفحص المسلسلات المتابَعة: أي حلقة جديدة (أو فاشلة/ضايعة) بتتبعت لـ1fichier بنفس المجلد وباسم SxxExx.
     الدور بيتحجز في التخزين الدائم عشان أكتر من instance ما يرفعوش نفس الحلقة مرتين."""
-    if _fi_cool_left() > 0:
-        return 0
     data = _ru_data()
     ws = {k: w for k, w in (data.get("watch") or {}).items() if w.get("on") and (not only or k == only)}
     if not ws:
@@ -10756,12 +10760,14 @@ def _ru_watch_run(only=None, force=False, eps_override=None):
     gap = max(int(os.environ.get("RU_WATCH_MIN", "15") or 15), 3) * 60
     t0, sent = time.time(), 0
     for key, _w in sorted(ws.items(), key=lambda kv: float(kv[1].get("chk") or 0)):
-        if time.time() - t0 > 45 or _fi_cool_left() > 0:
+        if time.time() - t0 > 45:
             break
         with RU_LOCK:
             d2 = _ru_data()
             w = (d2.get("watch") or {}).get(key)
             if not w or not w.get("on"):
+                continue
+            if _cool_blocks(w.get("acc")):
                 continue
             if not force and time.time() - float(w.get("chk") or 0) < (240 if w.get("backlog") else gap):
                 continue
@@ -10869,11 +10875,30 @@ def ru_watch_set():
         w = (data.get("watch") or {}).get(key)
         if not w:
             return jsonify(ok=False, error="مفيش متابعة للمسلسل ده"), 404
-        w["on"] = bool(d.get("on"))
+        if "on" in d:
+            w["on"] = bool(d.get("on"))
+        tgt = str(d.get("acc") or "")
+        if tgt:
+            if tgt == "multiup":
+                p2 = _ru_acc("multiup")
+            else:
+                p2 = _ru_acc(tgt) or next((x for x in _ru_accounts() if x.get("type") == "1fichier"), None)
+            if not p2:
+                return jsonify(ok=False, error="الحساب ده مش متاح (ضيف MultiUp من الإعدادات الأول)"), 400
+            w["acc"] = p2["id"]
+            q = (data.get("queue") or {}).get(key)
+            if q is not None:
+                q["acc"] = p2["id"]
+                q.pop("claim", None)
+                q.pop("err", None)
+                q["fails"] = 0
+            w.pop("err", None)
+            if p2.get("type") == "multiup":
+                w["folder"] = 0
         store_save(RU_FILE, data)
     if d.get("now"):
         threading.Thread(target=_ru_watch_run, daemon=True).start()
-    return jsonify(ok=True, on=w["on"])
+    return jsonify(ok=True, on=w["on"], acc=w.get("acc"))
 
 
 @app.post("/ru/follow")
@@ -10951,6 +10976,8 @@ def ru_watchlist():
                     "queued": len(((data.get("queue") or {}).get(k) or {}).get("items") or []),
                     "backlog": bool(w.get("backlog")), "err": str(w.get("err") or ""),
                     "chk": int(w.get("chk") or 0), "last": int(w.get("last") or 0),
+                    "acc": str(w.get("acc") or ""),
+                    "mu": (_ru_acc(w.get("acc")) or {}).get("type") == "multiup",
                     "poster": ((data.get("lib") or {}).get(k) or {}).get("poster") or ""})
     for x in out:
         qe = str(((data.get("queue") or {}).get(x["key"]) or {}).get("err") or "")
@@ -10958,7 +10985,7 @@ def ru_watchlist():
             x["err"] = qe
     out.sort(key=lambda x: x["name"].lower())
     return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
-                   cool=_fi_cool_left())
+                   cool=_fi_cool_left(), mu_on=any(p.get("type") == "multiup" for p in _ru_accounts()))
 
 
 @app.post("/ru/wipe")
