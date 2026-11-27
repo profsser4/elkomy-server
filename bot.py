@@ -9864,7 +9864,7 @@ def _fi_call(p, path, body):
             return c[1]                 # 1fichier: نفس المجلد ميتعملوش ls أكتر من مرة كل 30 ثانية
     else:
         _FI_LS.clear()                  # أي تعديل: الكاش القديم ما يبقاش صحيح
-    gap = float(os.environ.get("FI_GAP", "2.5") or 2.5) - (time.time() - _FI_LAST[0])
+    gap = float(os.environ.get("FI_GAP", "5") or 5) - (time.time() - _FI_LAST[0])
     if is_ls:
         gap = max(gap, 3.5 - (time.time() - _FI_LS_LAST[0]))   # ls واحد كل 3-4 ثواني على الأكتر
     if gap > 0:
@@ -10108,7 +10108,7 @@ def _fi_cool_left():
 def _fi_cool(e):
     """لو 1fichier قفل الحساب/اشتكى من الزحمة: نوقف كل الطلبات 30 دقيقة (FI_COOL_MIN) في كل الـinstances."""
     if re.search(r"lock|flood|too many|#209|#211|#316|rate.?limit|banned|try again", str(e), re.I):
-        _FI_COOL[0] = time.time() + max(int(os.environ.get("FI_COOL_MIN", "30") or 30), 5) * 60
+        _FI_COOL[0] = time.time() + max(int(os.environ.get("FI_COOL_MIN", "45") or 45), 5) * 60
         try:
             store_save(RU_COOL_FILE, {"t": _FI_COOL[0]})
         except Exception:
@@ -10303,6 +10303,8 @@ def _ru_pump():
             _now = time.time()
             if any((not j.get("done")) and _now - int(j.get("t") or 0) < 6 * 3600 for j in (data.get("jobs") or [])):
                 continue                                    # لسه فيه رابط بيتسحب (أي مسلسل): حساب IPTV بلينك واحد بس
+            if _now - float(data.get("last_send") or 0) < max(int(os.environ.get("RU_SEND_GAP", "300") or 300), 30):
+                continue                                    # مهلة بين كل رفع والتاني (الافتراضي 300 ثانية) عشان 1fichier ما يقفلش الحساب
             if _now - float(q.get("claim") or 0) < 60:
                 continue                                    # instance تانية بتبعته دلوقتي
             if any(k2 != key and _now - float((q2 or {}).get("claim") or 0) < 60
@@ -10367,6 +10369,7 @@ def _ru_pump():
                 q["fails"] = 0
                 if not q["items"]:
                     data["queue"].pop(key, None)
+            data["last_send"] = time.time()
             w = (data.get("watch") or {}).get(key)
             if w is not None:
                 w["seen"] = list(dict.fromkeys((w.get("seen") or []) + [x["e"] for x in items if x.get("e")]))
