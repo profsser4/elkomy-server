@@ -9916,6 +9916,28 @@ def _mu_links(res):
     return out
 
 
+def _mu_find(name):
+    """بيدوّر في ملفات حساب MultiUp على ملف بنفس الاسم (عشان ما نرفعش نفس الملف مرتين، ونلاقي الرابط لو الطلب انقطع)."""
+    user, pw = _mu_creds()
+    if not (user and name):
+        return ""
+    try:
+        res = _mu_post("list-files", {"username": user, "password": pw, "max": 50, "search": name}, 30)
+    except Exception:
+        return ""
+    fs = res.get("files")
+    fs = list(fs.values()) if isinstance(fs, dict) else (fs or [])
+    want = str(name).strip().lower()
+    for f in fs:
+        if not isinstance(f, dict):
+            continue
+        nm = str(f.get("name") or f.get("file_name") or f.get("fileName") or f.get("filename") or "").strip().lower()
+        url = str(f.get("url") or f.get("link") or f.get("download_url") or "")
+        if nm == want and url.startswith("http"):
+            return url
+    return ""
+
+
 def _mu_call(p, ep, body):
     user, pw = _mu_creds()
     if not user:
@@ -9923,18 +9945,36 @@ def _mu_call(p, ep, body):
     if ep == "request":
         urls = body.get("urls") or []
         names = body.get("names") or []
+        nm = (names[0] if names else "") or ""
+        ex = _mu_find(nm) if nm else ""
+        if ex:
+            return {"id": ex}                           # الملف ده مرفوع عندك فعلاً: منكرّرهوش
         data = {"link": urls[0], "username": user, "password": pw}
-        if names and names[0]:
-            data["fileName"] = names[0]
+        if nm:
+            data["fileName"] = nm
         for h in _mu_host_names():
             data[h] = "true"
-        res = _mu_post("remote-upload", data, int(os.environ.get("MU_TIMEOUT", "90") or 90))
+        try:
+            res = _mu_post("remote-upload", data, int(os.environ.get("MU_TIMEOUT", "25") or 25))
+        except MuError as e:
+            m = str(e).lower()
+            if nm and any(x in m for x in ("timed out", "timeout", "reset", "aborted", "connection")):
+                # MultiUp غالباً استلم الطلب وبيسحب: نكمّل نتابعه بالاسم بدل ما نعيد الإرسال (ده كان بيعمل ملفات مكررة)
+                return {"id": "pending:%d:%s" % (int(time.time()), nm)}
+            raise
         link = res.get("link")
         if not link:
             raise MuError("MultiUp: مفيش رابط في الرد: " + str(res)[:140])
         return {"id": link}
     if ep == "info":
         link = str(body.get("id") or "")
+        if link.startswith("pending:"):
+            _, ts, nm = (link.split(":", 2) + ["", ""])[:3]
+            link = _mu_find(nm)
+            if not link:
+                if time.time() - float(ts or 0) > 1500:
+                    raise MuError("no such remote (MultiUp ما رفعش الملف)")
+                return {}
         res = _mu_post("check-file", {"link": link}, 40)
         st = str(res.get("status") or "").lower()
         if st == "not_found":
@@ -10993,8 +11033,8 @@ def ru_watchlist():
                     "poster": ((data.get("lib") or {}).get(k) or {}).get("poster") or ""})
     for x in out:
         qe = str(((data.get("queue") or {}).get(x["key"]) or {}).get("err") or "")
-        if qe and not x["err"]:
-            x["err"] = qe
+        if qe and qe not in x["err"]:
+            x["err"] = (x["err"] + " | " if x["err"] else "") + qe
     out.sort(key=lambda x: x["name"].lower())
     return jsonify(ok=True, items=out, cron=bool(os.environ.get("CRON_KEY") or os.environ.get("CRON_SECRET")),
                    cool=_fi_cool_left(), mu_on=any(p.get("type") == "multiup" for p in _ru_accounts()))
