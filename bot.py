@@ -9791,22 +9791,43 @@ def _ru_acc(pid):
 _FI_LAST = [0.0]
 
 
+_FI_LS, _FI_LS_LAST = {}, [0.0]
+
+
 def _fi_call(p, path, body):
     left = _fi_cool_left()
     if left > 0:
         # فترة هدوء بعد قفل 1fichier للحساب: مفيش أي طلب يتبعت لحد ما تخلص
         raise Exception("1fichier في فترة هدوء، جرّب بعد %d دقيقة" % (left // 60 + 1))
-    gap = float(os.environ.get("FI_GAP", "2.0") or 2.0) - (time.time() - _FI_LAST[0])
+    is_ls = path in ("file/ls", "folder/ls")
+    ck = (p["key"][-8:], path, json.dumps(body, sort_keys=True, default=str))
+    if is_ls:
+        c = _FI_LS.get(ck)
+        if c and time.time() - c[0] < 35:
+            return c[1]                 # 1fichier: نفس المجلد ميتعملوش ls أكتر من مرة كل 30 ثانية
+    else:
+        _FI_LS.clear()                  # أي تعديل: الكاش القديم ما يبقاش صحيح
+    gap = float(os.environ.get("FI_GAP", "2.5") or 2.5) - (time.time() - _FI_LAST[0])
+    if is_ls:
+        gap = max(gap, 3.5 - (time.time() - _FI_LS_LAST[0]))   # ls واحد كل 3-4 ثواني على الأكتر
     if gap > 0:
         time.sleep(gap)                 # مسافة بين الطلبات عشان 1fichier ما يعتبرهاش flood
     _FI_LAST[0] = time.time()
+    if is_ls:
+        _FI_LS_LAST[0] = _FI_LAST[0]
+    px = os.environ.get("FI_PROXY", "").strip()      # بروكسي بآيبي ثابت/نضيف لو آيبي السيرفر مشترك ومحظور
     r = requests.post(f"{FI_API}/{path}.cgi", json=body,
-                      headers={"Authorization": "Bearer " + p["key"]}, timeout=30)
+                      headers={"Authorization": "Bearer " + p["key"]}, timeout=30,
+                      proxies=({"http": px, "https": px} if px else None))
     res = jj(r)
     if isinstance(res, dict) and res.get("status") == "KO":
         msg = res.get("message") or "1fichier رفض الطلب"
         _fi_cool(msg)
         raise Exception(msg)
+    if is_ls:
+        _FI_LS[ck] = (time.time(), res)
+        if len(_FI_LS) > 50:
+            _FI_LS.clear()
     return res
 
 
@@ -10087,15 +10108,16 @@ def _ru_sync_core():
             p = _ru_acc(j.get("acc"))
             if not p:
                 continue
-            if time.time() - float(j.get("chk") or 0) < 120:
-                continue
+            if time.time() - float(j.get("chk") or 0) < min(120 * (2 ** int(j.get("nchk") or 0)), 900):
+                continue                    # كل فشل بيزوّد المسافة (2، 4، 8، لحد 15 دقيقة) عشان منزعّجش 1fichier
             j["chk"] = time.time()
+            j["nchk"] = int(j.get("nchk") or 0) + 1
             changed = True
             budget -= 1
             if _fi_cool_left() > 0:
                 break
             info, einfo = {}, None
-            cands = [p] + [a for a in _ru_accounts() if a["id"] != p["id"]]   # الطلب ممكن يكون تابع لحساب تاني
+            cands = [p]                     # حساب الطلب بس: كل حساب زيادة = طلبات زيادة على 1fichier
             for a_ in cands:
                 try:
                     info = _ru_info(a_, j["id"])
