@@ -2176,9 +2176,45 @@ def feat_clean(d):
     return out
 
 
+IPTV_UFEAT = "__ufeat__"  # مميّز خاص بكل عضو: {username: feat} (بيظهر للعضو ده بس فوق مميّز الكل)
+
+
+def feat_merge(gf, uf):
+    """مميّز الكل + مميّز العضو (بتاع العضو الأول). المنبثق: بتاع العضو لو شغّال وإلا بتاع الكل."""
+    gf = gf or {}
+    if not uf:
+        return gf
+    out = dict(gf)
+    out["mt"] = uf.get("mt") or gf.get("mt") or ""
+    out["matches"] = (uf.get("matches") or []) + (gf.get("matches") or [])
+    out["banners"] = (uf.get("banners") or []) + (gf.get("banners") or [])
+    sec = {}
+    for k in ("home", "movie", "tv"):
+        seen, lst = set(), []
+        for x in (uf.get("sec") or {}).get(k, []) + (gf.get("sec") or {}).get(k, []):
+            key = (x.get("k"), x.get("sid"))
+            if key not in seen:
+                seen.add(key)
+                lst.append(x)
+        sec[k] = lst
+    out["sec"] = sec
+    up = uf.get("popup") or {}
+    if up.get("on"):
+        out["popup"] = up
+    return out
+
+
 @app.get("/iptv/feat")
 def iptv_feat_get():
-    return jsonify((iptv_load().get(IPTV_FEAT) or {}))
+    al = iptv_load()
+    gf = al.get(IPTV_FEAT) or {}
+    uf_all = al.get(IPTV_UFEAT) or {}
+    if request.args.get("raw") == "1":                       # للوحة الأدمن: النسخة الخام بدون دمج
+        if g.role != "admin":
+            return jsonify(error="للأدمن بس"), 403
+        u = str(request.args.get("u", "")).strip().lower()
+        return jsonify(uf_all.get(u) or {} if u else gf)
+    return jsonify(feat_merge(gf, uf_all.get(str(g.user).lower())))
 
 
 @app.post("/iptv/feat")
@@ -2186,12 +2222,18 @@ def iptv_feat_set():
     if g.role != "admin":
         return jsonify(error="للأدمن بس"), 403
     d = request.get_json(silent=True) or {}
+    u = str(d.get("user", "")).strip().lower()
+    if u and u != APP_USER.lower() and u not in users_load():
+        return jsonify(error="المستخدم مش موجود"), 404
     with IPTV_LOCK:
         al = iptv_load()
-        al[IPTV_FEAT] = feat_clean(d)
+        if u:
+            uf = al.setdefault(IPTV_UFEAT, {})
+            uf[u] = feat_clean(d)
+        else:
+            al[IPTV_FEAT] = feat_clean(d)
         iptv_save(al)
     return jsonify(ok=True)
-
 
 
 def _prune_cmap(cm, keys):
