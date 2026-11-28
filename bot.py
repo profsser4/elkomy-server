@@ -5747,7 +5747,10 @@ def st_streams():
     tmdb = request.args.get("tmdb", "")
     s, e = request.args.get("s", ""), request.args.get("e", "")
     imdb_ok, tmdb_ok = bool(re.fullmatch(r"tt\d+", imdb)), bool(re.fullmatch(r"\d{1,9}", tmdb))
-    if not imdb_ok and not tmdb_ok:
+    aid_req = request.args.get("aid", "")[:40]
+    mid_req = request.args.get("mid", "")
+    mid_ok = bool(aid_req) and bool(re.fullmatch(r"[\w:.\-]{1,80}", mid_req))
+    if not imdb_ok and not tmdb_ok and not mid_ok:
         return jsonify(error="العمل ده ملوش IMDb id ولا TMDB id"), 400
 
     def cands_for(a):
@@ -5756,6 +5759,8 @@ def st_streams():
         has_tm = tmdb_ok and any(p.lower().startswith("tmdb") for p in pre)
         has_im = imdb_ok and (not pre or any(imdb.startswith(p) for p in pre))
         out = []
+        if mid_ok and a.get("id") == aid_req:
+            out.append(mid_req)          # العمل جاي من قسم الإضافة دي: رقمها الخاص الأول
         if has_tm:
             out.append("tmdb:" + tmdb)
         if has_im:
@@ -5781,6 +5786,8 @@ def st_streams():
     low_keys = {k.lower() for k in all_keys}
 
     def usable(a):
+        if aid_req and a.get("id") != aid_req:
+            return False                 # العمل من قسم إضافة معيّنة: مانجيبش نتايج من إضافات تانية
         if not a.get("stream"):
             return False
         if a.get("types") and typ not in a["types"]:
@@ -5813,6 +5820,8 @@ def st_streams():
                 txt = x.get("title") or x.get("description") or ""
                 nm = (x.get("name") or "").replace("\n", " ").strip()
                 title = (txt.split("\n")[0] or nm or "stream").strip()
+                if re.search(r"low\s*match", txt + " " + nm, re.I):
+                    continue        # نتيجة الإضافة نفسها واصفاها «Low Match» (مش المسلسل ده): مانعرضهاش
                 sm = SEEDS_RX.search(txt)
                 size = bh.get("videoSize") or parse_size(
                     " ".join([txt, nm, str(bh.get("filename") or "")]))
@@ -6407,6 +6416,7 @@ def cat_items(a, e):
         it = {"type": "tv" if (m.get("type") or e["ty"]) == "series" else "movie",
               "title": m.get("name") or "", "poster": m["poster"],
               "year": str(m.get("year") or m.get("releaseInfo") or "")[:4]}
+        it["aid"], it["mid"] = a["id"], iid[:80]      # الإضافة اللي جه منها العمل + رقمها الخاص (التشغيل بيتحصر عليها)
         if re.fullmatch(r"tt\d+", iid):
             it["imdb"] = iid
         elif iid.startswith("tmdb:") and iid[5:].isdigit():
@@ -9406,7 +9416,10 @@ def cat_items_page(a, e, skip):
     r = requests.get(a["base"] + path + ".json", timeout=20,
                      headers={"User-Agent": "Mozilla/5.0"})
     metas = r.json().get("metas") or []
-    return _metas_to_items(metas, e["ty"]), len(metas)
+    its = _metas_to_items(metas, e["ty"])
+    for it, m in zip(its, [m for m in metas if m.get("poster") and (re.fullmatch(r"tt\d+", str(m.get("id", ""))) or str(m.get("id", "")).startswith("tmdb:") or (m.get("name") or ""))]):
+        it["aid"], it["mid"] = a["id"], str(m.get("id", ""))[:80]
+    return its, len(metas)
 
 
 def browse_row(k, skip):
