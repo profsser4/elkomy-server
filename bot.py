@@ -6461,6 +6461,82 @@ def cat_items(a, e):
     return items
 
 
+_ASRCH_MAN = {}
+
+
+def _addon_search_cats(a):
+    """كتالوجات البحث في الإضافة دي (من الـ manifest، بكاش ساعة)"""
+    hit = _ASRCH_MAN.get(a["base"])
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    out = []
+    try:
+        man = st_manifest(a["base"])
+        for c in (man.get("catalogs") or []):
+            if not isinstance(c, dict) or not c.get("id") or c.get("type") not in ("movie", "series"):
+                continue
+            ex = c.get("extra") or []
+            sup = [str(x) for x in (c.get("extraSupported") or [])]
+            has = "search" in sup or any(isinstance(x, dict) and x.get("name") == "search" for x in ex)
+            if has or (not ex and not sup and "search" in str(c["id"]).lower()):
+                out.append((c["type"], str(c["id"])))
+    except Exception:
+        pass
+    _ASRCH_MAN[a["base"]] = (time.time(), out)
+    return out
+
+
+@app.get("/stremio/asearch")
+def st_asearch():
+    """بحث داخل كتالوجات الإضافات بس (عربي/مدبلج/مترجم) — منفصل عن TMDB والتورنت"""
+    q = request.args.get("q", "").strip()[:80]
+    if len(q) < 2:
+        return jsonify(results=[])
+    is_admin = g.role == "admin"
+    addons = [a for a in st_load()["addons"]
+              if "cinemeta" not in a.get("base", "").lower() and "strem.fun" not in a.get("base", "")]
+
+    def one(a):
+        res = []
+        for ty, cid in _addon_search_cats(a)[:4]:
+            try:
+                r = requests.get(f"{a['base']}/catalog/{ty}/{quote(cid, safe='')}/search={quote(q, safe='')}.json",
+                                 timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    continue
+                for m in (r.json().get("metas") or [])[:20]:
+                    iid = str(m.get("id", ""))
+                    it = {"type": "tv" if (m.get("type") or ty) == "series" else "movie",
+                          "title": m.get("name") or "", "poster": m.get("poster") or "",
+                          "year": str(m.get("year") or m.get("releaseInfo") or "")[:4],
+                          "aid": a["id"], "mid": iid[:80], "an": a["name"] if is_admin else ""}
+                    if re.fullmatch(r"tt\d+", iid):
+                        it["imdb"] = iid
+                    elif iid.startswith("tmdb:") and iid[5:].isdigit():
+                        it["id"] = int(iid[5:])
+                    elif it["title"]:
+                        it["lk"] = True
+                    else:
+                        continue
+                    res.append(it)
+            except Exception:
+                continue
+        return _tmdb_upgrade(res[:30]) if res else []
+
+    if not addons:
+        return jsonify(results=[])
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        parts = list(ex.map(one, addons))
+    seen, out = set(), []
+    for part in parts:
+        for it in part:
+            k = (it["aid"], it["mid"])
+            if k not in seen:
+                seen.add(k)
+                out.append(it)
+    return jsonify(results=out[:60])
+
+
 # ---- قسم المدبلج بالمصري: بنفحص إضافاتك على أفلام الكرتون والعائلي المشهورة
 def dub_hit(a, imdb):
     try:
