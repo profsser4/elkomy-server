@@ -5390,7 +5390,7 @@ def st_logout():
 def st_add_ep():
     """بيضيف إضافة (أو كذا إضافة، كل لينك في سطر) للمصدر المختار (Stremio أو Nuvio): لينك manifest.json."""
     b = request.get_json() or {}
-    raw = [x for x in re.split(r"[\s,]+", str(b.get("urls") or b.get("url") or "")) if x][:30]
+    raw = [x for x in re.split(r"\s+|,(?=\s*(?:https?|stremio)://)", str(b.get("urls") or b.get("url") or "")) if x][:30]   # الفاصلة جوه اللينك (زي qualityfilter=threed,4k) ماتقطّعوش
     if not raw:
         return jsonify(error="الصق رابط الإضافة"), 400
     added_n, keys, errs = 0, 0, []
