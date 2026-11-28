@@ -9,6 +9,8 @@ import hashlib
 import secrets
 import time
 import zipfile
+import struct
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -137,6 +139,7 @@ def store_del(path):
 PFILE = os.path.join(DATA_DIR, "providers.json")
 UDFILE = os.path.join(DATA_DIR, "userdata.json")
 SFILE = os.path.join(DATA_DIR, "stremio.json")
+NFILE = os.path.join(DATA_DIR, "nuvio.json")          # إضافات Nuvio (منفصلة عن Stremio)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 HOME_FILE = os.path.join(DATA_DIR, "home.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -1190,7 +1193,7 @@ def me_password():
 #   dl:    "same" (التحميل من نفس مزوّد المشاهدة) أو id/نوع مزوّد تاني للتحميل بس
 #   strict: لو true مفيش رجوع لمزوّد تاني لو المختار فشل
 # وكل مستخدم ممكن يكون ليه wp (مشاهدة) و dp (تحميل) خاصين في users.json.
-SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False, "reg": True}
+SET_DEF = {"watch": "alldebrid", "dl": "same", "strict": False, "reg": True, "asrc": "stremio"}   # asrc: مصدر الإضافات stremio | nuvio
 
 
 def settings_load():
@@ -1205,6 +1208,7 @@ def settings_load():
             out[k] = d[k].strip()[:40]
     out["strict"] = bool(d.get("strict"))
     out["reg"] = bool(d.get("reg", True))
+    out["asrc"] = d.get("asrc") if d.get("asrc") in ("stremio", "nuvio") else "stremio"
     return out
 
 
@@ -1545,7 +1549,19 @@ def settings_set():
         cur["strict"] = bool(d["strict"])
     if "reg" in d:
         cur["reg"] = bool(d["reg"])
+    if "asrc" in d:
+        if d["asrc"] not in ("stremio", "nuvio"):
+            return jsonify(error="مصدر غلط"), 400
+        if cur.get("asrc") != d["asrc"]:
+            cur["asrc"] = d["asrc"]
+            _ST_SRC[0] = 0.0
+            for _c in ("HB_CACHE", "CAT_CACHE"):          # الصفوف المتخزنة كانت من المصدر القديم
+                try:
+                    globals()[_c].clear()
+                except Exception:
+                    pass
     settings_save(cur)
+    _ST_SRC[0] = 0.0
     return jsonify(ok=True, settings=cur)
 
 
@@ -5170,20 +5186,39 @@ def parse_size(text):
         return 0
 
 
-def st_load():
+_ST_SRC = [0.0, "stremio"]
+
+
+def st_src():
+    """مصدر الإضافات الحالي: stremio أو nuvio (من الإعدادات، بكاش 5 ثواني)."""
+    if time.time() - _ST_SRC[0] > 5:
+        try:
+            v = settings_load().get("asrc")
+        except Exception:
+            v = _ST_SRC[1]
+        _ST_SRC[1] = v if v in ("stremio", "nuvio") else "stremio"
+        _ST_SRC[0] = time.time()
+    return _ST_SRC[1]
+
+
+def st_load(src=None):
+    """إضافات المصدر المختار (كل الكود التاني بيستخدمها زي ما هي). src لتحديد مصدر بعينه."""
+    src = src if src in ("stremio", "nuvio") else st_src()
     try:
-        d = store_load(SFILE)
+        d = store_load(NFILE if src == "nuvio" else SFILE)
     except Exception:
         d = {}
     if not isinstance(d, dict):
         d = {}
     d.setdefault("addons", [])
     d.setdefault("ignored", [])
+    d["_src"] = src
     return d
 
 
 def st_save(d):
-    store_save(SFILE, d)
+    src = d.get("_src") or "stremio"
+    store_save(NFILE if src == "nuvio" else SFILE, {k: v for k, v in d.items() if k != "_src"})
 
 
 def st_post(method, body):
@@ -5316,7 +5351,7 @@ def st_login():
         if not key:
             return jsonify(error="Stremio: تسجيل الدخول فشل"), 400
         with ST_LOCK:
-            d = st_load()
+            d = st_load("stremio")
             d["authKey"] = key
             d["email"] = email
             d["ignored"] = []   # تسجيل الدخول من جديد = رجّع كل إضافات الحساب حتى المحذوفة
@@ -5330,7 +5365,7 @@ def st_login():
 @app.post("/stremio/sync")
 def st_sync():
     with ST_LOCK:
-        d = st_load()
+        d = st_load("stremio")
         if not d.get("authKey"):
             return jsonify(error="سجّل دخول Stremio الأول"), 400
         try:
@@ -5344,7 +5379,7 @@ def st_sync():
 @app.post("/stremio/logout")
 def st_logout():
     with ST_LOCK:
-        d = st_load()
+        d = st_load("stremio")
         d.pop("authKey", None)
         d.pop("email", None)
         st_save(d)
@@ -5353,24 +5388,38 @@ def st_logout():
 
 @app.post("/stremio/addon")
 def st_add_ep():
-    base = st_base((request.get_json() or {}).get("url", ""))
-    if not base.startswith(("http://", "https://")):
-        return jsonify(error="الرابط لازم يبدأ بـ https:// أو stremio://"), 400
-    if not _public_url(base):      # حماية SSRF: ممنوع عناوين داخلية (localhost / شبكة خاصة)
-        return jsonify(error="الرابط ده مش مسموح (لازم يكون عنوان عام)"), 400
-    try:
-        man = st_manifest(base)
-    except Exception as e:
-        return jsonify(error=f"الإضافة مش شغالة: {e}"), 400
-    if not isinstance(man, dict) or not man.get("name"):
-        return jsonify(error="ده مش manifest إضافة صحيح"), 400
-    with ST_LOCK:
-        d = st_load()
-        d["ignored"] = [x for x in d["ignored"] if x != base]
-        added = st_add(d, base, man)
-        st_save(d)
-    keys = st_import_keys(base)
-    return jsonify(ok=True, added=added, keys=keys)
+    """بيضيف إضافة (أو كذا إضافة، كل لينك في سطر) للمصدر المختار (Stremio أو Nuvio): لينك manifest.json."""
+    b = request.get_json() or {}
+    raw = [x for x in re.split(r"[\s,]+", str(b.get("urls") or b.get("url") or "")) if x][:30]
+    if not raw:
+        return jsonify(error="الصق رابط الإضافة"), 400
+    added_n, keys, errs = 0, 0, []
+    for u in raw:
+        base = st_base(u)
+        if not base.startswith(("http://", "https://")):
+            errs.append("الرابط لازم يبدأ بـ https:// أو stremio:// : " + u[:60])
+            continue
+        if not _public_url(base):      # حماية SSRF: ممنوع عناوين داخلية (localhost / شبكة خاصة)
+            errs.append("الرابط ده مش مسموح (لازم يكون عنوان عام): " + u[:60])
+            continue
+        try:
+            man = st_manifest(base)
+        except Exception as e:
+            errs.append("الإضافة مش شغالة (%s): %s" % (u[:60], str(e)[:80]))
+            continue
+        if not isinstance(man, dict) or not man.get("name"):
+            errs.append("ده مش manifest إضافة صحيح: " + u[:60])
+            continue
+        with ST_LOCK:
+            d = st_load()
+            d["ignored"] = [x for x in d["ignored"] if x != base]
+            if st_add(d, base, man):
+                added_n += 1
+            st_save(d)
+        keys += st_import_keys(base)
+    if errs and not added_n and len(raw) == 1:
+        return jsonify(error=errs[0]), 400
+    return jsonify(ok=True, added=added_n, keys=keys, errs=errs, src=st_src())
 
 
 @app.get("/stremio/addons")
@@ -5380,7 +5429,7 @@ def st_list():
     if g.role != "admin":
         return jsonify(logged=False, email="", items=[], n=n)
     return jsonify(
-        logged=bool(d.get("authKey")), email=d.get("email", ""), n=n,
+        src=d.get("_src"), logged=bool(d.get("authKey")), email=d.get("email", ""), n=n,
         items=[{"id": a["id"], "name": a["name"], "stream": a["stream"],
                 "base": a.get("base", "")} for a in d["addons"]])
 
@@ -10079,6 +10128,547 @@ def ru_multiup_del():
     return jsonify(ok=True)
 
 
+# ============================================================
+# Mega.nz — رفع مباشر من لينك الـIPTV
+#  - Mega مفيهوش "ريموت أبلود"، فالسيرفر نفسه بيسحب من اللينك ويشفّر ويرفع (ستريم، الملف مش بيتحفظ على الديسك).
+#  - رابط واحد في المرة، وأول ما يخلص بيبدأ اللي بعده على طول (من غير أي مهلة بين الرفعات).
+#  - بيحتاج مكتبة cryptography في requirements.txt
+#  - متغيرات اختيارية: MEGA_EMAIL / MEGA_PASS (بدل الحفظ من الإعدادات)، MEGA_CONN (عدد اتصالات الرفع، الافتراضي 4)
+# ============================================================
+MEGA_FILE = os.path.join(DATA_DIR, "mega.json")
+MEGA_API = "https://g.api.mega.co.nz/cs"
+_MEGA_CACHE = [0.0, {}]
+_MEGA_SES = {"sid": "", "mk": b"", "t": 0.0, "root": "", "files": {}}
+_MEGA_LOCK = threading.RLock()
+_MEGA_SEQ = [int.from_bytes(os.urandom(3), "big")]
+_MEGA_RUN = {}          # job id -> {"jid","t","name","size","done","hb"}  (الرفعات الشغالة دلوقتي في الـprocess ده)
+
+
+class MegaError(MuError):
+    """أخطاء Mega: ما بتفعّلش فترة هدوء 1fichier."""
+
+    def __init__(self, msg, code=0):
+        super().__init__(msg)
+        self.code = code
+
+
+_MG_ERR = {
+    -3: "Mega مشغول، جرّب تاني", -4: "Mega: طلبات كتير بسرعة", -8: "الجلسة انتهت",
+    -9: "الإيميل أو الباسورد غلط (أو الحساب مش موجود)", -11: "Mega: مفيش صلاحية للعملية دي",
+    -15: "جلسة Mega انتهت", -16: "حساب Mega ده محظور", -17: "مساحة حساب Mega خلصت، افضّي مساحة",
+    -18: "Mega مش متاح مؤقتاً", -26: "حساب Mega عليه تحقق بخطوتين (2FA) ومش مدعوم هنا، استخدم حساب من غيره",
+}
+
+
+def _mg_crypto():
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except Exception:
+        raise MegaError("Mega: مكتبة cryptography مش متسطّبة. ضيف سطر cryptography في requirements.txt وأعد النشر")
+    return Cipher, algorithms, modes
+
+
+def _mg_b64d(s):
+    s = str(s).replace("-", "+").replace("_", "/").replace(",", "")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def _mg_b64e(b):
+    return base64.urlsafe_b64encode(bytes(b)).decode().rstrip("=")
+
+
+def _mg_ecb(key, data, enc):
+    Cipher, algorithms, modes = _mg_crypto()
+    c = Cipher(algorithms.AES(key), modes.ECB())
+    o = c.encryptor() if enc else c.decryptor()
+    return o.update(data) + o.finalize()
+
+
+def _mg_cbc(key, iv, data, enc):
+    Cipher, algorithms, modes = _mg_crypto()
+    c = Cipher(algorithms.AES(key), modes.CBC(iv))
+    o = c.encryptor() if enc else c.decryptor()
+    return o.update(data) + o.finalize()
+
+
+def _mega_creds():
+    """(إيميل، باسورد) من الإعدادات المحفوظة، أو من MEGA_EMAIL/MEGA_PASS."""
+    c = _MEGA_CACHE
+    if time.time() - c[0] > 20:
+        try:
+            c[1] = store_load(MEGA_FILE) or {}
+        except Exception:
+            c[1] = c[1] or {}
+        c[0] = time.time()
+    d = c[1] if isinstance(c[1], dict) else {}
+    em = str(d.get("email") or os.environ.get("MEGA_EMAIL", "")).strip()
+    pw = str(d.get("pass") or os.environ.get("MEGA_PASS", "")).strip()
+    return (em, pw) if em and pw else ("", "")
+
+
+def _mg_api(cmd, sid=""):
+    last = None
+    for i in range(5):
+        _MEGA_SEQ[0] += 1
+        params = {"id": _MEGA_SEQ[0]}
+        if sid:
+            params["sid"] = sid
+        try:
+            r = requests.post(MEGA_API, params=params, data=json.dumps([cmd]), timeout=60,
+                              headers={"Content-Type": "application/json"})
+            res = r.json()
+        except Exception as e:
+            last = MegaError("Mega: " + str(e)[:120])
+            time.sleep(1 + i * 2)
+            continue
+        if isinstance(res, list) and res:
+            res = res[0]
+        if isinstance(res, int) and res < 0:
+            if res == -3:
+                last = MegaError("Mega: " + _MG_ERR[-3], -3)
+                time.sleep(0.5 * (2 ** i))
+                continue
+            raise MegaError("Mega: " + _MG_ERR.get(res, "خطأ %d" % res), res)
+        return res
+    raise last or MegaError("Mega: مفيش رد")
+
+
+def _mg_prepkey_v1(password):
+    """تشفير الباسورد للحسابات القديمة (نسخة 1)."""
+    Cipher, algorithms, modes = _mg_crypto()
+    pw = password.encode("utf-8")
+    pw += b"\0" * (-len(pw) % 4)
+    words = list(struct.unpack(">%dI" % (len(pw) // 4), pw))
+    encs = []
+    for j in range(0, len(words), 4):
+        k = words[j:j + 4]
+        k += [0] * (4 - len(k))
+        encs.append(Cipher(algorithms.AES(struct.pack(">4I", *k)), modes.ECB()).encryptor())
+    pkey = bytes.fromhex("93C467E37DB0C7A4D1BE3F810152CB56")
+    for _ in range(0x10000):
+        for e in encs:
+            pkey = e.update(pkey)
+    return pkey
+
+
+def _mg_stringhash_v1(s, aeskey):
+    Cipher, algorithms, modes = _mg_crypto()
+    b = s.encode("utf-8")
+    b += b"\0" * (-len(b) % 4)
+    w = struct.unpack(">%dI" % (len(b) // 4), b)
+    h = [0, 0, 0, 0]
+    for i, x in enumerate(w):
+        h[i % 4] ^= x
+    hb = struct.pack(">4I", *h)
+    e = Cipher(algorithms.AES(aeskey), modes.ECB()).encryptor()
+    for _ in range(0x4000):
+        hb = e.update(hb)
+    h = struct.unpack(">4I", hb)
+    return _mg_b64e(struct.pack(">2I", h[0], h[2]))
+
+
+def _mg_login(email, pw):
+    """بيرجّع (sid, master_key)."""
+    email = email.strip().lower()
+    r0 = _mg_api({"a": "us0", "user": email})
+    ver = int((r0 or {}).get("v") or 1) if isinstance(r0, dict) else 1
+    if ver == 2:
+        dk = hashlib.pbkdf2_hmac("sha512", pw.encode("utf-8"), _mg_b64d(r0["s"]), 100000, 32)
+        pkey, uh = dk[:16], _mg_b64e(dk[16:])
+    else:
+        pkey = _mg_prepkey_v1(pw)
+        uh = _mg_stringhash_v1(email, pkey)
+    res = _mg_api({"a": "us", "user": email, "uh": uh})
+    if not isinstance(res, dict) or not res.get("k"):
+        raise MegaError("Mega: رد الدخول مش مفهوم")
+    mk = _mg_ecb(pkey, _mg_b64d(res["k"]), False)
+    if res.get("csid") and res.get("privk"):
+        pk = _mg_b64d(res["privk"])
+        pk = _mg_ecb(mk, pk[:len(pk) // 16 * 16], False)
+        ints = []
+        for _ in range(4):
+            bits = (pk[0] << 8) | pk[1]
+            n = (bits + 7) // 8
+            ints.append(int.from_bytes(pk[2:2 + n], "big"))
+            pk = pk[2 + n:]
+        p_, q_, d_ = ints[0], ints[1], ints[2]
+        c = int.from_bytes(_mg_b64d(res["csid"])[2:], "big")
+        m = pow(c, d_, p_ * q_)
+        mb = m.to_bytes((m.bit_length() + 7) // 8, "big")
+        sid = _mg_b64e(mb[:43])
+    elif res.get("tsid"):
+        sid = str(res["tsid"])
+    else:
+        raise MegaError("Mega: مفيش sid في رد الدخول")
+    return sid, mk
+
+
+def _mg_list_root(sid, mk):
+    """(handle مجلد الـCloud Drive، {اسم الملف: {h, s, k}} للملفات اللي في الجذر) عشان ما نرفعش نفس الملف مرتين."""
+    res = _mg_api({"a": "f", "c": 1}, sid)
+    nodes = (res or {}).get("f") or [] if isinstance(res, dict) else []
+    root = next((n.get("h") for n in nodes if n.get("t") == 2), "")
+    if not root:
+        raise MegaError("Mega: ما لقيتش مجلد Cloud Drive في الحساب")
+    files = {}
+    for n in nodes:
+        if n.get("t") != 0 or n.get("p") != root:
+            continue
+        try:
+            k = _mg_ecb(mk, _mg_b64d(str(n.get("k") or "").split("/")[0].split(":")[-1]), False)
+            k = bytes(a ^ b for a, b in zip(k[:16], k[16:32])) if len(k) >= 32 else k[:16]
+            at = _mg_cbc(k, b"\0" * 16, _mg_b64d(n["a"]), False)
+            if not at.startswith(b"MEGA"):
+                continue
+            nm = json.loads(at[4:].split(b"\0")[0].decode("utf-8", "ignore")).get("n")
+            if nm:
+                files[str(nm)] = {"h": n["h"], "s": int(n.get("s") or 0), "k": k}
+        except Exception:
+            continue
+    return root, files
+
+
+def _mg_session(force=False):
+    with _MEGA_LOCK:
+        s = _MEGA_SES
+        if not force and s["sid"] and time.time() - s["t"] < 2700:
+            return s
+        em, pw = _mega_creds()
+        if not em:
+            raise MegaError("Mega: ضيف الإيميل والباسورد من الإعدادات")
+        sid, mk = _mg_login(em, pw)
+        root, files = _mg_list_root(sid, mk)
+        s.update(sid=sid, mk=mk, t=time.time(), root=root, files=files)
+        return s
+
+
+def _mg_cmd(cmd):
+    s = _mg_session()
+    try:
+        return _mg_api(cmd, s["sid"])
+    except MegaError as e:
+        if e.code != -15:
+            raise
+    s = _mg_session(True)
+    return _mg_api(cmd, s["sid"])
+
+
+def _mg_chunks(size):
+    """أحجام الأجزاء بتاعة Mega: 128KB وبتزيد 128KB لحد 1MB وبعدها 1MB ثابتة."""
+    out, p, s = [], 0, 0x20000
+    while p + s < size:
+        out.append((p, s))
+        p += s
+        if s < 0x100000:
+            s += 0x20000
+    out.append((p, size - p))
+    return out
+
+
+def _mg_link(handle, key16):
+    ph = _mg_cmd({"a": "l", "n": handle})
+    if not isinstance(ph, str) or not ph:
+        raise MegaError("Mega: ما قدرتش أعمل لينك للملف")
+    return "https://mega.nz/file/%s#%s" % (ph, _mg_b64e(key16))
+
+
+def _mg_post_chunk(base, pos, data):
+    last = ""
+    for i in range(4):
+        try:
+            r = requests.post("%s/%d" % (base, pos), data=data, timeout=(15, 180))
+            t = (r.text or "").strip()
+            if r.status_code == 200:
+                if re.fullmatch(r"-\d+", t):
+                    code = int(t)
+                    if code != -3:
+                        raise MegaError("Mega: " + _MG_ERR.get(code, "خطأ %d" % code), code)
+                    last = "Mega مشغول"
+                else:
+                    return t
+            else:
+                last = "كود %d" % r.status_code
+        except MegaError:
+            raise
+        except Exception as e:
+            last = str(e)[:100]
+        time.sleep(1 + 2 * i)
+    raise MegaError("Mega: فشل رفع جزء من الملف (%s)" % last)
+
+
+def _mg_drain(futs, limit):
+    """بيستنى لحد ما اللي شغّال من الأجزاء يبقى أقل من limit، وبيرمي أي خطأ حصل في جزء."""
+    while True:
+        alive = []
+        for f in futs:
+            if f.done():
+                f.result()
+            else:
+                alive.append(f)
+        futs[:] = alive
+        if len(alive) < limit:
+            return
+        time.sleep(0.03)
+
+
+def _mg_src_name(resp, url, name):
+    nm = _ru_clean(name, "")
+    if nm:
+        return nm
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', resp.headers.get("Content-Disposition", ""), re.I)
+    if m:
+        nm = _ru_clean(unquote(m.group(1)), "")
+    return nm or _ru_clean(unquote(os.path.basename(urlparse(url).path)), "file.mp4")
+
+
+def _mg_transfer(url, name, st):
+    """بيسحب من اللينك ويشفّر ويرفع لـMega ويرجّع لينك mega.nz/file/...#key."""
+    Cipher, algorithms, modes = _mg_crypto()
+    hdrs = {"User-Agent": "VLC/3.0.20 LibVLC/3.0.20", "Accept-Encoding": "identity"}
+    resp = requests.get(url, stream=True, headers=hdrs, timeout=(15, 90), allow_redirects=True)
+    spool = None
+    try:
+        if resp.status_code >= 400:
+            raise MegaError("المصدر رد بكود %d (اللينك مش شغّال أو الاتصال التاني لسه مفتوح)" % resp.status_code)
+        size = int(resp.headers.get("Content-Length") or 0)
+        nm = _mg_src_name(resp, url, name)
+        st["name"] = nm
+        if "text/html" in resp.headers.get("Content-Type", "").lower() and size < 2 * 1024 * 1024:
+            raise MegaError("المصدر رجّع صفحة ويب مش ملف فيديو")
+        if size > 0:
+            src = resp.iter_content(chunk_size=262144)
+            buf = bytearray()
+
+            def reader(n):
+                while len(buf) < n:
+                    b = next(src, None)
+                    if b is None:
+                        break
+                    buf.extend(b)
+                out = bytes(buf[:n])
+                del buf[:n]
+                return out
+        else:
+            # المصدر مش قايل الحجم: نحفظه مؤقتاً الأول (Mega لازم يعرف الحجم قبل الرفع)
+            spool = tempfile.TemporaryFile()
+            n_ = 0
+            for b in resp.iter_content(chunk_size=1 << 20):
+                if b:
+                    spool.write(b)
+                    n_ += len(b)
+                    st["done"] = n_
+            size = n_
+            spool.seek(0)
+            reader = spool.read
+        if size <= 0:
+            raise MegaError("المصدر رجّع ملف فاضي")
+        st["size"], st["done"] = size, 0
+        sess = _mg_session()
+        dup = sess["files"].get(nm)
+        if dup and dup["s"] == size:
+            return _mg_link(dup["h"], dup["k"])          # الملف ده مرفوع فعلاً: ناخد لينكه من غير ما نرفعه تاني
+        up = _mg_cmd({"a": "u", "s": size})
+        base = str((up or {}).get("p") or "") if isinstance(up, dict) else ""
+        if not base:
+            raise MegaError("Mega: مرجّعش مكان للرفع")
+        if base.startswith("http://"):
+            base = "https://" + base[7:]
+        key, nonce = os.urandom(16), os.urandom(8)
+        mac_iv = nonce + nonce
+        fmac_enc = Cipher(algorithms.AES(key), modes.CBC(b"\0" * 16)).encryptor()
+        file_mac = b"\0" * 16
+        chunks = _mg_chunks(size)
+        conns = max(1, min(int(os.environ.get("MEGA_CONN", "4") or 4), 8))
+        ex = ThreadPoolExecutor(max_workers=conns)
+        futs, handle = [], ""
+        try:
+            for idx, (pos, n) in enumerate(chunks):
+                data = reader(n)
+                if len(data) != n:
+                    raise MegaError("المصدر قطع الاتصال قبل ما الملف يكمل (%d من %d)" % (pos + len(data), size))
+                padded = data + b"\0" * (-len(data) % 16)
+                cmac = Cipher(algorithms.AES(key), modes.CBC(mac_iv)).encryptor().update(padded)[-16:]
+                file_mac = fmac_enc.update(cmac)
+                ct = Cipher(algorithms.AES(key), modes.CTR(nonce + (pos // 16).to_bytes(8, "big"))).encryptor().update(data)
+                st["done"] = pos + n
+                if time.time() - st.get("hb", 0) > 30:
+                    st["hb"] = time.time()
+                    _mega_hb(st.get("jid"))
+                if idx == len(chunks) - 1:
+                    _mg_drain(futs, 1)                   # كل الأجزاء اللي قبله لازم تخلص، وبعدها آخر جزء بيرجّع مفتاح الاكتمال
+                    handle = _mg_post_chunk(base, pos, ct)
+                else:
+                    _mg_drain(futs, conns * 2)
+                    futs.append(ex.submit(_mg_post_chunk, base, pos, ct))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", handle or ""):
+            raise MegaError("Mega: ما رجّعش مفتاح اكتمال الرفع (%s)" % str(handle)[:40])
+        fm = struct.unpack(">4I", file_mac)
+        meta = (fm[0] ^ fm[1], fm[2] ^ fm[3])
+        kw, nw = struct.unpack(">4I", key), struct.unpack(">2I", nonce)
+        nk = struct.pack(">8I", kw[0] ^ nw[0], kw[1] ^ nw[1], kw[2] ^ meta[0], kw[3] ^ meta[1], nw[0], nw[1], meta[0], meta[1])
+        attr = b"MEGA" + json.dumps({"n": nm}).encode("utf-8")
+        attr += b"\0" * (-len(attr) % 16)
+        node = {"h": handle, "t": 0, "a": _mg_b64e(_mg_cbc(key, b"\0" * 16, attr, True)),
+                "k": _mg_b64e(_mg_ecb(sess["mk"], nk, True))}
+        res = _mg_cmd({"a": "p", "t": sess["root"], "n": [node]})
+        fl = (res or {}).get("f") if isinstance(res, dict) else None
+        if not fl:
+            raise MegaError("Mega: ما أكدش حفظ الملف")
+        link = _mg_link(fl[0]["h"], key)
+        sess["files"][nm] = {"h": fl[0]["h"], "s": size, "k": key}
+        return link
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if spool:
+            spool.close()
+
+
+def _mega_hb(jid):
+    """نبضة: بتقول للـinstances التانية إن الرفع لسه شغّال (عشان ما يتعتبرش واقف ويتعاد)."""
+    if not jid:
+        return
+    try:
+        with RU_LOCK:
+            data = _ru_data()
+            j = next((x for x in data.get("jobs") or [] if str(x.get("id")) == jid), None)
+            if j is not None:
+                j["hb"] = int(time.time())
+                store_save(RU_FILE, data)
+    except Exception:
+        pass
+
+
+def _mega_apply(data, j, ok, link="", err=""):
+    """بيسجّل نتيجة رفعة Mega في الـjob والمكتبة، ولو فشلت بيرجّع الرابط أول الطابور (وبعد 3 مرات يسجّله فاشل)."""
+    items = j.get("items") or []
+    it = items[0] if items else {}
+    key = j.get("key")
+    j["done"] = True
+    if ok:
+        j.pop("err", None)
+        if key:
+            ent = {"ep": it.get("e") or "", "name": it.get("n") or "", "t": int(time.time()), "ok": True, "link": link}
+            cur = data.setdefault("links", {}).setdefault(key, {"files": []})["files"]
+            same = next((i for i, f in enumerate(cur)
+                         if (ent["ep"] and f.get("ep") == ent["ep"]) or (not ent["ep"] and f.get("name") == ent["name"])), None)
+            if same is None:
+                cur.append(ent)
+            else:
+                cur[same] = ent
+        return
+    j["err"] = str(err)[:300]
+    if not key:
+        return
+    q = data.setdefault("queue", {}).setdefault(key, {"items": []})
+    q["acc"], q["folder"] = j.get("acc"), j.get("folder")
+    have = {x.get("u") for x in q["items"]}
+    for x in reversed(items):
+        if x.get("u") not in have:
+            q["items"].insert(0, x)
+    q["fails"] = int(q.get("fails") or 0) + 1
+    q["err"] = str(err)[:160]
+    if q["fails"] >= 3 and q["items"]:
+        bad = q["items"].pop(0)
+        data.setdefault("links", {}).setdefault(key, {"files": []})["files"].append(
+            {"ep": bad.get("e") or "", "name": bad.get("n") or "", "t": int(time.time()), "ok": False, "err": str(err)[:160]})
+        q["fails"] = 0
+        q.pop("err", None)
+    if not q["items"]:
+        data["queue"].pop(key, None)
+
+
+def _mega_finish(jid, ok, link="", err=""):
+    for _ in range(60):                     # الـjob بيتسجّل بعد ما الإرسال يرجع: نستناه لو الرفع خلص بسرعة
+        with RU_LOCK:
+            data = _ru_data()
+            j = next((x for x in data.get("jobs") or [] if str(x.get("id")) == jid), None)
+            if j is not None:
+                _mega_apply(data, j, ok, link, err)
+                store_save(RU_FILE, data)
+                break
+        time.sleep(0.5)
+    _MEGA_RUN.pop(jid, None)
+    if ok:
+        _ru_pump_safe()                     # اللي بعده على طول
+    else:
+        threading.Timer(int(os.environ.get("MEGA_RETRY_WAIT", "20") or 20), _ru_pump_safe).start()
+
+
+def _ru_pump_safe():
+    try:
+        _ru_pump()
+    except Exception as e:
+        app.logger.warning("ru pump: %s", e)
+
+
+def _mega_worker(jid, url, name):
+    st = _MEGA_RUN.get(jid) or {}
+    try:
+        link = _mg_transfer(url, name, st)
+    except Exception as e:
+        app.logger.warning("mega upload %s: %s", jid, e)
+        _mega_finish(jid, False, err=str(e))
+        return
+    _mega_finish(jid, True, link=link)
+
+
+def _ru_send_mega(p, urls, folder_id="0", headers=None, names=None):
+    if not _mega_creds()[0]:
+        raise MegaError("Mega: ضيف الإيميل والباسورد من الإعدادات")
+    _mg_crypto()
+    jid = "mega:" + uuid.uuid4().hex[:12]
+    _MEGA_RUN[jid] = {"jid": jid, "t": time.time(), "name": (names or [""])[0] or "", "size": 0, "done": 0, "hb": time.time()}
+    threading.Thread(target=_mega_worker, args=(jid, urls[0], (names or [""])[0] or ""), daemon=True).start()
+    return {"id": jid}
+
+
+@app.get("/ru/mega")
+def ru_mega_get():
+    em, _pw = _mega_creds()
+    try:
+        _mg_crypto()
+        crypto = True
+    except Exception:
+        crypto = False
+    return jsonify(ok=True, on=bool(em), user=em, crypto=crypto)
+
+
+@app.post("/ru/mega")
+def ru_mega_set():
+    d = request.get_json(silent=True) or {}
+    em, pw = str(d.get("email") or "").strip(), str(d.get("pass") or "").strip()
+    if not em or not pw:
+        return jsonify(ok=False, error="اكتب الإيميل والباسورد"), 400
+    try:
+        _mg_crypto()
+        _mg_login(em, pw)                                   # نتأكد إنهم صح قبل ما نحفظهم
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
+    try:
+        store_save(MEGA_FILE, {"email": em, "pass": pw})
+        _MEGA_CACHE[0] = 0.0
+        _MEGA_SES.update(sid="", t=0.0)
+    except Exception as e:
+        return jsonify(ok=False, error="ما قدرتش أحفظ: " + str(e)[:100]), 500
+    return jsonify(ok=True)
+
+
+@app.delete("/ru/mega")
+def ru_mega_del():
+    try:
+        store_save(MEGA_FILE, {})
+        _MEGA_CACHE[0] = 0.0
+        _MEGA_SES.update(sid="", t=0.0)
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+
 def _ru_data():
     try:
         d = store_load(RU_FILE)
@@ -10092,6 +10682,8 @@ def _ru_accounts():
     out = [p for p in load() if p["type"] == "1fichier" and not p.get("login")]
     if _mu_creds()[0]:
         out.append({"id": "multiup", "type": "multiup", "name": "MultiUp", "key": "multiup", "cdn": False})
+    if _mega_creds()[0]:
+        out.insert(0, {"id": "mega", "type": "mega", "name": "Mega", "key": "mega", "cdn": False})   # الأول في القايمة
     return out
 
 
@@ -10143,6 +10735,9 @@ def _fi_call(p, path, body):
 
 
 def _ru_call(p, ep, body):
+    if p.get("type") == "mega":
+        st = _MEGA_RUN.get(str((body or {}).get("id") or "")) or {}
+        return {"mega": bool(st), "name": st.get("name"), "size": st.get("size"), "done": st.get("done")}
     if p.get("type") == "multiup":
         return _mu_call(p, ep, body)
     return _fi_call(p, "remote/" + ep, body)
@@ -10210,7 +10805,7 @@ def _ru_send_multiup(p, urls, folder_id="0", headers=None, names=None):
     return _mu_call(p, "request", {"urls": urls, "names": names or []})
 
 
-RU_HOSTS = {"1fichier": _ru_send_1fichier, "multiup": _ru_send_multiup}
+RU_HOSTS = {"1fichier": _ru_send_1fichier, "multiup": _ru_send_multiup, "mega": _ru_send_mega}
 
 
 @app.get("/ru/targets")
@@ -10230,7 +10825,7 @@ def ru_folders():
         parent = int(request.args.get("parent") or 0)
     except Exception:
         parent = 0
-    if p.get("type") == "multiup":
+    if p.get("type") in ("multiup", "mega"):
         return jsonify(ok=True, parent=0, items=[])
     try:
         res = _fi_call(p, "folder/ls", {"folder_id": parent})
@@ -10255,7 +10850,7 @@ def ru_mkdir():
     name = _ru_clean(d.get("name"), "")
     if not name:
         return jsonify(ok=False, error="اكتب اسم المجلد"), 400
-    if p.get("type") == "multiup":
+    if p.get("type") in ("multiup", "mega"):
         return jsonify(ok=True, id=0, name=name)          # MultiUp مفيهوش مجلدات: الاسم بيتحط في اسم الملف
     try:
         parent = int(d.get("parent") or 0)
@@ -10395,7 +10990,7 @@ def _cool_blocks(acc_id):
     if _fi_cool_left() <= 0:
         return False
     p = _ru_acc(acc_id) or (_ru_accounts() or [{}])[0]
-    return (p or {}).get("type") != "multiup"
+    return (p or {}).get("type") not in ("multiup", "mega")
 
 
 def _fi_cool(e):
@@ -10465,6 +11060,12 @@ def _ru_sync_core():
         budget = 4
         for j in jobs:
             if j.get("done"):
+                continue
+            if str(j.get("id")).startswith("mega:"):
+                # رفعات Mega بتخلّص نفسها (الـthread بيسجّل النتيجة ويبدأ اللي بعده). هنا بس بنكتشف لو اتقطعت (ريستارت)
+                if str(j["id"]) not in _MEGA_RUN and time.time() - max(int(j.get("t") or 0), int(j.get("hb") or 0)) > 150:
+                    _mega_apply(data, j, False, "", "رفع Mega اتقطع (السيرفر اتعمله ريستارت)، هيتعاد تلقائي")
+                    changed = True
                 continue
             if budget <= 0:
                 break
@@ -10616,8 +11217,8 @@ def _ru_pump():
             if any((not j.get("done")) and _now - int(j.get("t") or 0) < 6 * 3600 for j in (data.get("jobs") or [])):
                 continue                                    # لسه فيه رابط بيتسحب (أي مسلسل): حساب IPTV بلينك واحد بس
             _qp = _ru_acc(q.get("acc")) or {}
-            _gap = int(os.environ.get("MU_SEND_GAP", "30") or 30) if _qp.get("type") == "multiup" else int(os.environ.get("RU_SEND_GAP", "300") or 300)
-            if _now - float(data.get("last_send") or 0) < max(_gap, 15):
+            _gap = 0 if _qp.get("type") == "mega" else (int(os.environ.get("MU_SEND_GAP", "30") or 30) if _qp.get("type") == "multiup" else int(os.environ.get("RU_SEND_GAP", "300") or 300))
+            if _gap and _now - float(data.get("last_send") or 0) < max(_gap, 15):      # Mega: من غير مهلة، اللي بعده على طول
                 continue                                    # مهلة بين كل رفع والتاني (الافتراضي 300 ثانية) عشان 1fichier ما يقفلش الحساب
             if _now - float(q.get("claim") or 0) < 60:
                 continue                                    # instance تانية بتبعته دلوقتي
@@ -10737,7 +11338,14 @@ def ru_links():
     qe = str(((data.get("queue") or {}).get(key) or {}).get("err") or "")
     if qe:
         errs.append(qe)
-    return jsonify(ok=True, files=files, pending=pend, queued=qn, errs=errs[:3], cool=_fi_cool_left(), watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
+    prog = None
+    for j in (data.get("jobs") or []):
+        st_ = _MEGA_RUN.get(str(j.get("id"))) if (j.get("key") == key and not j.get("done")) else None
+        if st_:
+            sz = int(st_.get("size") or 0)
+            prog = {"name": st_.get("name") or "", "pct": int(100 * int(st_.get("done") or 0) / sz) if sz else 0,
+                    "mb": round(int(st_.get("done") or 0) / 1048576)}
+    return jsonify(ok=True, files=files, pending=pend, queued=qn, errs=errs[:3], cool=_fi_cool_left(), prog=prog, watch=({"on": bool(w.get("on")), "n": len(w.get("seen") or [])} if w else None))
 
 
 @app.get("/ru/status")
@@ -10984,8 +11592,8 @@ def ru_watch_set():
             w["on"] = bool(d.get("on"))
         tgt = str(d.get("acc") or "")
         if tgt:
-            if tgt == "multiup":
-                p2 = _ru_acc("multiup")
+            if tgt in ("multiup", "mega"):
+                p2 = _ru_acc(tgt)
             else:
                 p2 = _ru_acc(tgt) or next((x for x in _ru_accounts() if x.get("type") == "1fichier"), None)
             if not p2:
@@ -10998,7 +11606,7 @@ def ru_watch_set():
                 q.pop("err", None)
                 q["fails"] = 0
             w.pop("err", None)
-            if p2.get("type") == "multiup":
+            if p2.get("type") in ("multiup", "mega"):
                 w["folder"] = 0
         store_save(RU_FILE, data)
     if d.get("now"):
