@@ -5261,8 +5261,20 @@ def st_info(m):
 
 
 def st_manifest(base):
-    r = requests.get(base + "/manifest.json", timeout=15)
+    r = requests.get(base + "/manifest.json", timeout=15,
+                     headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     return jj(r)
+
+
+def st_fallback_manifest(base, err):
+    """Torrentio (strem.fun) بيرجّع 403 لآيبيهات السيرفرات فمقدرناش نقرا الـmanifest.
+    بنضيف الإضافة بـmanifest جاهز (أفلام ومسلسلات بأرقام IMDb) بدل ما نرفضها. ملحوظة: لو الآيبي لسه محظور،
+    نتايج التشغيل هتحتاج ADDON_PROXY على السيرفر."""
+    if "strem.fun" in base and ("403" in str(err) or "429" in str(err) or "1020" in str(err)):
+        return {"name": "Torrentio", "types": ["movie", "series"], "idPrefixes": ["tt"],
+                "resources": [{"name": "stream", "types": ["movie", "series"], "idPrefixes": ["tt"]}],
+                "catalogs": []}
+    return None
 
 
 def st_catalogs(m):
@@ -5416,8 +5428,10 @@ def st_add_ep():
         try:
             man = st_manifest(base)
         except Exception as e:
-            errs.append("الإضافة مش شغالة (%s): %s" % (u[:60], str(e)[:80]))
-            continue
+            man = st_fallback_manifest(base, e)
+            if man is None:
+                errs.append("الإضافة مش شغالة (%s): %s" % (u[:60], str(e)[:80]))
+                continue
         if not isinstance(man, dict) or not man.get("name"):
             errs.append("ده مش manifest إضافة صحيح: " + u[:60])
             continue
