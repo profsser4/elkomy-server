@@ -5750,18 +5750,27 @@ def st_streams():
     if not imdb_ok and not tmdb_ok:
         return jsonify(error="العمل ده ملوش IMDb id ولا TMDB id"), 400
 
-    def mid_for(a):
-        """الرقم اللي الإضافة دي بتفهمه: IMDb (tt...) أو TMDB (tmdb:123 زي إضافات Nuvio)."""
+    def cands_for(a):
+        """الأرقام اللي الإضافة دي بتفهمها بالترتيب: TMDB الأول (الأساس) ثم IMDb، ولو الإضافة من غير idPrefixes بنجرّب الاتنين."""
         pre = [str(p) for p in (a.get("prefixes") or [])]
-        if imdb_ok and (not pre or any(imdb.startswith(p) for p in pre)):
-            return imdb
-        if tmdb_ok and any(p.lower().startswith("tmdb") for p in pre):
-            return "tmdb:" + tmdb
-        return None
+        has_tm = tmdb_ok and any(p.lower().startswith("tmdb") for p in pre)
+        has_im = imdb_ok and (not pre or any(imdb.startswith(p) for p in pre))
+        out = []
+        if has_tm:
+            out.append("tmdb:" + tmdb)
+        if has_im:
+            out.append(imdb)
+        if tmdb_ok and not pre and not has_tm:
+            out.append("tmdb:" + tmdb)
+        return out
 
-    def sid_for(a):
-        m = mid_for(a)
-        return f"{m}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else m
+    def mid_for(a):
+        c = cands_for(a)
+        return c[0] if c else None
+
+    def sids_for(a):
+        return [f"{m}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else m
+                for m in cands_for(a)]
 
     # AllDebrid بيرفض طلبات السيرفر (NO_SERVER)، فمايتحسبش مزوّد يسحب من عندنا
     own = (not ADDON_DIRECT) and any(p["type"] != "alldebrid" for p in torrent_providers())
@@ -5783,14 +5792,22 @@ def st_streams():
 
     def one(a):
         qb = st_plain_base(a["base"]) if own else a["base"]
-        url = f"{qb}/stream/{typ}/{sid_for(a)}.json"
         try:
-            r = requests.get(url, timeout=25,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200:
-                return [], f"{a['name']}: رد {r.status_code}"
+            streams_, code, got200 = [], None, False
+            for sid in sids_for(a):
+                r = requests.get(f"{qb}/stream/{typ}/{sid}.json", timeout=25,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+                code = r.status_code
+                if code != 200:
+                    continue
+                got200 = True
+                streams_ = r.json().get("streams") or []
+                if streams_:
+                    break          # رد فيه نتايج: كفاية. غير كده نجرّب الرقم التاني (TMDB/IMDb)
+            if not got200:
+                return [], f"{a['name']}: رد {code}"
             out = []
-            for x in (r.json().get("streams") or []):
+            for x in streams_:
                 h = str(x.get("infoHash") or "").lower()
                 bh = x.get("behaviorHints") or {}
                 txt = x.get("title") or x.get("description") or ""
@@ -6154,8 +6171,8 @@ HB_FIXED = {"feat": "المميّز (بانرات / مباريات)", "cw": "▶
             "live": "📡 القنوات المباشرة", "ivsec": "أقسام IPTV (رمضان…)", "new-ar": "🇪🇬 جديد عربي",
             "new-for": "🌍 جديد أجنبي", "new-toon": "🧸 كرتون وأنمي جديد", "tz": "على ذوقك (تعلّم تلقائي)",
             "fav": "مفضلتي (المنصات والأنواع)", "ar": "صفوف الإضافات (Stremio)"}
-HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
-HB_HEAVY = {"new-ar", "new-for", "new-toon", "ar", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
+HB_DEFAULT = ["feat", "cw", "pins", "live", "ivsec", "tz", "ar"]   # الرئيسية الخفيفة: المميّز + كمّل المشاهدة + المثبّت (أفلام/قنوات/أقسام) + على ذوقك
+HB_HEAVY = {"new-ar", "new-for", "new-toon", "fav"}   # بتقفل تلقائي (الأدمن يقدر يفتحها من لوحة الأقسام)
 HB_SORTS = ("new", "old", "pop", "top")
 HB_CACHE = {}
 
@@ -6197,19 +6214,24 @@ def hb_clean(rows_in):
 
 
 def hb_view():
-    saved, lite = None, False
+    saved, ver = None, 0
     try:
         d = store_load(HB_FILE)
         if isinstance(d, dict):
             saved = d.get("blocks")
-            lite = d.get("lite") == 2
+            ver = d.get("lite") or 0
     except Exception:
         saved = None
+    lite = ver in (2, 3)
     blocks = hb_clean(saved) if saved else []
     if blocks and not lite:          # تخزين قديم: اقفل الأقسام التقيلة مرة واحدة (أول حفظ جديد من الأدمن بيثبّت اختياراته)
         for b in blocks:
             if b["id"] in HB_HEAVY:
                 b["on"] = False
+    if blocks and ver == 2:          # v86: صفوف الإضافات تظهر لكل الأعضاء (مرة واحدة، وأول حفظ من الأدمن بعد كده بيثبّت اختياره)
+        for b in blocks:
+            if b["id"] == "ar":
+                b["on"] = True
     have = {x["id"] for x in blocks}
     for bid in HB_FIXED:
         if bid not in have:
@@ -6230,7 +6252,7 @@ def hb_set():
         return jsonify(error="بيانات ناقصة"), 400
     out = hb_clean(rows_in)
     try:
-        store_save(HB_FILE, {"blocks": out, "t": int(time.time()), "lite": 2})
+        store_save(HB_FILE, {"blocks": out, "t": int(time.time()), "lite": 3})
         back = store_load(HB_FILE)
         if not isinstance(back, dict) or len(back.get("blocks") or []) != len(out):
             return jsonify(error="التخزين رجّع بيانات مختلفة بعد الحفظ"), 500
@@ -6315,6 +6337,58 @@ def hb_items():
 
 
 
+_FIND_CACHE = {}
+
+
+def _tmdb_from_imdb(imdb, typ):
+    """رقم IMDb (tt...) -> عمل على TMDB بالعربي. بيتخزّن في الذاكرة، والفشل المؤقت مابيتخزّنش."""
+    k = (imdb, typ)
+    if k in _FIND_CACHE:
+        return _FIND_CACHE[k]
+    out = None
+    try:
+        r = tmdb_get(f"/find/{imdb}", external_source="imdb_id", language="ar")
+        mv, tv = r.get("movie_results") or [], r.get("tv_results") or []
+        order = [("tv", tv), ("movie", mv)] if typ == "tv" else [("movie", mv), ("tv", tv)]
+        for t, lst in order:
+            if lst:
+                x = lst[0]
+                out = {"id": x["id"], "type": t,
+                       "title": x.get("title") or x.get("name") or "",
+                       "poster": img(x.get("poster_path"), "w342"),
+                       "year": (x.get("release_date") or x.get("first_air_date") or "")[:4],
+                       "rating": round(x.get("vote_average") or 0, 1)}
+                break
+    except Exception:
+        return None
+    if len(_FIND_CACHE) > 6000:
+        _FIND_CACHE.clear()
+    _FIND_CACHE[k] = out
+    return out
+
+
+def _tmdb_upgrade(items):
+    if not TMDB_KEY or not items:
+        return items
+
+    def up(it):
+        if it.get("imdb") and not it.get("id"):
+            f = _tmdb_from_imdb(it["imdb"], it.get("type") or "movie")
+            if f:
+                it["id"], it["type"] = f["id"], f["type"]
+                for kk in ("title", "poster", "year"):
+                    if f.get(kk):
+                        it[kk] = f[kk]
+                if f.get("rating"):
+                    it["rating"] = f["rating"]
+        return it
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return list(ex.map(up, items))
+    except Exception:
+        return items
+
+
 def cat_items(a, e):
     key = (a["id"], e["ty"], e["c"], e.get("g", ""))
     hit = CAT_CACHE.get(key)
@@ -6345,6 +6419,7 @@ def cat_items(a, e):
             continue
         items.append(it)
     items = items[:20]
+    items = _tmdb_upgrade(items)       # v86: TMDB هو الأساس (اسم وبوستر عربي + id بيفتح صفحة TMDB على طول)
     CAT_STATS[key] = {"n": len(items), "lk": skipped, "ex": ex_id}
     if items:
         CAT_CACHE[key] = (time.time(), items)
@@ -7060,6 +7135,69 @@ def tmdb_rows():
     return jsonify(rows=data)
 
 
+_IMDB_MISS = {}
+
+
+def _norm_en(v):
+    return re.sub(r"[^a-z0-9]+", "", str(v or "").lower())
+
+
+def _imdb_find(typ, tid, titles, year):
+    """عمل على TMDB من غير رقم IMDb: نلاقيه من Cinemeta بالاسم الإنجليزي + السنة (±1) ونحفظه مشترك لكل الأعضاء.
+    مابنخمّنش: لازم الاسم يتطابق والسنة تقرّب، لأن رقم غلط بيجيب تشغيل لعمل تاني."""
+    key = f"{typ}:{tid}"
+    try:
+        m = store_load(IMDBFIX_FILE)
+        if isinstance(m, dict) and re.fullmatch(r"tt\d{5,10}", str(m.get(key) or "")):
+            return m[key]
+    except Exception:
+        pass
+    if time.time() - _IMDB_MISS.get(key, 0) < 6 * 3600:
+        return ""
+    kind = "series" if typ == "tv" else "movie"
+    yr = int(year) if str(year).isdigit() else 0
+    hit = ""
+    for name in (titles or [])[:3]:
+        try:
+            r = requests.get(f"https://v3-cinemeta.strem.io/catalog/{kind}/top/search={quote(name)}.json",
+                             timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                continue
+            metas = r.json().get("metas") or []
+        except Exception:
+            continue
+        for x in metas[:10]:
+            iid = str(x.get("imdb_id") or x.get("id") or "")
+            if not re.fullmatch(r"tt\d{5,10}", iid) or _norm_en(x.get("name")) != _norm_en(name):
+                continue
+            ym = re.match(r"(\d{4})", str(x.get("year") or x.get("releaseInfo") or ""))
+            y = int(ym.group(1)) if ym else 0
+            if yr and y and abs(y - yr) > 1:
+                continue
+            hit = iid
+            break
+        if hit:
+            break
+    if not hit:
+        _IMDB_MISS[key] = time.time()
+        return ""
+    try:
+        with IMDBFIX_LOCK:
+            try:
+                m = store_load(IMDBFIX_FILE)
+            except Exception:
+                m = {}
+            if not isinstance(m, dict):
+                m = {}
+            m[key] = hit
+            if len(m) > 5000:
+                m = dict(list(m.items())[-5000:])
+            store_save(IMDBFIX_FILE, m)
+    except Exception:
+        pass
+    return hit
+
+
 @app.get("/details")
 def details():
     t, i = request.args.get("type"), request.args.get("id")
@@ -7074,6 +7212,11 @@ def details():
         cast = (a.get("credits") or {}).get("cast", [])[:10]
         lat = latin_titles(a, e)
         imdb = (a.get("external_ids") or {}).get("imdb_id") or a.get("imdb_id") or ""
+        if not imdb:                      # v86: المسلسلات/الأفلام اللي TMDB مالهاش فيها IMDb بتتكمّل من السيرفر عشان التشغيل
+            try:
+                imdb = _imdb_find(t, int(i), lat, date_s[:4])
+            except Exception:
+                imdb = ""
         return jsonify(
             id=int(i), type=t, year=date_s[:4], runtime=rt,
             lang=a.get("original_language") or "",
