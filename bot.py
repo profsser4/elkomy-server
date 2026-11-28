@@ -225,6 +225,17 @@ TORBOX_BASE = "https://api.torbox.app/v1/api"
 SUBDL_API = "https://api.subdl.com/api/v1/subtitles"
 SUBDL_DL = "https://dl.subdl.com"
 ST_API = "https://api.strem.io/api"
+
+# بروكسي اختياري لـTorrentio بس (بيحظر آيبيهات السيرفرات برد 403): ضيف متغير ADDON_PROXY مثال http://user:pass@host:port
+_ADDON_PX = (os.environ.get("ADDON_PROXY") or "").strip()
+if _ADDON_PX:
+    _req_get = requests.get
+
+    def _addon_get(url, *a, **kw):
+        if "strem.fun" in str(url) and "proxies" not in kw:
+            kw["proxies"] = {"http": _ADDON_PX, "https": _ADDON_PX}
+        return _req_get(url, *a, **kw)
+    requests.get = _addon_get
 VIDEO = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v")
 TRACKERS = (
     "&tr=udp://tracker.opentrackr.org:1337/announce"
