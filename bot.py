@@ -5744,10 +5744,24 @@ def st_streams():
     is_admin = g.role == "admin"
     typ = "series" if request.args.get("type") == "tv" else "movie"
     imdb = request.args.get("imdb", "")
+    tmdb = request.args.get("tmdb", "")
     s, e = request.args.get("s", ""), request.args.get("e", "")
-    if not re.fullmatch(r"tt\d+", imdb):
-        return jsonify(error="العمل ده ملوش IMDb id"), 400
-    sid = f"{imdb}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else imdb
+    imdb_ok, tmdb_ok = bool(re.fullmatch(r"tt\d+", imdb)), bool(re.fullmatch(r"\d{1,9}", tmdb))
+    if not imdb_ok and not tmdb_ok:
+        return jsonify(error="العمل ده ملوش IMDb id ولا TMDB id"), 400
+
+    def mid_for(a):
+        """الرقم اللي الإضافة دي بتفهمه: IMDb (tt...) أو TMDB (tmdb:123 زي إضافات Nuvio)."""
+        pre = [str(p) for p in (a.get("prefixes") or [])]
+        if imdb_ok and (not pre or any(imdb.startswith(p) for p in pre)):
+            return imdb
+        if tmdb_ok and any(p.lower().startswith("tmdb") for p in pre):
+            return "tmdb:" + tmdb
+        return None
+
+    def sid_for(a):
+        m = mid_for(a)
+        return f"{m}:{s}:{e}" if typ == "series" and s.isdigit() and e.isdigit() else m
 
     # AllDebrid بيرفض طلبات السيرفر (NO_SERVER)، فمايتحسبش مزوّد يسحب من عندنا
     own = (not ADDON_DIRECT) and any(p["type"] != "alldebrid" for p in torrent_providers())
@@ -5765,12 +5779,11 @@ def st_streams():
         if own and st_plain_base(a["base"]) == a["base"] and any(
                 k in unquote(a["base"]) for k in all_keys):
             return False
-        pre = a.get("prefixes")
-        return not pre or any(imdb.startswith(p) for p in pre)
+        return mid_for(a) is not None
 
     def one(a):
         qb = st_plain_base(a["base"]) if own else a["base"]
-        url = f"{qb}/stream/{typ}/{sid}.json"
+        url = f"{qb}/stream/{typ}/{sid_for(a)}.json"
         try:
             r = requests.get(url, timeout=25,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -5824,6 +5837,8 @@ def st_streams():
 
     addons = [a for a in st_load()["addons"] if usable(a)]
     if not addons:
+        if not imdb_ok:
+            return jsonify(error="العمل ده ملوش رقم IMDb، ومفيش إضافة من إضافاتك بتدعم رقم TMDB (idPrefixes فيها tmdb). ضيف إضافة Nuvio بتدعمه.")
         return jsonify(error="مفيش مصادر متاحة للنوع ده حالياً.")
     with ThreadPoolExecutor(max_workers=6) as ex:
         parts = list(ex.map(one, addons))
