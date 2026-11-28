@@ -5232,7 +5232,7 @@ def st_post(method, body):
 
 def st_base(u):
     u = (u or "").strip().replace("stremio://", "https://")
-    return re.sub(r"/manifest\.json.*$", "", u).rstrip("/")
+    return re.sub(r"/(manifest\.json|configure)(/.*|\?.*|#.*)?$", "", u).rstrip("/")   # يقبل رابط صفحة configure كمان
 
 
 def st_info(m):
